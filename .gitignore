@@ -1,0 +1,49 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# App runtime data
+current_skills.json
+skill_tracker_state.json
+skill_tracker_sessions.json
+
+# Logs
+*.log
+chat.log
+
+# Local config / temp files
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging
+*.egg-info/
+.eggs/
