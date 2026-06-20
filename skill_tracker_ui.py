@@ -42,6 +42,7 @@ except ImportError:
 CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
+IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 
 
 X = np.array([
@@ -214,6 +215,21 @@ def parse_float(value, default=0.0):
         return default
 
 
+def percent(numerator, denominator) -> float:
+    try:
+        denominator = float(denominator)
+        if denominator == 0:
+            return 0.0
+        return float(numerator) / denominator * 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def ignored_loot_message(message: str) -> bool:
+    lower_message = str(message).lower()
+    return any(item.lower() in lower_message for item in IGNORED_LOOT_ITEMS)
+
+
 def weapon_cost_per_shot_ped(weapon_name: str) -> float:
     weapon = WEAPONS.get(weapon_name) or {}
     decay = weapon.get("decay") or 0.0
@@ -322,6 +338,8 @@ class ChatLogParser:
 
         loot = cls.loot_re.match(message)
         if loot:
+            if ignored_loot_message(message):
+                return None
             return {"type": "loot", "timestamp": timestamp, "value_ped": float(loot.group(1)), "message": message}
 
         return None
@@ -475,11 +493,13 @@ class SkillTrackerApp:
         summary.pack(fill="x", padx=10, pady=6)
         ttk.Label(summary, textvariable=self.session_summary_var, justify="left").pack(anchor="w")
 
-        columns = ("skill", "tt_gain", "point_gain", "gain_count", "current")
+        columns = ("skill", "tt_gain", "tt_percent", "point_gain", "gain_count", "message_percent", "current")
         self.session_skill_tree = ttk.Treeview(self.monitor_tab, columns=columns, show="headings", height=10)
         for col, title, width in [
             ("skill", "Skill", 280), ("tt_gain", "TT-equivalent gain", 160),
+            ("tt_percent", "TT % of skills", 120),
             ("point_gain", "Session point gain", 170), ("gain_count", "Gain messages", 130),
+            ("message_percent", "Msg % of skills", 120),
             ("current", "Current skill", 160),
         ]:
             self.session_skill_tree.heading(col, text=title)
@@ -553,13 +573,15 @@ class SkillTrackerApp:
         ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
-        columns = ("started", "ended", "weapon", "mob", "attacks", "damage", "ped", "loot", "skill_tt", "skill_points", "skill_events", "skills")
+        columns = ("started", "ended", "weapon", "mob", "attacks", "damage", "ped", "loot", "loot_percent", "skill_tt", "skill_tt_percent", "skill_points", "skill_events", "skills")
         self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
         setup = [
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon", 200),
             ("mob", "Mob", 170), ("attacks", "Attacks", 75), ("damage", "Damage", 85),
             ("ped", "PED cycled", 95), ("loot", "Loot PED", 85),
+            ("loot_percent", "Loot %", 75),
             ("skill_tt", "TT-equiv total", 105), ("skill_points", "Point total", 115),
+            ("skill_tt_percent", "Skill TT %", 85),
             ("skill_events", "Skill gains", 90), ("skills", "Skills gained", 300),
         ]
         for col, title, width in setup:
@@ -583,13 +605,15 @@ class SkillTrackerApp:
 
         skill_frame = ttk.LabelFrame(self.session_details_tab, text="Skill gains in selected session", padding=6)
         skill_frame.pack(fill="both", expand=True, padx=10, pady=6)
-        columns = ("skill", "points", "tt", "count", "avg_points", "avg_tt")
+        columns = ("skill", "points", "tt", "tt_percent", "count", "message_percent", "avg_points", "avg_tt")
         self.session_detail_skill_tree = ttk.Treeview(skill_frame, columns=columns, show="headings", height=12)
         setup = [
             ("skill", "Skill", 260),
             ("points", "Point gain", 130),
             ("tt", "TT-equivalent", 130),
+            ("tt_percent", "TT % of skills", 120),
             ("count", "Messages", 90),
+            ("message_percent", "Msg % of skills", 120),
             ("avg_points", "Avg point/msg", 130),
             ("avg_tt", "Avg TT/msg", 130),
         ]
@@ -635,6 +659,11 @@ class SkillTrackerApp:
         avg_points = skill_points_total / skill_events_total if skill_events_total else 0.0
         avg_tt = skill_tt_total / skill_events_total if skill_events_total else 0.0
         mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip() or "-"
+        ped_cycled = float(session.get('ped_cycled', 0.0))
+        loot_ped = float(session.get('loot_ped_total', 0.0))
+        loot_percent = percent(loot_ped, ped_cycled)
+        skill_tt_percent = percent(skill_tt_total, ped_cycled)
+        skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
 
         self.session_detail_summary_var.set(
             f"Started: {session.get('started_at', '')} | Ended: {session.get('ended_at', '')}\n"
@@ -642,10 +671,12 @@ class SkillTrackerApp:
             f"Weapon: {session.get('weapon', '-') or '-'} | Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
             f"Attacks: {session.get('attacks_total', 0)} "
             f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, jammed {session.get('jammed_attacks', 0)}) | "
-            f"Damage: {float(session.get('damage_total', 0.0)):.1f} | PED cycled: {float(session.get('ped_cycled', 0.0)):.4f} | "
-            f"Loot: {float(session.get('loot_ped_total', 0.0)):.4f} PED\n"
+            f"Damage: {float(session.get('damage_total', 0.0)):.1f} | PED cycled: {ped_cycled:.4f} | "
+            f"Loot: {loot_ped:.4f} PED ({loot_percent:.2f}%)\n"
             f"Skill gain messages: {skill_events_total} | Point total: {skill_points_total:.4f} | "
-            f"TT-equivalent total: {skill_tt_total:.4f} | Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT"
+            f"TT-equivalent total: {skill_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
+            f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
+            f"Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT"
         )
 
         all_skills = sorted(set(skill_points) | set(skill_tt) | set(counts), key=str.lower)
@@ -660,7 +691,9 @@ class SkillTrackerApp:
                     skill,
                     f"{points:.4f}",
                     f"{tt:.6f}",
+                    f"{percent(tt, skill_tt_total):.2f}%",
                     count,
+                    f"{percent(count, skill_events_total):.2f}%",
                     f"{(points / count) if count else 0.0:.6f}",
                     f"{(tt / count) if count else 0.0:.6f}",
                 ),
@@ -1251,11 +1284,25 @@ class SkillTrackerApp:
         self.session_skill_tree.delete(*self.session_skill_tree.get_children())
         if self.current_session is None:
             return
+        total_tt_gain = float(self.current_session.skill_gain_tt_total)
+        total_gain_messages = sum(int(v) for v in self.current_session.skill_gain_events_by_skill.values())
         for skill, tt_gain in sorted(self.current_session.skill_gains_tt.items(), key=lambda item: item[0].lower()):
             point_gain = self.current_session.skill_gains_points.get(skill, 0.0)
             gain_count = self.current_session.skill_gain_events_by_skill.get(skill, 0)
             current = self.current_skills.get(skill, 0.0)
-            self.session_skill_tree.insert("", "end", values=(skill, f"{tt_gain:.4f}", f"{point_gain:.4f}", gain_count, f"{current:.4f}"))
+            self.session_skill_tree.insert(
+                "",
+                "end",
+                values=(
+                    skill,
+                    f"{tt_gain:.4f}",
+                    f"{percent(tt_gain, total_tt_gain):.2f}%",
+                    f"{point_gain:.4f}",
+                    gain_count,
+                    f"{percent(gain_count, total_gain_messages):.2f}%",
+                    f"{current:.4f}",
+                ),
+            )
 
     def update_session_summary(self):
         if self.current_session is None:
@@ -1265,12 +1312,25 @@ class SkillTrackerApp:
         top_professions = sorted(s.total_profession_gain_by_profession.items(), key=lambda item: item[1], reverse=True)[:5]
         top_text = ", ".join(f"{name}: +{value:.4f}" for name, value in top_professions) or "-"
         total_skill_gain_events = sum(s.skill_gain_events_by_skill.values())
+        loot_percent = percent(s.loot_ped_total, s.ped_cycled)
+        skill_tt_percent = percent(s.skill_gain_tt_total, s.ped_cycled)
+        skill_messages_per_attack = percent(total_skill_gain_events, s.attacks_total)
+        top_skills = []
+        for skill, tt_gain in sorted(s.skill_gains_tt.items(), key=lambda item: item[1], reverse=True)[:5]:
+            gain_count = int(s.skill_gain_events_by_skill.get(skill, 0))
+            top_skills.append(
+                f"{skill}: {tt_gain:.4f} TT ({percent(tt_gain, s.skill_gain_tt_total):.1f}% TT, "
+                f"{percent(gain_count, total_skill_gain_events):.1f}% msgs)"
+            )
+        top_skills_text = "; ".join(top_skills) or "-"
         self.session_summary_var.set(
             f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Mob: {s.mob or '-'} {s.maturity or ''}\n"
             f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, jammed {s.jammed_attacks}) | "
-            f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED\n"
+            f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%)\n"
             f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
-            f"TT-equivalent total: {s.skill_gain_tt_total:.4f}\n"
+            f"TT-equivalent total: {s.skill_gain_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
+            f"Skill messages/attack: {skill_messages_per_attack:.2f}%\n"
+            f"Top skills: {top_skills_text}\n"
             f"Top profession gains: {top_text}"
         )
 
@@ -1307,13 +1367,18 @@ class SkillTrackerApp:
                 tt_gain = float(skill_tt.get(skill_name, 0.0))
                 gain_count = int(counts.get(skill_name, 0))
                 count_text = f", {gain_count}x" if gain_count else ""
-                skill_rows.append(f"{skill_name}: +{float(point_gain):.4f} pts / +{tt_gain:.4f} TT{count_text}")
+                skill_rows.append(
+                    f"{skill_name}: +{float(point_gain):.4f} pts / +{tt_gain:.4f} TT "
+                    f"({percent(tt_gain, skill_tt_total):.1f}% TT, {percent(gain_count, skill_gain_events_total):.1f}% msgs){count_text}"
+                )
 
             skills_text = "; ".join(skill_rows[:4])
             if len(skill_rows) > 4:
                 skills_text += f" ... +{len(skill_rows) - 4} more"
 
             mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
+            ped_cycled = float(session.get('ped_cycled', 0.0))
+            loot_ped = float(session.get('loot_ped_total', 0.0))
             self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
                 session.get("started_at", ""),
                 session.get("ended_at", ""),
@@ -1321,9 +1386,11 @@ class SkillTrackerApp:
                 mob,
                 session.get("attacks_total", 0),
                 f"{float(session.get('damage_total', 0.0)):.1f}",
-                f"{float(session.get('ped_cycled', 0.0)):.4f}",
-                f"{float(session.get('loot_ped_total', 0.0)):.4f}",
+                f"{ped_cycled:.4f}",
+                f"{loot_ped:.4f}",
+                f"{percent(loot_ped, ped_cycled):.2f}%",
                 f"{skill_tt_total:.4f}",
+                f"{percent(skill_tt_total, ped_cycled):.2f}%",
                 f"{skill_points_total:.4f}",
                 skill_gain_events_total,
                 skills_text,
