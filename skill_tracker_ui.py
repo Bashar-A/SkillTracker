@@ -397,6 +397,8 @@ class SkillTrackerApp:
         self.all_mob_names = sorted(MOBS.keys(), key=str.lower)
         self.weapon_filter_var = tk.StringVar()
         self.mob_filter_var = tk.StringVar()
+        self.tree_sort_state = {}
+        self.tree_heading_titles = {}
 
         self.create_ui()
         self.load_profession()
@@ -426,6 +428,61 @@ class SkillTrackerApp:
         self.create_sessions_tab()
         self.create_session_details_tab()
         self.create_profession_tab()
+
+    def make_tree_sortable(self, tree, headings):
+        self.tree_heading_titles[tree] = dict(headings)
+        self.tree_sort_state.setdefault(tree, {"column": None, "descending": False})
+        self.refresh_tree_sort_headings(tree)
+
+    def refresh_tree_sort_headings(self, tree):
+        titles = self.tree_heading_titles.get(tree, {})
+        state = self.tree_sort_state.get(tree, {})
+        active_column = state.get("column")
+        descending = bool(state.get("descending", False))
+        for col, title in titles.items():
+            indicator = ""
+            if col == active_column:
+                indicator = " v" if descending else " ^"
+            tree.heading(col, text=f"{title}{indicator}", command=lambda c=col, t=tree: self.toggle_tree_sort(t, c))
+
+    def toggle_tree_sort(self, tree, column):
+        state = self.tree_sort_state.setdefault(tree, {"column": None, "descending": False})
+        if state.get("column") == column:
+            state["descending"] = not bool(state.get("descending", False))
+        else:
+            state["column"] = column
+            state["descending"] = False
+        self.apply_tree_sort(tree)
+        self.refresh_tree_sort_headings(tree)
+
+    def tree_sort_key(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        numeric_text = text.rstrip("%").replace(",", "")
+        try:
+            return (0, float(numeric_text))
+        except ValueError:
+            return (1, text.casefold())
+
+    def apply_tree_sort(self, tree):
+        state = self.tree_sort_state.get(tree, {})
+        column = state.get("column")
+        if not column:
+            return
+        descending = bool(state.get("descending", False))
+        keyed_items = []
+        empty_items = []
+        for item_id in tree.get_children(""):
+            key = self.tree_sort_key(tree.set(item_id, column))
+            if key is None:
+                empty_items.append(item_id)
+            else:
+                keyed_items.append((key, item_id))
+        keyed_items.sort(key=lambda item: item[0], reverse=descending)
+        ordered_items = [item_id for _, item_id in keyed_items] + empty_items
+        for index, item_id in enumerate(ordered_items):
+            tree.move(item_id, "", index)
 
     def create_profession_tab(self):
         top_frame = ttk.Frame(self.profession_tab, padding=10)
@@ -504,6 +561,15 @@ class SkillTrackerApp:
         ]:
             self.session_skill_tree.heading(col, text=title)
             self.session_skill_tree.column(col, width=width, anchor="center" if col != "skill" else "w")
+        self.make_tree_sortable(self.session_skill_tree, {
+            "skill": "Skill",
+            "tt_gain": "TT-equivalent gain",
+            "tt_percent": "TT % of skills",
+            "point_gain": "Session point gain",
+            "gain_count": "Gain messages",
+            "message_percent": "Msg % of skills",
+            "current": "Current skill",
+        })
         self.session_skill_tree.pack(fill="both", expand=True, padx=10, pady=6)
 
         event_frame = ttk.LabelFrame(self.monitor_tab, text="Recent parsed events", padding=6)
@@ -588,6 +654,7 @@ class SkillTrackerApp:
         for col, title, width in setup:
             self.sessions_tree.heading(col, text=title)
             self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "skills") else "w")
+        self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
         self.sessions_tree.pack(fill="both", expand=True, padx=10, pady=10)
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
 
@@ -621,6 +688,7 @@ class SkillTrackerApp:
         for col, title, width in setup:
             self.session_detail_skill_tree.heading(col, text=title)
             self.session_detail_skill_tree.column(col, width=width, anchor="center" if col != "skill" else "w")
+        self.make_tree_sortable(self.session_detail_skill_tree, {col: title for col, title, _ in setup})
         self.session_detail_skill_tree.pack(fill="both", expand=True)
 
         events_frame = ttk.LabelFrame(self.session_details_tab, text="Saved parsed events (last 300 per session)", padding=6)
@@ -703,6 +771,7 @@ class SkillTrackerApp:
                     f"{(tt / count) if count else 0.0:.6f}",
                 ),
             )
+        self.apply_tree_sort(self.session_detail_skill_tree)
 
         for event in session.get("events", []) or []:
             etype = event.get("type", "")
@@ -1308,6 +1377,7 @@ class SkillTrackerApp:
                     f"{current:.4f}",
                 ),
             )
+        self.apply_tree_sort(self.session_skill_tree)
 
     def update_session_summary(self):
         if self.current_session is None:
@@ -1400,6 +1470,7 @@ class SkillTrackerApp:
                 skill_gain_events_total,
                 skills_text,
             ))
+        self.apply_tree_sort(self.sessions_tree)
 
     def clear_sessions(self):
         if not messagebox.askyesno("Clear sessions", "Delete all saved session history?"):
