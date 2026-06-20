@@ -310,6 +310,13 @@ class ChatLogParser:
     loot_re = re.compile(r"^You received .+ Value: ([0-9]+(?:\.[0-9]+)?) PED$")
 
     @classmethod
+    def parse_line_timestamp(cls, line: str):
+        match = cls.line_re.match(line.strip("\ufeff\r\n"))
+        if not match:
+            return None
+        return parse_chat_timestamp(match.group(1))
+
+    @classmethod
     def parse_line(cls, line: str):
         line = line.strip("\ufeff\r\n")
         match = cls.line_re.match(line)
@@ -395,6 +402,7 @@ class SkillTrackerApp:
         self.reader_active = False
         self.reader_done_pending = False
         self.reader_final_offset = None
+        self.reader_final_last_read_at = ""
         self.reader_error = ""
         self.reader_last_progress_at = 0.0
         self.reader_processed_batches = 0
@@ -1068,6 +1076,9 @@ class SkillTrackerApp:
         self.mob_info_var.set(f"Planet: {planets} | HP: {hp} | Level: {level}")
 
     def start_sync(self):
+        if self.monitoring:
+            self.stop_sync()
+
         path = Path(self.chat_log_path_var.get()).expanduser()
         if not path.exists():
             messagebox.showerror("chat.log not found", "Choose a valid chat.log file first.")
@@ -1138,12 +1149,12 @@ class SkillTrackerApp:
             return
 
         # Ask the background reader to stop, then apply anything it already
-        # parsed before saving the session. This keeps the UI responsive even
-        # when the initial backlog is still being scanned.
+        # parsed before saving the session. Waiting prevents stale worker
+        # batches from a stopped session from being applied to a restarted one.
         self.reader_stop_event.set()
         if self.reader_thread is not None and self.reader_thread.is_alive():
-            self.reader_thread.join(timeout=0.5)
-        self.process_reader_queue(max_batches=1000)
+            self.reader_thread.join()
+        self.process_reader_queue(max_batches=1_000_000)
 
         self.current_session.ended_at = now_iso()
         self.current_session.end_offset = self.log_offset
@@ -1218,6 +1229,7 @@ class SkillTrackerApp:
         self.reader_active = True
         self.reader_done_pending = False
         self.reader_final_offset = None
+        self.reader_final_last_read_at = ""
         self.reader_error = ""
         self.reader_processed_batches = 0
         self.monitor_status_var.set("Reading log...")
@@ -1226,7 +1238,7 @@ class SkillTrackerApp:
         def worker():
             batch = []
             skipped_by_time = 0
-            newest_event_at = None
+            newest_line_at = None
             lines_seen = 0
             last_progress = time.time()
             last_offset = start_offset
@@ -1240,21 +1252,20 @@ class SkillTrackerApp:
                         last_offset = handle.tell()
                         lines_seen += 1
                         line = raw.decode("utf-8", errors="replace")
+                        line_at = ChatLogParser.parse_line_timestamp(line)
+                        if line_at is not None and (newest_line_at is None or line_at > newest_line_at):
+                            newest_line_at = line_at
                         event = ChatLogParser.parse_line(line)
                         if event:
                             if not event_is_after_cutoff(event, cutoff_at):
                                 skipped_by_time += 1
                             else:
                                 batch.append(event)
-                                event_at = parse_chat_timestamp(event.get("timestamp"))
-                                if event_at is not None and (newest_event_at is None or event_at > newest_event_at):
-                                    newest_event_at = event_at
 
                         if len(batch) >= 200:
-                            self.reader_queue.put(("batch", batch, skipped_by_time, newest_event_at.isoformat(timespec="seconds") if newest_event_at else "", last_offset))
+                            self.reader_queue.put(("batch", batch, skipped_by_time, newest_line_at.isoformat(timespec="seconds") if newest_line_at else "", last_offset))
                             batch = []
                             skipped_by_time = 0
-                            newest_event_at = None
 
                         now = time.time()
                         if now - last_progress >= 0.35:
@@ -1262,8 +1273,8 @@ class SkillTrackerApp:
                             last_progress = now
 
                 if batch or skipped_by_time:
-                    self.reader_queue.put(("batch", batch, skipped_by_time, newest_event_at.isoformat(timespec="seconds") if newest_event_at else "", last_offset))
-                self.reader_queue.put(("done", last_offset))
+                    self.reader_queue.put(("batch", batch, skipped_by_time, newest_line_at.isoformat(timespec="seconds") if newest_line_at else "", last_offset))
+                self.reader_queue.put(("done", last_offset, newest_line_at.isoformat(timespec="seconds") if newest_line_at else ""))
             except Exception as ex:
                 self.reader_queue.put(("error", str(ex)))
 
@@ -1305,10 +1316,12 @@ class SkillTrackerApp:
                 continue
 
             if kind == "done":
-                _, final_offset = item
+                final_offset = item[1]
+                final_last_read_at = item[2] if len(item) > 2 else ""
                 self.reader_active = False
                 self.reader_done_pending = True
                 self.reader_final_offset = int(final_offset)
+                self.reader_final_last_read_at = str(final_last_read_at or "")
                 continue
 
             if kind == "error":
@@ -1338,8 +1351,12 @@ class SkillTrackerApp:
             if not has_pending_batch:
                 if self.reader_final_offset is not None:
                     self.log_offset = int(self.reader_final_offset)
-                self.save_state()
+                if self.reader_final_last_read_at:
+                    self.save_state(last_log_read_at=self.reader_final_last_read_at)
+                else:
+                    self.save_state()
                 self.reader_done_pending = False
+                self.reader_final_last_read_at = ""
                 self.monitor_status_var.set("Syncing")
                 self.monitor_progress_var.set(f"Caught up. Current offset: {self.log_offset:,}. Waiting for new lines...")
                 if self.log_time_cutoff_at is not None:
@@ -1383,8 +1400,11 @@ class SkillTrackerApp:
 
         skipped_by_time = 0
         processed_after_cutoff = 0
-        newest_processed_event_at = None
+        newest_line_at = None
         for line in lines:
+            line_at = ChatLogParser.parse_line_timestamp(line)
+            if line_at is not None and (newest_line_at is None or line_at > newest_line_at):
+                newest_line_at = line_at
             event = ChatLogParser.parse_line(line)
             if event:
                 if not event_is_after_cutoff(event, self.log_time_cutoff_at):
@@ -1392,9 +1412,6 @@ class SkillTrackerApp:
                     continue
                 processed_after_cutoff += 1
                 self.apply_event(event)
-                event_at = parse_chat_timestamp(event.get("timestamp"))
-                if event_at is not None and (newest_processed_event_at is None or event_at > newest_processed_event_at):
-                    newest_processed_event_at = event_at
 
         if skipped_by_time:
             self.append_event(f"Skipped {skipped_by_time} old parsed events before last_log_read_at")
@@ -1404,7 +1421,7 @@ class SkillTrackerApp:
                 self.current_session.log_cutoff_at = ""
 
         save_current_skills(self.current_skills)
-        last_read_at = newest_processed_event_at.isoformat(timespec="seconds") if newest_processed_event_at else None
+        last_read_at = newest_line_at.isoformat(timespec="seconds") if newest_line_at else None
         self.save_state(last_log_read_at=last_read_at)
         self.refresh_session_skill_tree()
         self.update_session_summary()
@@ -1626,10 +1643,10 @@ class SkillTrackerApp:
     def save_state(self, last_log_read_at=None):
         """Save app state without accidentally moving the log cutoff forward.
 
-        last_log_read_at must mean: timestamp of the newest chat.log event that
-        was actually read/applied. It must not be set to current app time when
-        the user only changes weapon/mob, browses for a log file, closes the app,
-        or starts sync before any log line was processed.
+        last_log_read_at must mean: timestamp of the newest chat.log line that
+        was actually read. It must not be set to current app time when the user
+        only changes setup, browses for a log file, closes the app, or starts
+        sync before any log line was processed.
         """
         chat_log_path = self.chat_log_path_var.get()
         path = Path(chat_log_path).expanduser() if chat_log_path else None
