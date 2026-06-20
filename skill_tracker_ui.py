@@ -571,6 +571,7 @@ class SkillTrackerApp:
         top = ttk.Frame(self.sessions_tab, padding=10)
         top.pack(fill="x")
         ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
+        ttk.Button(top, text="Delete Selected Session", command=self.delete_selected_session).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
         columns = ("started", "ended", "weapon", "mob", "attacks", "damage", "ped", "loot", "loot_percent", "skill_tt", "skill_tt_percent", "skill_points", "skill_events", "skills")
@@ -627,7 +628,7 @@ class SkillTrackerApp:
         self.session_detail_events_text = tk.Text(events_frame, height=10, wrap="none")
         self.session_detail_events_text.pack(fill="both", expand=True)
 
-    def selected_session_from_table(self):
+    def selected_session_index_from_table(self):
         selected = self.sessions_tree.selection()
         if not selected:
             return None
@@ -636,9 +637,13 @@ class SkillTrackerApp:
             index = int(iid.replace("session_", ""))
         except ValueError:
             return None
-        if 0 <= index < len(self.sessions):
-            return self.sessions[index]
-        return None
+        return index if 0 <= index < len(self.sessions) else None
+
+    def selected_session_from_table(self):
+        index = self.selected_session_index_from_table()
+        if index is None:
+            return None
+        return self.sessions[index]
 
     def on_session_selected(self, event=None):
         self.show_session_details(self.selected_session_from_table())
@@ -1400,6 +1405,27 @@ class SkillTrackerApp:
         if not messagebox.askyesno("Clear sessions", "Delete all saved session history?"):
             return
         self.sessions = []
+        save_json(SESSIONS_FILE, self.sessions)
+        self.refresh_sessions_table()
+        self.show_session_details(None)
+
+    def delete_selected_session(self):
+        index = self.selected_session_index_from_table()
+        if index is None:
+            messagebox.showwarning("No session selected", "Select a session to delete first.")
+            return
+
+        session = self.sessions[index]
+        started = session.get("started_at", "")
+        weapon = session.get("weapon", "") or "-"
+        mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip() or "-"
+        if not messagebox.askyesno(
+            "Delete selected session",
+            f"Delete session from {started}?\n\nWeapon: {weapon}\nMob: {mob}",
+        ):
+            return
+
+        del self.sessions[index]
         save_json(SESSIONS_FILE, self.sessions)
         self.refresh_sessions_table()
         self.show_session_details(None)
