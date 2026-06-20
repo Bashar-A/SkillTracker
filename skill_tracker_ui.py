@@ -38,6 +38,16 @@ try:
 except ImportError:
     MOBS = {}
 
+try:
+    from amplifier_data import AMPLIFIERS
+except ImportError:
+    AMPLIFIERS = {}
+
+try:
+    from attachment_data import ATTACHMENTS
+except ImportError:
+    ATTACHMENTS = {}
+
 
 CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
@@ -230,13 +240,26 @@ def ignored_loot_message(message: str) -> bool:
     return any(item.lower() in lower_message for item in IGNORED_LOOT_ITEMS)
 
 
-def weapon_cost_per_shot_ped(weapon_name: str) -> float:
-    weapon = WEAPONS.get(weapon_name) or {}
-    decay = weapon.get("decay") or 0.0
-    ammo_burn = weapon.get("ammo_burn") or 0.0
+def equipment_item_cost_per_shot_ped(item: dict) -> float:
+    decay = item.get("decay") or 0.0
+    ammo_burn = item.get("ammo_burn") or 0.0
     # Entropia data is usually in PEC-like fractional decay and ammo burn in ammo units.
     # PED cost = decay PEC / 100 + ammo units / 10000.
     return float(decay) / 100.0 + float(ammo_burn) / 10000.0
+
+
+def weapon_cost_per_shot_ped(weapon_name: str) -> float:
+    return equipment_item_cost_per_shot_ped(WEAPONS.get(weapon_name) or {})
+
+
+def hunting_setup_cost_per_shot_ped(weapon_name: str, amplifier_name: str = "", attachment_names=None) -> float:
+    cost = weapon_cost_per_shot_ped(weapon_name)
+    if amplifier_name in AMPLIFIERS:
+        cost += equipment_item_cost_per_shot_ped(AMPLIFIERS[amplifier_name])
+    for attachment_name in list(attachment_names or [])[:3]:
+        if attachment_name in ATTACHMENTS:
+            cost += equipment_item_cost_per_shot_ped(ATTACHMENTS[attachment_name])
+    return cost
 
 
 @dataclass
@@ -249,6 +272,8 @@ class MonitorSession:
     end_offset: int = 0
     log_cutoff_at: str = ""
     weapon: str = ""
+    amplifier: str = ""
+    attachments: list = field(default_factory=list)
     mob: str = ""
     maturity: str = ""
     count_hunting: bool = False
@@ -388,14 +413,23 @@ class SkillTrackerApp:
         self.session_summary_var = tk.StringVar(value="No active session")
 
         self.weapon_var = tk.StringVar(value=self.state.get("weapon", ""))
+        self.amplifier_var = tk.StringVar(value=self.state.get("amplifier", ""))
+        saved_attachments = list(self.state.get("attachments", []) or [])[:3]
+        while len(saved_attachments) < 3:
+            saved_attachments.append("")
+        self.attachment_vars = [tk.StringVar(value=value) for value in saved_attachments]
         self.mob_var = tk.StringVar(value=self.state.get("mob", ""))
         self.maturity_var = tk.StringVar(value=self.state.get("maturity", ""))
         self.count_hunting_var = tk.BooleanVar(value=bool(self.state.get("count_hunting", False)))
         self.weapon_cost_var = tk.StringVar(value="Cost/shot: 0.000000 PED")
         self.mob_info_var = tk.StringVar(value="Mob: -")
         self.all_weapon_names = sorted(WEAPONS.keys(), key=str.lower)
+        self.all_amplifier_names = sorted(AMPLIFIERS.keys(), key=str.lower)
+        self.all_attachment_names = sorted(ATTACHMENTS.keys(), key=str.lower)
         self.all_mob_names = sorted(MOBS.keys(), key=str.lower)
         self.weapon_filter_var = tk.StringVar()
+        self.amplifier_filter_var = tk.StringVar()
+        self.attachment_filter_var = tk.StringVar()
         self.mob_filter_var = tk.StringVar()
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
@@ -597,27 +631,57 @@ class SkillTrackerApp:
         self.weapon_combo.bind("<KeyRelease>", lambda e: self.filter_weapon_values(self.weapon_var.get()))
         ttk.Label(frame, textvariable=self.weapon_cost_var).grid(row=2, column=2, sticky="w")
 
-        ttk.Label(frame, text="Mob search:").grid(row=3, column=0, sticky="w")
-        mob_search = ttk.Entry(frame, textvariable=self.mob_filter_var, width=35)
-        mob_search.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
-        mob_search.bind("<KeyRelease>", lambda e: self.filter_mob_values())
-        ttk.Button(frame, text="Clear", command=self.clear_mob_filter).grid(row=3, column=2, sticky="w", padx=4)
+        ttk.Label(frame, text="Amplifier search:").grid(row=3, column=0, sticky="w")
+        amplifier_search = ttk.Entry(frame, textvariable=self.amplifier_filter_var, width=35)
+        amplifier_search.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
+        amplifier_search.bind("<KeyRelease>", lambda e: self.filter_amplifier_values())
+        ttk.Button(frame, text="Clear", command=self.clear_amplifier_filter).grid(row=3, column=2, sticky="w", padx=4)
 
-        ttk.Label(frame, text="Mob:").grid(row=4, column=0, sticky="w")
+        ttk.Label(frame, text="Amplifier:").grid(row=4, column=0, sticky="w")
+        self.amplifier_combo = ttk.Combobox(frame, textvariable=self.amplifier_var, values=[""] + self.all_amplifier_names, width=70)
+        self.amplifier_combo.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
+        self.amplifier_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
+        self.amplifier_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
+        self.amplifier_combo.bind("<KeyRelease>", lambda e: self.filter_amplifier_values(self.amplifier_var.get()))
+
+        ttk.Label(frame, text="Attachment search:").grid(row=5, column=0, sticky="w")
+        attachment_search = ttk.Entry(frame, textvariable=self.attachment_filter_var, width=35)
+        attachment_search.grid(row=5, column=1, sticky="ew", padx=8, pady=4)
+        attachment_search.bind("<KeyRelease>", lambda e: self.filter_attachment_values())
+        ttk.Button(frame, text="Clear", command=self.clear_attachment_filter).grid(row=5, column=2, sticky="w", padx=4)
+
+        self.attachment_combos = []
+        for index, attachment_var in enumerate(self.attachment_vars, start=1):
+            row = 5 + index
+            ttk.Label(frame, text=f"Attachment {index}:").grid(row=row, column=0, sticky="w")
+            combo = ttk.Combobox(frame, textvariable=attachment_var, values=[""] + self.all_attachment_names, width=70)
+            combo.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
+            combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
+            combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
+            combo.bind("<KeyRelease>", lambda e, var=attachment_var: self.filter_attachment_values(var.get()))
+            self.attachment_combos.append(combo)
+
+        ttk.Label(frame, text="Mob search:").grid(row=9, column=0, sticky="w")
+        mob_search = ttk.Entry(frame, textvariable=self.mob_filter_var, width=35)
+        mob_search.grid(row=9, column=1, sticky="ew", padx=8, pady=4)
+        mob_search.bind("<KeyRelease>", lambda e: self.filter_mob_values())
+        ttk.Button(frame, text="Clear", command=self.clear_mob_filter).grid(row=9, column=2, sticky="w", padx=4)
+
+        ttk.Label(frame, text="Mob:").grid(row=10, column=0, sticky="w")
         self.mob_combo = ttk.Combobox(frame, textvariable=self.mob_var, values=self.all_mob_names, width=70)
-        self.mob_combo.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
+        self.mob_combo.grid(row=10, column=1, sticky="ew", padx=8, pady=4)
         self.mob_combo.bind("<<ComboboxSelected>>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<FocusOut>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<KeyRelease>", lambda e: self.filter_mob_values(self.mob_var.get()))
 
-        ttk.Label(frame, text="Maturity:").grid(row=5, column=0, sticky="w")
+        ttk.Label(frame, text="Maturity:").grid(row=11, column=0, sticky="w")
         self.maturity_combo = ttk.Combobox(frame, textvariable=self.maturity_var, values=[], width=70)
-        self.maturity_combo.grid(row=5, column=1, sticky="ew", padx=8, pady=4)
+        self.maturity_combo.grid(row=11, column=1, sticky="ew", padx=8, pady=4)
         self.maturity_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.maturity_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
-        ttk.Label(frame, textvariable=self.mob_info_var).grid(row=5, column=2, sticky="w")
+        ttk.Label(frame, textvariable=self.mob_info_var).grid(row=11, column=2, sticky="w")
 
-        ttk.Button(frame, text="Save Hunting Setup", command=self.save_state).grid(row=6, column=1, sticky="w", padx=8, pady=12)
+        ttk.Button(frame, text="Save Hunting Setup", command=self.save_state).grid(row=12, column=1, sticky="w", padx=8, pady=12)
         frame.columnconfigure(1, weight=1)
         self.update_maturity_values()
 
@@ -628,7 +692,7 @@ class SkillTrackerApp:
             text=(
                 "PED cycled increments on your attack events only: normal hit, critical hit, or 'The target Jammed your attack'.\n"
                 "It ignores enemy attacks like 'The attack missed you' and 'You took damage'.\n"
-                "Per attack cost is calculated as decay / 100 + ammo_burn / 10000 PED."
+                "Per attack cost is calculated from weapon, amplifier, and attachment decay / 100 + ammo_burn / 10000 PED."
             ),
             justify="left",
         ).pack(anchor="w")
@@ -737,11 +801,13 @@ class SkillTrackerApp:
         loot_percent = percent(loot_ped, ped_cycled)
         skill_tt_percent = percent(skill_tt_total, ped_cycled)
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
+        attachments = ", ".join(session.get("attachments", []) or []) or "-"
 
         self.session_detail_summary_var.set(
             f"Started: {session.get('started_at', '')} | Ended: {session.get('ended_at', '')}\n"
             f"Log: {session.get('chat_log_path', '')}\n"
-            f"Weapon: {session.get('weapon', '-') or '-'} | Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
+            f"Weapon: {session.get('weapon', '-') or '-'} | Amp: {session.get('amplifier', '') or '-'} | Attachments: {attachments}\n"
+            f"Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
             f"Attacks: {session.get('attacks_total', 0)} "
             f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, jammed {session.get('jammed_attacks', 0)}) | "
             f"Damage: {float(session.get('damage_total', 0.0)):.1f} | PED cycled: {ped_cycled:.4f} | "
@@ -911,6 +977,25 @@ class SkillTrackerApp:
             self.weapon_var.set(values[0])
             self.on_hunting_changed()
 
+    def filter_amplifier_values(self, query=None):
+        values = self.filter_names(self.all_amplifier_names, self.amplifier_filter_var.get() if query is None else query)
+        self.amplifier_combo.configure(values=[""] + values)
+        if len(values) == 1 and query is None:
+            self.amplifier_var.set(values[0])
+            self.on_hunting_changed()
+
+    def filter_attachment_values(self, query=None):
+        values = self.filter_names(self.all_attachment_names, self.attachment_filter_var.get() if query is None else query)
+        combo_values = [""] + values
+        for combo in self.attachment_combos:
+            combo.configure(values=combo_values)
+        if len(values) == 1 and query is None:
+            for attachment_var in self.attachment_vars:
+                if not attachment_var.get():
+                    attachment_var.set(values[0])
+                    self.on_hunting_changed()
+                    break
+
     def filter_mob_values(self, query=None):
         values = self.filter_names(self.all_mob_names, self.mob_filter_var.get() if query is None else query)
         self.mob_combo.configure(values=values)
@@ -922,9 +1007,36 @@ class SkillTrackerApp:
         self.weapon_filter_var.set("")
         self.weapon_combo.configure(values=self.all_weapon_names)
 
+    def clear_amplifier_filter(self):
+        self.amplifier_filter_var.set("")
+        self.amplifier_combo.configure(values=[""] + self.all_amplifier_names)
+
+    def clear_attachment_filter(self):
+        self.attachment_filter_var.set("")
+        for combo in self.attachment_combos:
+            combo.configure(values=[""] + self.all_attachment_names)
+
     def clear_mob_filter(self):
         self.mob_filter_var.set("")
         self.mob_combo.configure(values=self.all_mob_names)
+
+    def selected_attachments(self):
+        attachments = []
+        for attachment_var in self.attachment_vars[:3]:
+            name = attachment_var.get()
+            if name in ATTACHMENTS:
+                attachments.append(name)
+            elif name:
+                attachment_var.set("")
+        return attachments
+
+    def selected_amplifier(self):
+        amplifier = self.amplifier_var.get()
+        if amplifier in AMPLIFIERS:
+            return amplifier
+        if amplifier:
+            self.amplifier_var.set("")
+        return ""
 
     def on_mob_changed(self):
         self.update_maturity_values()
@@ -943,7 +1055,9 @@ class SkillTrackerApp:
 
     def refresh_hunting_info(self):
         weapon_name = self.weapon_var.get()
-        cost = weapon_cost_per_shot_ped(weapon_name) if weapon_name in WEAPONS else 0.0
+        amplifier_name = self.selected_amplifier()
+        attachments = self.selected_attachments()
+        cost = hunting_setup_cost_per_shot_ped(weapon_name, amplifier_name, attachments)
         self.weapon_cost_var.set(f"Cost/shot: {cost:.6f} PED")
 
         mob = MOBS.get(self.mob_var.get()) or {}
@@ -1006,6 +1120,8 @@ class SkillTrackerApp:
             end_offset=start_offset,
             log_cutoff_at=self.log_time_cutoff_at.isoformat(timespec="seconds") if self.log_time_cutoff_at else "",
             weapon=self.weapon_var.get(),
+            amplifier=self.selected_amplifier(),
+            attachments=self.selected_attachments(),
             mob=self.mob_var.get(),
             maturity=self.maturity_var.get(),
             count_hunting=self.count_hunting_var.get(),
@@ -1336,7 +1452,11 @@ class SkillTrackerApp:
                 session.jammed_attacks += 1
                 self.append_event(f"{event['timestamp']} jammed/missed attack")
             if session.count_hunting:
-                session.ped_cycled += weapon_cost_per_shot_ped(session.weapon)
+                session.ped_cycled += hunting_setup_cost_per_shot_ped(
+                    session.weapon,
+                    session.amplifier,
+                    session.attachments,
+                )
         elif event_type == "loot":
             session.loot_ped_total += float(event["value_ped"])
             self.append_event(f"{event['timestamp']} loot +{event['value_ped']:.4f} PED")
@@ -1398,8 +1518,10 @@ class SkillTrackerApp:
                 f"{percent(gain_count, total_skill_gain_events):.1f}% msgs)"
             )
         top_skills_text = "; ".join(top_skills) or "-"
+        attachments = ", ".join(s.attachments or []) or "-"
         self.session_summary_var.set(
-            f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Mob: {s.mob or '-'} {s.maturity or ''}\n"
+            f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Amp: {s.amplifier or '-'} | Attachments: {attachments}\n"
+            f"Mob: {s.mob or '-'} {s.maturity or ''}\n"
             f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, jammed {s.jammed_attacks}) | "
             f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%)\n"
             f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
@@ -1536,6 +1658,8 @@ class SkillTrackerApp:
             "last_log_mtime_ns": file_mtime_ns,
             "last_log_fingerprint": fingerprint,
             "weapon": self.weapon_var.get(),
+            "amplifier": self.selected_amplifier(),
+            "attachments": self.selected_attachments(),
             "mob": self.mob_var.get(),
             "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
