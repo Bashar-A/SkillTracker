@@ -183,6 +183,35 @@ def can_resume_log(path: Path, saved_path: str, saved_offset: int, saved_fingerp
     return log_resume_fingerprint(path, saved_offset) == saved_fingerprint
 
 
+def newest_log_timestamp_at_or_before(path: Path, end_offset: int, max_scan: int = 8 * 1024 * 1024):
+    """Return the newest timestamped chat.log line at or before end_offset."""
+    try:
+        end_offset = int(end_offset)
+        if end_offset <= 0 or not path.exists():
+            return None
+        file_size = path.stat().st_size
+        pos = min(end_offset, file_size)
+        data = b""
+        scanned = 0
+        with path.open("rb") as handle:
+            while pos > 0 and scanned < max_scan:
+                read_size = min(65536, pos, max_scan - scanned)
+                if read_size <= 0:
+                    break
+                pos -= read_size
+                handle.seek(pos)
+                data = handle.read(read_size) + data
+                scanned += read_size
+                for raw_line in reversed(data.splitlines()):
+                    line = raw_line.decode("utf-8", errors="replace")
+                    timestamp = ChatLogParser.parse_line_timestamp(line)
+                    if timestamp is not None:
+                        return timestamp
+    except Exception:
+        return None
+    return None
+
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -419,6 +448,16 @@ class SkillTrackerApp:
         self.monitor_status_var = tk.StringVar(value="Stopped")
         self.monitor_progress_var = tk.StringVar(value="")
         self.session_summary_var = tk.StringVar(value="No active session")
+        self.sync_start_modes = (
+            "Resume saved position",
+            "From chosen time",
+            "From start of log",
+            "From end of log",
+        )
+        self.sync_start_mode_var = tk.StringVar(value=self.state.get("sync_start_mode", self.sync_start_modes[0]))
+        if self.sync_start_mode_var.get() not in self.sync_start_modes:
+            self.sync_start_mode_var.set(self.sync_start_modes[0])
+        self.last_log_read_at_var = tk.StringVar(value=self.state.get("last_log_read_at", ""))
 
         self.weapon_var = tk.StringVar(value=self.state.get("weapon", ""))
         self.amplifier_var = tk.StringVar(value=self.state.get("amplifier", ""))
@@ -585,7 +624,20 @@ class SkillTrackerApp:
         ttk.Button(top, text="Start Sync", command=self.start_sync).grid(row=0, column=3, padx=4)
         ttk.Button(top, text="Stop Sync", command=self.stop_sync).grid(row=0, column=4, padx=4)
         ttk.Label(top, textvariable=self.monitor_status_var, font=("Arial", 11, "bold")).grid(row=0, column=5, padx=12)
-        ttk.Label(top, textvariable=self.monitor_progress_var).grid(row=1, column=1, columnspan=5, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(top, text="Start from:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            top,
+            textvariable=self.sync_start_mode_var,
+            values=self.sync_start_modes,
+            width=24,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(top, text="last_log_read_at:").grid(row=1, column=2, sticky="e", padx=(8, 4), pady=(6, 0))
+        ttk.Entry(top, textvariable=self.last_log_read_at_var, width=25).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        ttk.Button(top, text="Save Time", command=self.save_last_log_read_at_from_ui).grid(row=1, column=4, sticky="w", padx=4, pady=(6, 0))
+        ttk.Button(top, text="Clear Time", command=self.clear_last_log_read_at).grid(row=1, column=5, sticky="w", padx=4, pady=(6, 0))
+        ttk.Button(top, text="Reload Time", command=self.reload_last_log_read_at).grid(row=1, column=6, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(top, textvariable=self.monitor_progress_var).grid(row=2, column=1, columnspan=6, sticky="w", padx=6, pady=(4, 0))
         top.columnconfigure(1, weight=1)
 
         summary = ttk.LabelFrame(self.monitor_tab, text="Current session", padding=10)
@@ -872,6 +924,22 @@ class SkillTrackerApp:
             self.chat_log_path_var.set(filename)
             self.save_state()
 
+    def save_last_log_read_at_from_ui(self):
+        value = self.last_log_read_at_var.get().strip()
+        if value and parse_iso_datetime(value) is None:
+            messagebox.showerror("Invalid time", "Use ISO format like 2026-06-20T18:30:00 or leave it empty.")
+            return False
+        self.last_log_read_at_var.set(value)
+        self.save_state(last_log_read_at=value)
+        return True
+
+    def clear_last_log_read_at(self):
+        self.last_log_read_at_var.set("")
+        self.save_state(last_log_read_at="")
+
+    def reload_last_log_read_at(self):
+        self.last_log_read_at_var.set(str(self.state.get("last_log_read_at", "") or ""))
+
     def load_profession(self):
         self.entries.clear()
         self.skill_tree.delete(*self.skill_tree.get_children())
@@ -1084,34 +1152,67 @@ class SkillTrackerApp:
             messagebox.showerror("chat.log not found", "Choose a valid chat.log file first.")
             return
 
-        # Resume only when the saved offset belongs to the same unchanged log.
-        # Size checks alone are not enough: chat.log can be cleared/replaced and
-        # later grow past the old offset, which would make us skip valid data.
+        mode = self.sync_start_mode_var.get()
         previous_state = dict(self.state)
-        saved_path = previous_state.get("chat_log_path", "")
-        saved_offset = int(previous_state.get("last_log_offset", 0) or 0)
-        saved_fingerprint = previous_state.get("last_log_fingerprint", "")
+        last_log_read_at_to_save = None
 
-        saved_last_read_at = previous_state.get("last_log_read_at", "")
-
-        if TRACKER_STATE_FILE.exists() and can_resume_log(path, saved_path, saved_offset, saved_fingerprint):
-            start_offset = saved_offset
-            self.log_time_cutoff_at = None
-            resume_message = f"Started sync session from saved offset {start_offset}"
-        else:
+        if mode == "From start of log":
             start_offset = 0
-            # If the log was cleared/replaced, we must scan from byte 0, but we
-            # should not re-apply older lines. Only lines whose chat timestamp is
-            # at/after the previous last_log_read_at are processed. With no prior
-            # state, the cutoff is None and the whole file is imported.
-            self.log_time_cutoff_at = parse_iso_datetime(saved_last_read_at) if TRACKER_STATE_FILE.exists() else None
-            if self.log_time_cutoff_at is None:
-                resume_message = "Started sync session from beginning of log"
+            self.log_time_cutoff_at = None
+            last_log_read_at_to_save = ""
+            resume_message = "Started sync session from beginning of log"
+        elif mode == "From chosen time":
+            chosen_time = self.last_log_read_at_var.get().strip()
+            cutoff_at = parse_iso_datetime(chosen_time) if chosen_time else None
+            if chosen_time and cutoff_at is None:
+                messagebox.showerror("Invalid time", "Use ISO format like 2026-06-20T18:30:00 or leave it empty.")
+                return
+            start_offset = 0
+            self.log_time_cutoff_at = cutoff_at
+            last_log_read_at_to_save = chosen_time
+            if chosen_time:
+                resume_message = f"Started sync session from beginning of log; skipping lines before {chosen_time}"
             else:
-                resume_message = f"Started sync session from beginning of log; skipping lines before {saved_last_read_at}"
+                resume_message = "Started sync session from beginning of log with no time cutoff"
+        elif mode == "From end of log":
+            try:
+                start_offset = int(path.stat().st_size)
+            except OSError as ex:
+                messagebox.showerror("chat.log read error", str(ex))
+                return
+            self.log_time_cutoff_at = None
+            latest_log_time = newest_log_timestamp_at_or_before(path, start_offset)
+            last_log_read_at_to_save = latest_log_time.isoformat(timespec="seconds") if latest_log_time else ""
+            resume_message = f"Started sync session from end of log at offset {start_offset}"
+        else:
+            # Resume only when the saved offset belongs to the same unchanged log.
+            # Size checks alone are not enough: chat.log can be cleared/replaced and
+            # later grow past the old offset, which would make us skip valid data.
+            saved_path = previous_state.get("chat_log_path", "")
+            saved_offset = int(previous_state.get("last_log_offset", 0) or 0)
+            saved_fingerprint = previous_state.get("last_log_fingerprint", "")
+            saved_last_read_at = previous_state.get("last_log_read_at", "")
+
+            if TRACKER_STATE_FILE.exists() and can_resume_log(path, saved_path, saved_offset, saved_fingerprint):
+                start_offset = saved_offset
+                self.log_time_cutoff_at = None
+                resume_message = f"Started sync session from saved offset {start_offset}"
+            else:
+                start_offset = 0
+                # If the log was cleared/replaced, we must scan from byte 0, but
+                # should not re-apply older lines. Only lines whose chat timestamp
+                # is at/after last_log_read_at are processed.
+                self.log_time_cutoff_at = parse_iso_datetime(saved_last_read_at) if TRACKER_STATE_FILE.exists() else None
+                if self.log_time_cutoff_at is None:
+                    resume_message = "Started sync session from beginning of log"
+                else:
+                    resume_message = f"Started sync session from beginning of log; skipping lines before {saved_last_read_at}"
 
         self.log_offset = start_offset
-        self.save_state()
+        if last_log_read_at_to_save is None:
+            self.save_state()
+        else:
+            self.save_state(last_log_read_at=last_log_read_at_to_save)
 
         # Drop any stale worker messages from a previous stopped session.
         while True:
@@ -1666,6 +1767,7 @@ class SkillTrackerApp:
         preserved_last_read_at = str(self.state.get("last_log_read_at", "") or "")
         if last_log_read_at is not None:
             preserved_last_read_at = str(last_log_read_at or "")
+            self.last_log_read_at_var.set(preserved_last_read_at)
 
         self.state = {
             "chat_log_path": chat_log_path,
@@ -1680,6 +1782,7 @@ class SkillTrackerApp:
             "mob": self.mob_var.get(),
             "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
+            "sync_start_mode": self.sync_start_mode_var.get(),
         }
         save_json(TRACKER_STATE_FILE, self.state)
 
