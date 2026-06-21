@@ -277,6 +277,10 @@ def equipment_item_cost_per_shot_ped(item: dict) -> float:
     return float(decay) / 100.0 + float(ammo_burn) / 10000.0
 
 
+def equipment_item_max_damage(item: dict) -> float:
+    return parse_float(item.get("max_damage"), 0.0)
+
+
 def weapon_cost_per_shot_ped(weapon_name: str) -> float:
     return equipment_item_cost_per_shot_ped(WEAPONS.get(weapon_name) or {})
 
@@ -289,6 +293,43 @@ def hunting_setup_cost_per_shot_ped(weapon_name: str, amplifier_name: str = "", 
         if attachment_name in ATTACHMENTS:
             cost += equipment_item_cost_per_shot_ped(ATTACHMENTS[attachment_name])
     return cost
+
+
+def hunting_setup_max_damage(weapon_name: str, amplifier_name: str = "") -> float:
+    max_damage = equipment_item_max_damage(WEAPONS.get(weapon_name) or {})
+    if amplifier_name in AMPLIFIERS:
+        max_damage += equipment_item_max_damage(AMPLIFIERS[amplifier_name])
+    return max_damage
+
+
+def hunting_setup_efficiency(weapon_name: str) -> float | None:
+    weapon = WEAPONS.get(weapon_name) or {}
+    efficiency = parse_float(weapon.get("efficiency"), None)
+    return efficiency
+
+
+def hunting_setup_uses_per_minute(weapon_name: str) -> float:
+    weapon = WEAPONS.get(weapon_name) or {}
+    return parse_float(weapon.get("uses_per_minute"), 0.0)
+
+
+def hunting_setup_dpp(weapon_name: str, amplifier_name: str = "", attachment_names=None) -> float:
+    cost_ped = hunting_setup_cost_per_shot_ped(weapon_name, amplifier_name, attachment_names)
+    cost_pec = cost_ped * 100.0
+    if cost_pec == 0:
+        return 0.0
+    return (0.695 * hunting_setup_max_damage(weapon_name, amplifier_name)) / cost_pec
+
+
+def hunting_setup_ped_per_hour(weapon_name: str, amplifier_name: str = "", attachment_names=None) -> float:
+    cost_ped = hunting_setup_cost_per_shot_ped(weapon_name, amplifier_name, attachment_names)
+    return cost_ped * hunting_setup_uses_per_minute(weapon_name) * 60.0
+
+
+def avg_ped_loss_per_100(efficiency: float | None) -> float | None:
+    if efficiency is None:
+        return None
+    return (0.07 - (0.0007 * efficiency)) * 100.0
 
 
 @dataclass
@@ -764,22 +805,33 @@ class SkillTrackerApp:
         ttk.Button(top, text="Delete Selected Session", command=self.delete_selected_session).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
-        columns = ("started", "ended", "weapon", "mob", "attacks", "damage", "ped", "loot", "loot_percent", "skill_tt", "skill_tt_percent", "skill_points", "skill_events", "skills")
+        columns = (
+            "started", "ended", "weapon", "mob", "attacks", "damage", "ped",
+            "dpp", "efficiency", "ped_h", "loot", "loot_percent", "skill_tt",
+            "skill_tt_percent", "avg_ped_loss_100", "skill_tt_minus_avg_loss_100",
+            "skill_points", "skill_events", "skills",
+        )
         self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
         setup = [
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon", 200),
             ("mob", "Mob", 170), ("attacks", "Attacks", 75), ("damage", "Damage", 85),
-            ("ped", "PED cycled", 95), ("loot", "Loot PED", 85),
+            ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
+            ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
             ("loot_percent", "Loot %", 75),
             ("skill_tt", "TT-equiv total", 105), ("skill_points", "Point total", 115),
             ("skill_tt_percent", "Skill TT %", 85),
+            ("avg_ped_loss_100", "Avg PED lose/100", 125),
+            ("skill_tt_minus_avg_loss_100", "Skill TT - avg lose/100", 145),
             ("skill_events", "Skill gains", 90), ("skills", "Skills gained", 300),
         ]
         for col, title, width in setup:
             self.sessions_tree.heading(col, text=title)
             self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "skills") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
-        self.sessions_tree.pack(fill="both", expand=True, padx=10, pady=10)
+        sessions_xscroll = ttk.Scrollbar(self.sessions_tab, orient="horizontal", command=self.sessions_tree.xview)
+        self.sessions_tree.configure(xscrollcommand=sessions_xscroll.set)
+        self.sessions_tree.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        sessions_xscroll.pack(fill="x", padx=10, pady=(0, 10))
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
 
     def create_session_details_tab(self):
@@ -1694,18 +1746,33 @@ class SkillTrackerApp:
             mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
             ped_cycled = float(session.get('ped_cycled', 0.0))
             loot_ped = float(session.get('loot_ped_total', 0.0))
+            weapon = session.get("weapon", "")
+            amplifier = session.get("amplifier", "")
+            attachments = session.get("attachments", []) or []
+            has_weapon_stats = weapon in WEAPONS
+            dpp = hunting_setup_dpp(weapon, amplifier, attachments) if has_weapon_stats else 0.0
+            efficiency = hunting_setup_efficiency(weapon)
+            ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
+            skill_tt_percent = percent(skill_tt_total, ped_cycled)
+            avg_loss = avg_ped_loss_per_100(efficiency)
+            skill_tt_minus_avg_loss = skill_tt_percent - avg_loss if avg_loss is not None else None
             self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
                 session.get("started_at", ""),
                 session.get("ended_at", ""),
-                session.get("weapon", ""),
+                weapon,
                 mob,
                 session.get("attacks_total", 0),
                 f"{float(session.get('damage_total', 0.0)):.1f}",
                 f"{ped_cycled:.4f}",
+                f"{dpp:.3f}" if dpp else "",
+                f"{efficiency:.1f}" if efficiency is not None else "",
+                f"{ped_per_hour:.2f}" if ped_per_hour else "",
                 f"{loot_ped:.4f}",
                 f"{percent(loot_ped, ped_cycled):.2f}%",
                 f"{skill_tt_total:.4f}",
-                f"{percent(skill_tt_total, ped_cycled):.2f}%",
+                f"{skill_tt_percent:.2f}%",
+                f"{avg_loss:.2f}" if avg_loss is not None else "",
+                f"{skill_tt_minus_avg_loss:.2f}" if skill_tt_minus_avg_loss is not None else "",
                 f"{skill_points_total:.4f}",
                 skill_gain_events_total,
                 skills_text,
