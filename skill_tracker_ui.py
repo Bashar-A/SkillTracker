@@ -478,6 +478,9 @@ class SkillTrackerApp:
         self.reader_processed_batches = 0
 
         self.profession_var = tk.StringVar()
+        default_projection_profession = "Animal Looter" if "Animal Looter" in PROFESSIONS else next(iter(PROFESSIONS), "")
+        self.session_projection_profession_var = tk.StringVar(value=default_projection_profession)
+        self.session_projection_ped_var = tk.StringVar(value="1000")
         self.total_gain_var = tk.StringVar(value="Total profession gain: 0.0000")
         self.selected_skill_var = tk.StringVar(value="")
         self.current_var = tk.StringVar(value="0")
@@ -843,6 +846,26 @@ class SkillTrackerApp:
             text="Select a session in Previous Sessions to inspect exact skill gains, averages, hunting totals, and saved parsed events.",
         ).pack(anchor="w")
 
+        projection = ttk.LabelFrame(self.session_details_tab, text="Profession projection", padding=10)
+        projection.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(projection, text="Profession:").grid(row=0, column=0, sticky="w")
+        profession_combo = ttk.Combobox(
+            projection,
+            textvariable=self.session_projection_profession_var,
+            values=sorted(PROFESSIONS.keys(), key=str.lower),
+            state="readonly",
+            width=45,
+        )
+        profession_combo.grid(row=0, column=1, sticky="w", padx=8)
+        profession_combo.bind("<<ComboboxSelected>>", self.refresh_selected_session_details)
+        ttk.Label(projection, text="PED cycle:").grid(row=0, column=2, sticky="w", padx=(16, 0))
+        ped_entry = ttk.Entry(projection, textvariable=self.session_projection_ped_var, width=14)
+        ped_entry.grid(row=0, column=3, sticky="w", padx=8)
+        ped_entry.bind("<Return>", self.refresh_selected_session_details)
+        ped_entry.bind("<FocusOut>", self.refresh_selected_session_details)
+        ttk.Button(projection, text="Calculate", command=self.refresh_selected_session_details).grid(row=0, column=4, sticky="w", padx=4)
+        projection.columnconfigure(1, weight=1)
+
         self.session_detail_summary_var = tk.StringVar(value="No session selected")
         summary = ttk.LabelFrame(self.session_details_tab, text="Selected session summary", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
@@ -893,6 +916,10 @@ class SkillTrackerApp:
     def on_session_selected(self, event=None):
         self.show_session_details(self.selected_session_from_table())
 
+    def refresh_selected_session_details(self, event=None):
+        self.show_session_details(self.selected_session_from_table())
+        self.update_session_summary()
+
     def show_session_details(self, session):
         self.session_detail_skill_tree.delete(*self.session_detail_skill_tree.get_children())
         self.session_detail_events_text.delete("1.0", "end")
@@ -915,6 +942,7 @@ class SkillTrackerApp:
         skill_tt_percent = percent(skill_tt_total, ped_cycled)
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
         attachments = ", ".join(session.get("attachments", []) or []) or "-"
+        profession_projection_text = self.profession_projection_text(session)
 
         self.session_detail_summary_var.set(
             f"Started: {session.get('started_at', '')} | Ended: {session.get('ended_at', '')}\n"
@@ -928,7 +956,8 @@ class SkillTrackerApp:
             f"Skill gain messages: {skill_events_total} | Point total: {skill_points_total:.4f} | "
             f"TT-equivalent total: {skill_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
             f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
-            f"Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT"
+            f"Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT\n"
+            f"{profession_projection_text}"
         )
 
         all_skills = sorted(set(skill_points) | set(skill_tt) | set(counts), key=str.lower)
@@ -1645,6 +1674,60 @@ class SkillTrackerApp:
                 gains[profession_name] = total
         return gains
 
+    def calculate_profession_projection(self, session, profession_name: str, ped_cycle: float | None = None) -> float:
+        profession = PROFESSIONS.get(profession_name)
+        if not profession:
+            return 0.0
+        if isinstance(session, MonitorSession):
+            session = asdict(session)
+
+        skill_tt = session.get("skill_gains_tt", {}) or {}
+        ped_cycled = float(session.get("ped_cycled", 0.0))
+        total = 0.0
+
+        for skill, weight in profession["skills"].items():
+            if ped_cycle is None:
+                tt_delta = float(skill_tt.get(skill, 0.0))
+            else:
+                if ped_cycled <= 0:
+                    tt_delta = 0.0
+                else:
+                    tt_delta = float(skill_tt.get(skill, 0.0)) / ped_cycled * float(ped_cycle)
+            current_points = float(self.current_skills.get(skill, 0.0))
+            try:
+                point_gain = find_skill_after_tt_delta(current_points, tt_delta) - current_points
+            except Exception:
+                point_gain = 0.0
+            total += point_gain * float(weight) / 100.0
+
+        return total
+
+    def selected_projection_profession(self) -> str:
+        profession_name = self.session_projection_profession_var.get()
+        if profession_name in PROFESSIONS:
+            return profession_name
+        profession_name = "Animal Looter" if "Animal Looter" in PROFESSIONS else next(iter(PROFESSIONS), "")
+        self.session_projection_profession_var.set(profession_name)
+        return profession_name
+
+    def selected_projection_ped_cycle(self) -> float | None:
+        ped_cycle = parse_float(self.session_projection_ped_var.get(), None)
+        if ped_cycle is None or ped_cycle < 0:
+            return None
+        return ped_cycle
+
+    def format_ped_cycle(self, ped_cycle: float) -> str:
+        return f"{ped_cycle:,.2f}".rstrip("0").rstrip(".")
+
+    def profession_projection_text(self, session) -> str:
+        profession_name = self.selected_projection_profession()
+        ped_cycle = self.selected_projection_ped_cycle()
+        if ped_cycle is None:
+            return f"{profession_name} projected gain: invalid PED cycle"
+
+        projected = self.calculate_profession_projection(session, profession_name, ped_cycle)
+        return f"{profession_name} projected gain at {self.format_ped_cycle(ped_cycle)} PED: {projected:.4f}"
+
     def refresh_session_skill_tree(self):
         self.session_skill_tree.delete(*self.session_skill_tree.get_children())
         if self.current_session is None:
@@ -1690,6 +1773,7 @@ class SkillTrackerApp:
             )
         top_skills_text = "; ".join(top_skills) or "-"
         attachments = ", ".join(s.attachments or []) or "-"
+        profession_projection_text = self.profession_projection_text(s)
         self.session_summary_var.set(
             f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Amp: {s.amplifier or '-'} | Attachments: {attachments}\n"
             f"Mob: {s.mob or '-'} {s.maturity or ''}\n"
@@ -1699,7 +1783,8 @@ class SkillTrackerApp:
             f"TT-equivalent total: {s.skill_gain_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
             f"Skill messages/attack: {skill_messages_per_attack:.2f}%\n"
             f"Top skills: {top_skills_text}\n"
-            f"Top profession gains: {top_text}"
+            f"Top profession gains: {top_text}\n"
+            f"{profession_projection_text}"
         )
 
     def append_event(self, text: str):
