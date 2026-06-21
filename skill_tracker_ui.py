@@ -808,8 +808,8 @@ class SkillTrackerApp:
         columns = (
             "started", "ended", "weapon", "mob", "attacks", "damage", "ped",
             "dpp", "efficiency", "ped_h", "loot", "loot_percent", "skill_tt",
-            "skill_tt_percent", "avg_ped_loss_100", "skill_tt_minus_avg_loss_100",
-            "skill_points", "skill_events", "skills",
+            "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
+            "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
         )
         self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
         setup = [
@@ -820,6 +820,7 @@ class SkillTrackerApp:
             ("loot_percent", "Loot %", 75),
             ("skill_tt", "TT-equiv total", 105), ("skill_points", "Point total", 115),
             ("skill_tt_percent", "Skill TT %", 85),
+            ("avg_skill_tt_per_hour", "Avg skill TT/h", 105),
             ("avg_ped_loss_100", "Avg PED lose/100", 125),
             ("skill_tt_minus_avg_loss_100", "Skill TT - avg lose/100", 145),
             ("skill_events", "Skill gains", 90), ("skills", "Skills gained", 300),
@@ -1754,6 +1755,7 @@ class SkillTrackerApp:
             efficiency = hunting_setup_efficiency(weapon)
             ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
             skill_tt_percent = percent(skill_tt_total, ped_cycled)
+            avg_skill_tt_per_hour = (skill_tt_percent / 100.0) * ped_per_hour if ped_per_hour else 0.0
             avg_loss = avg_ped_loss_per_100(efficiency)
             skill_tt_minus_avg_loss = skill_tt_percent - avg_loss if avg_loss is not None else None
             self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
@@ -1771,6 +1773,7 @@ class SkillTrackerApp:
                 f"{percent(loot_ped, ped_cycled):.2f}%",
                 f"{skill_tt_total:.4f}",
                 f"{skill_tt_percent:.2f}%",
+                f"{avg_skill_tt_per_hour:.4f}" if avg_skill_tt_per_hour else "",
                 f"{avg_loss:.2f}" if avg_loss is not None else "",
                 f"{skill_tt_minus_avg_loss:.2f}" if skill_tt_minus_avg_loss is not None else "",
                 f"{skill_points_total:.4f}",
