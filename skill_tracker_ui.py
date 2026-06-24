@@ -816,7 +816,7 @@ class SkillTrackerApp:
         )
         self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
         setup = [
-            ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon", 200),
+            ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
             ("mob", "Mob", 170), ("attacks", "Attacks", 75), ("damage", "Damage", 85),
             ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
             ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
@@ -1835,6 +1835,9 @@ class SkillTrackerApp:
             weapon = session.get("weapon", "")
             amplifier = session.get("amplifier", "")
             attachments = session.get("attachments", []) or []
+            weapon_display = weapon
+            if amplifier:
+                weapon_display = f"{weapon or '-'} + {amplifier}"
             has_weapon_stats = weapon in WEAPONS
             dpp = hunting_setup_dpp(weapon, amplifier, attachments) if has_weapon_stats else 0.0
             efficiency = hunting_setup_efficiency(weapon)
@@ -1846,7 +1849,7 @@ class SkillTrackerApp:
             self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
                 session.get("started_at", ""),
                 session.get("ended_at", ""),
-                weapon,
+                weapon_display,
                 mob,
                 session.get("attacks_total", 0),
                 f"{float(session.get('damage_total', 0.0)):.1f}",

@@ -1,7 +1,8 @@
 # Auto-generated from Entropia Nexus.
 # This file is hardcoded and does not call the internet.
 
-MOBS = {'50 Foot Android Party Girl': {'planets': ['ROCKtropia'], 'maturities': {'Default': {'hp': None, 'level': 50}}},
+MOBS = {'Assualt Mulumn': {'planets': ['Calypso'], 'maturities': {'Default': {'hp': 100, 'level': 4}}},
+'50 Foot Android Party Girl': {'planets': ['ROCKtropia'], 'maturities': {'Default': {'hp': None, 'level': 50}}},
  '50 Foot Digital Party Girl': {'planets': ['ROCKtropia'], 'maturities': {'Default': {'hp': None, 'level': 50}}},
  '50 Foot Electro Party Girl': {'planets': ['ROCKtropia'], 'maturities': {}},
  '50 Foot Fembot Party Girl': {'planets': ['ROCKtropia'], 'maturities': {'Default': {'hp': None, 'level': 50}}},
