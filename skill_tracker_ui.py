@@ -55,7 +55,7 @@ SESSIONS_FILE = Path("skill_tracker_sessions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-graphs-layout-v8"
+LOOT_TRACKER_GRAPH_VERSION = "loot-save-all-events-v9"
 LOOT_EVENT_CONTINUE_SECONDS = 8
 
 
@@ -1131,17 +1131,18 @@ class SkillTrackerApp:
         item_totals = self.loot_item_totals(loot_events)
         top_items = "; ".join(f"{item}: {qty}" for item, qty in list(item_totals.items())[:6]) or "-"
         source = "active session" if self.current_session is not None else "saved session"
-        tree_limit = 500
-        hidden_rows = max(0, len(loot_events) - tree_limit)
-        hidden_text = f" | Event table shows last {tree_limit:,} only" if hidden_rows else ""
         self.loot_summary_var.set(
             f"Source: {source} | Loot events/kills: {len(loot_events)} | PED cycled: {ped_cycled:.4f} | "
             f"Loot: {loot_total:.4f} PED ({percent(loot_total, ped_cycled):.2f}%) | "
-            f"Cost per kill/event: {cost_per_kill:.6f} PED{hidden_text}\n"
+            f"Cost per kill/event: {cost_per_kill:.6f} PED | Event table shows all saved loot events\n"
             f"Unique items: {len(item_totals)} | Top items: {top_items}"
         )
 
-        for loot_event in loot_events[-tree_limit:]:
+        # Show every saved loot event. Earlier versions only displayed the last
+        # 500 rows, which looked like older loot events were not saved.
+        # The graphs are still downsampled separately, so drawing performance is
+        # not tied to the number of rows shown here.
+        for loot_event in loot_events:
             cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
             self.loot_events_tree.insert("", "end", values=(
                 loot_event.get("index", ""),
@@ -1993,7 +1994,7 @@ class SkillTrackerApp:
         self.make_tree_sortable(self.session_detail_skill_tree, {col: title for col, title, _ in setup})
         self.session_detail_skill_tree.pack(fill="both", expand=True)
 
-        events_frame = ttk.LabelFrame(self.session_details_tab, text="Saved parsed events (last 300 per session)", padding=6)
+        events_frame = ttk.LabelFrame(self.session_details_tab, text="Saved parsed events (display limited, file saves all)", padding=6)
         events_frame.pack(fill="both", expand=True, padx=10, pady=6)
         self.session_detail_events_text = tk.Text(events_frame, height=10, wrap="none")
         self.session_detail_events_text.pack(fill="both", expand=True)
@@ -2721,9 +2722,10 @@ class SkillTrackerApp:
             return
         session = self.current_session
         previous_event_type = session.events[-1].get("type", "") if session.events else ""
+        # Keep all parsed events in the session file. Older versions kept only
+        # the last 300 events; that made old-session fallback reconstruction lose
+        # earlier loot events. UI text widgets still limit what they display.
         session.events.append(event)
-        if len(session.events) > 300:
-            session.events = session.events[-300:]
 
         event_type = event["type"]
         if event_type == "skill_gain":
