@@ -53,6 +53,11 @@ CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
+# Some stackables do not print quantity in chat.log. Derive count from TT value.
+STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
+LOOT_TRACKER_GRAPH_VERSION = "loot-graphs-zoom-v7"
+LOOT_EVENT_CONTINUE_SECONDS = 8
+
 
 
 X = np.array([
@@ -232,6 +237,10 @@ def parse_chat_timestamp(value):
         return None
 
 
+def parse_any_timestamp(value):
+    return parse_chat_timestamp(value) or parse_iso_datetime(value)
+
+
 def event_is_after_cutoff(event, cutoff_at):
     """Return True when an event should be processed after a safe-reset read.
 
@@ -264,9 +273,46 @@ def percent(numerator, denominator) -> float:
         return 0.0
 
 
+def ignored_loot_item_name(item_name: str) -> bool:
+    lower_name = str(item_name or "").lower()
+    return any(item.lower() == lower_name for item in IGNORED_LOOT_ITEMS)
+
+
 def ignored_loot_message(message: str) -> bool:
-    lower_message = str(message).lower()
+    lower_message = str(message or "").lower()
     return any(item.lower() in lower_message for item in IGNORED_LOOT_ITEMS)
+
+
+def normalize_loot_item_name(raw_name: str) -> str:
+    """Return a stable item name from the text between 'You received' and 'Value:'.
+
+    Entropia loot messages often include quantities, for example
+    'Animal Muscle Oil x 12'.  For item count charts we want the item name,
+    not a separate bucket for every quantity.
+    """
+    name = str(raw_name or "").strip()
+    name = re.sub(r"\s+x\s+[0-9][0-9,]*(?:\.[0-9]+)?$", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"\s+\([0-9][0-9,]*(?:\.[0-9]+)?\)$", "", name).strip()
+    return name or "Unknown item"
+
+
+def parse_loot_item_quantity(raw_name: str, item_name: str | None = None, value_ped: float | None = None) -> int:
+    name = str(raw_name or "")
+    match = re.search(r"\s+x\s+([0-9][0-9,]*)", name, flags=re.IGNORECASE)
+    if match:
+        try:
+            return max(1, int(match.group(1).replace(",", "")))
+        except ValueError:
+            return 1
+
+    normalized = item_name or normalize_loot_item_name(raw_name)
+    unit_value = STACKABLE_ITEM_PED_VALUE.get(normalized)
+    if unit_value and value_ped is not None:
+        try:
+            return max(1, int(round(float(value_ped) / float(unit_value))))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 1
+    return 1
 
 
 def equipment_item_cost_per_shot_ped(item: dict) -> float:
@@ -366,6 +412,8 @@ class MonitorSession:
     attacks_total: int = 0
     damage_total: float = 0.0
     loot_ped_total: float = 0.0
+    loot_event_count: int = 0
+    loot_events: list = field(default_factory=list)
     ped_cycled: float = 0.0
     events: list = field(default_factory=list)
 
@@ -377,7 +425,7 @@ class ChatLogParser:
     improved_re = re.compile(r"^Your (.+?) has improved by ([0-9]+(?:\.[0-9]+)?)$")
     normal_damage_re = re.compile(r"^You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
     crit_damage_re = re.compile(r"^Critical hit - Additional damage! You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
-    loot_re = re.compile(r"^You received .+ Value: ([0-9]+(?:\.[0-9]+)?) PED$")
+    loot_re = re.compile(r"^You received (.+?) Value: ([0-9]+(?:\.[0-9]+)?) PED$")
 
     @classmethod
     def parse_line_timestamp(cls, line: str):
@@ -442,7 +490,17 @@ class ChatLogParser:
         if loot:
             if ignored_loot_message(message):
                 return None
-            return {"type": "loot", "timestamp": timestamp, "value_ped": float(loot.group(1)), "message": message}
+            raw_item_name = loot.group(1).strip()
+            item_name = normalize_loot_item_name(raw_item_name)
+            value_ped = float(loot.group(2))
+            return {
+                "type": "loot",
+                "timestamp": timestamp,
+                "item": item_name,
+                "quantity": parse_loot_item_quantity(raw_item_name, item_name, value_ped),
+                "value_ped": value_ped,
+                "message": message,
+            }
 
         return None
 
@@ -524,6 +582,16 @@ class SkillTrackerApp:
         self.mob_filter_var = tk.StringVar()
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
+        self.loot_summary_var = tk.StringVar(value="No loot session selected")
+        self.loot_item_filter_var = tk.StringVar()
+        self.loot_item_vars = {}
+        self.loot_chart_payloads = {}
+        self.loot_chart_meta = {}
+        self.loot_zoom_ranges = {}
+        self.loot_drag = None
+        self.loot_selection_var = tk.StringVar(value="Drag across any loot graph to zoom and show totals for the selected range.")
+        self.loot_item_check_signature = None
+        self.loot_refresh_after_id = None
 
         self.create_ui()
         self.load_profession()
@@ -541,14 +609,17 @@ class SkillTrackerApp:
         self.hunting_tab = ttk.Frame(notebook)
         self.sessions_tab = ttk.Frame(notebook)
         self.session_details_tab = ttk.Frame(notebook)
+        self.loot_tab = ttk.Frame(notebook)
 
         notebook.add(self.monitor_tab, text="Live Monitor")
+        notebook.add(self.loot_tab, text="Loot Tracker")
         notebook.add(self.hunting_tab, text="Hunting Setup")
         notebook.add(self.sessions_tab, text="Previous Sessions")
         notebook.add(self.session_details_tab, text="Session Details")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
         self.create_monitor_tab()
+        self.create_loot_tab()
         self.create_hunting_tab()
         self.create_sessions_tab()
         self.create_session_details_tab()
@@ -584,10 +655,18 @@ class SkillTrackerApp:
         text = str(value or "").strip()
         if not text:
             return None
-        numeric_text = text.rstrip("%").replace(",", "")
+        numeric_text = text.replace(",", "").strip()
+        # Numeric table cells may be formatted as 84.20%, 1.23x, or 0.0123 PED.
+        numeric_text = re.sub(r"\s*(%|x|PED)\s*$", "", numeric_text, flags=re.IGNORECASE)
         try:
             return (0, float(numeric_text))
         except ValueError:
+            match = re.search(r"[-+]?\d+(?:\.\d+)?", numeric_text)
+            if match:
+                try:
+                    return (0, float(match.group(0)))
+                except ValueError:
+                    pass
             return (1, text.casefold())
 
     def apply_tree_sort(self, tree):
@@ -715,6 +794,1023 @@ class SkillTrackerApp:
         self.event_text = tk.Text(event_frame, height=10, wrap="none")
         self.event_text.pack(fill="both", expand=True)
 
+
+    def create_loot_tab(self):
+        top = ttk.Frame(self.loot_tab, padding=10)
+        top.pack(fill="x")
+        ttk.Label(
+            top,
+            text=(
+                "Uses the active session while syncing; otherwise uses the selected previous session, or the latest saved session. "
+                f"Graph version: {LOOT_TRACKER_GRAPH_VERSION}"
+            ),
+        ).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self.refresh_loot_tab).pack(side="right", padx=4)
+        ttk.Button(top, text="Reset zoom", command=self.reset_loot_zoom).pack(side="right", padx=4)
+
+        summary = ttk.LabelFrame(self.loot_tab, text="Loot summary", padding=10)
+        summary.pack(fill="x", padx=10, pady=6)
+        ttk.Label(summary, textvariable=self.loot_summary_var, justify="left").pack(anchor="w")
+
+        selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
+        selection.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(selection, textvariable=self.loot_selection_var, justify="left").pack(anchor="w")
+
+        body = ttk.Panedwindow(self.loot_tab, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=10, pady=6)
+
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=4)
+
+        items_frame = ttk.LabelFrame(left, text="Item filter", padding=6)
+        items_frame.pack(fill="both", expand=True)
+        ttk.Label(items_frame, text="Filter item names:").pack(anchor="w")
+        item_filter = ttk.Entry(items_frame, textvariable=self.loot_item_filter_var)
+        item_filter.pack(fill="x", pady=(2, 6))
+        item_filter.bind("<KeyRelease>", lambda event: self.refresh_loot_item_checks(force=True))
+        ttk.Button(items_frame, text="Apply selected items", command=self.refresh_loot_tab).pack(fill="x", pady=(0, 4))
+        ttk.Button(items_frame, text="Clear item selection", command=self.clear_loot_item_selection).pack(fill="x", pady=(0, 8))
+
+        canvas_holder = ttk.Frame(items_frame)
+        canvas_holder.pack(fill="both", expand=True)
+        self.loot_items_canvas = tk.Canvas(canvas_holder, highlightthickness=0, width=260)
+        self.loot_items_scrollbar = ttk.Scrollbar(canvas_holder, orient="vertical", command=self.loot_items_canvas.yview)
+        self.loot_items_scrollable = ttk.Frame(self.loot_items_canvas)
+        self.loot_items_scrollable.bind(
+            "<Configure>",
+            lambda event: self.loot_items_canvas.configure(scrollregion=self.loot_items_canvas.bbox("all")),
+        )
+        self.loot_items_canvas.create_window((0, 0), window=self.loot_items_scrollable, anchor="nw")
+        self.loot_items_canvas.configure(yscrollcommand=self.loot_items_scrollbar.set)
+        self.loot_items_canvas.pack(side="left", fill="both", expand=True)
+        self.loot_items_scrollbar.pack(side="right", fill="y")
+
+        events_frame = ttk.LabelFrame(left, text="Loot events", padding=6)
+        events_frame.pack(fill="both", expand=True, pady=(8, 0))
+        columns = ("idx", "time", "items", "loot", "cost", "return")
+        self.loot_events_tree = ttk.Treeview(events_frame, columns=columns, show="headings", height=10)
+        setup = [
+            ("idx", "#", 45),
+            ("time", "Time", 135),
+            ("items", "Items", 65),
+            ("loot", "Loot PED", 80),
+            ("cost", "Cost PED", 80),
+            ("return", "Multiplier", 85),
+        ]
+        for col, title, width in setup:
+            self.loot_events_tree.heading(col, text=title)
+            self.loot_events_tree.column(col, width=width, anchor="center")
+        self.make_tree_sortable(self.loot_events_tree, {col: title for col, title, _ in setup})
+        self.loot_events_tree.pack(fill="both", expand=True)
+
+        graph1 = ttk.LabelFrame(right, text="1. Loot value / elapsed time (% return)", padding=6)
+        graph1.pack(fill="both", expand=True, pady=(0, 6))
+        self.loot_value_time_canvas = tk.Canvas(graph1, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_value_time_canvas.pack(fill="both", expand=True)
+
+        graph2 = ttk.LabelFrame(right, text="2. Loot value / cost per kill (PED, multiplier)", padding=6)
+        graph2.pack(fill="both", expand=True, pady=6)
+        self.loot_cost_canvas = tk.Canvas(graph2, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_cost_canvas.pack(fill="both", expand=True)
+
+        graph3 = ttk.LabelFrame(right, text="3. Number of looted items / elapsed time (not cumulative)", padding=6)
+        graph3.pack(fill="both", expand=True, pady=(6, 0))
+        self.loot_items_time_canvas = tk.Canvas(graph3, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_items_time_canvas.pack(fill="both", expand=True)
+
+        for canvas in (self.loot_value_time_canvas, self.loot_cost_canvas, self.loot_items_time_canvas):
+            canvas.bind("<Configure>", lambda event, c=canvas: self.redraw_chart_canvas(c))
+            canvas.bind("<ButtonPress-1>", lambda event, c=canvas: self.on_loot_chart_drag_start(c, event))
+            canvas.bind("<B1-Motion>", lambda event, c=canvas: self.on_loot_chart_drag_motion(c, event))
+            canvas.bind("<ButtonRelease-1>", lambda event, c=canvas: self.on_loot_chart_drag_end(c, event))
+
+    def loot_source_session(self):
+        if self.current_session is not None:
+            return asdict(self.current_session)
+        selected = self.selected_session_from_table() if hasattr(self, "sessions_tree") else None
+        if selected:
+            return selected
+        if self.sessions:
+            return self.sessions[-1]
+        return None
+
+    def loot_events_for_session(self, session):
+        if not session:
+            return []
+        events = list(session.get("loot_events", []) or [])
+        if events:
+            return self.sanitize_loot_events(events)
+        # Backward compatibility for old saved sessions before loot_events existed.
+        reconstructed = []
+        previous_type = ""
+        cost_per_attack = hunting_setup_cost_per_shot_ped(
+            session.get("weapon", ""),
+            session.get("amplifier", ""),
+            session.get("attachments", []) or [],
+        )
+        running_cost = 0.0
+        previous_event_cost = 0.0
+        for event in session.get("events", []) or []:
+            etype = event.get("type", "")
+            if etype in ("normal_hit", "crit", "jammed") and session.get("count_hunting", False):
+                running_cost += cost_per_attack
+            elif etype == "loot":
+                if reconstructed and previous_type == "loot":
+                    loot_event = reconstructed[-1]
+                else:
+                    cost_ped = max(0.0, running_cost - previous_event_cost)
+                    previous_event_cost = running_cost
+                    loot_event = {
+                        "index": len(reconstructed) + 1,
+                        "started_at": event.get("timestamp", ""),
+                        "ended_at": event.get("timestamp", ""),
+                        "value_ped": 0.0,
+                        "cost_ped": cost_ped,
+                        "items": {},
+                        "messages": [],
+                    }
+                    reconstructed.append(loot_event)
+                item = event.get("item") or normalize_loot_item_name(str(event.get("message", "")).replace("You received", "").split("Value:")[0])
+                if ignored_loot_item_name(item):
+                    previous_type = etype
+                    continue
+                value_ped = float(event.get("value_ped", 0.0) or 0.0)
+                quantity = int(event.get("quantity", 0) or 0)
+                if quantity <= 1 and item in STACKABLE_ITEM_PED_VALUE:
+                    quantity = parse_loot_item_quantity(item, item, value_ped)
+                if quantity <= 0:
+                    quantity = 1
+                loot_event["ended_at"] = event.get("timestamp", loot_event.get("ended_at", ""))
+                loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0)) + value_ped
+                loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0)) + quantity
+                loot_event.setdefault("messages", []).append(event.get("message", ""))
+            previous_type = etype
+        return reconstructed
+
+    def sanitize_loot_events(self, loot_events):
+        """Apply ignored loot filtering and stackable quantity fixes to saved events.
+
+        This also fixes older saved sessions made by versions that counted
+        ignored loot or saved Shrapnel as x1 because chat.log does not print its
+        stack count.
+        """
+        result = []
+        loot_message_re = re.compile(r"^You received (.+?) Value: ([0-9]+(?:\.[0-9]+)?) PED$")
+        for original in list(loot_events or []):
+            event = dict(original or {})
+            messages = list(event.get("messages", []) or [])
+            rebuilt_items = {}
+            rebuilt_value = 0.0
+            rebuilt_from_messages = False
+            for message in messages:
+                match = loot_message_re.match(str(message or ""))
+                if not match:
+                    continue
+                raw_item_name = match.group(1).strip()
+                item_name = normalize_loot_item_name(raw_item_name)
+                value_ped = float(match.group(2))
+                if ignored_loot_item_name(item_name):
+                    rebuilt_from_messages = True
+                    continue
+                quantity = parse_loot_item_quantity(raw_item_name, item_name, value_ped)
+                rebuilt_items[item_name] = int(rebuilt_items.get(item_name, 0)) + int(quantity)
+                rebuilt_value += value_ped
+                rebuilt_from_messages = True
+
+            if rebuilt_from_messages:
+                event["items"] = rebuilt_items
+                event["value_ped"] = rebuilt_value
+            else:
+                filtered_items = {}
+                for item, quantity in (event.get("items", {}) or {}).items():
+                    if ignored_loot_item_name(item):
+                        continue
+                    fixed_quantity = int(quantity or 0)
+                    if item in STACKABLE_ITEM_PED_VALUE and fixed_quantity <= 1:
+                        try:
+                            fixed_quantity = parse_loot_item_quantity(item, item, float(event.get("value_ped", 0.0) or 0.0))
+                        except Exception:
+                            fixed_quantity = int(quantity or 0)
+                    filtered_items[item] = filtered_items.get(item, 0) + fixed_quantity
+                event["items"] = filtered_items
+
+            if float(event.get("value_ped", 0.0) or 0.0) <= 0 and not event.get("items"):
+                continue
+            event["index"] = len(result) + 1
+            result.append(event)
+        return result
+
+    def loot_item_totals(self, loot_events):
+        totals = {}
+        for loot_event in loot_events:
+            for item, quantity in (loot_event.get("items", {}) or {}).items():
+                totals[item] = totals.get(item, 0) + int(quantity or 0)
+        return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0].lower())))
+
+    def selected_loot_items(self):
+        return [item for item, var in self.loot_item_vars.items() if var.get()]
+
+    def clear_loot_item_selection(self):
+        for var in self.loot_item_vars.values():
+            var.set(False)
+        self.refresh_loot_tab()
+
+    def refresh_loot_item_checks(self, force=False):
+        """Rebuild the loot item checkbox list only when it actually changed.
+
+        Recreating dozens/hundreds of Tk checkboxes on every parsed log batch is
+        expensive and was one of the main reasons the tracker UI felt slow.
+        """
+        session = self.loot_source_session()
+        loot_events = self.loot_events_for_session(session)
+        totals = self.loot_item_totals(loot_events)
+        query = self.loot_item_filter_var.get().strip().lower()
+        signature = (tuple(totals.items()), query)
+        if not force and signature == self.loot_item_check_signature:
+            return
+
+        selected = set(self.selected_loot_items())
+        for child in self.loot_items_scrollable.winfo_children():
+            child.destroy()
+        self.loot_item_vars = {item: tk.BooleanVar(value=item in selected) for item in totals}
+        for item, quantity in totals.items():
+            if query and query not in item.lower():
+                continue
+            ttk.Checkbutton(
+                self.loot_items_scrollable,
+                text=f"{item} ({quantity})",
+                variable=self.loot_item_vars[item],
+                command=self.refresh_loot_tab,
+            ).pack(anchor="w")
+        self.loot_item_check_signature = signature
+
+    def schedule_loot_refresh(self, delay_ms=750):
+        """Debounce expensive loot chart redraws while the log reader is busy."""
+        if not hasattr(self, "loot_value_time_canvas"):
+            return
+        if self.loot_refresh_after_id is not None:
+            return
+        self.loot_refresh_after_id = self.root.after(delay_ms, self._run_scheduled_loot_refresh)
+
+    def _run_scheduled_loot_refresh(self):
+        self.loot_refresh_after_id = None
+        self.refresh_loot_tab()
+
+    def first_loot_event_time(self, loot_events):
+        for loot_event in loot_events:
+            event_time = parse_any_timestamp(loot_event.get("started_at") or loot_event.get("ended_at"))
+            if event_time is not None:
+                return event_time
+            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+            if event_time is not None:
+                return event_time
+        return None
+
+    def downsample_points(self, points, max_points=1200):
+        points = list(points or [])
+        if len(points) <= max_points:
+            return points
+        if max_points < 3:
+            return points[:max_points]
+        step = (len(points) - 1) / float(max_points - 1)
+        sampled = []
+        last_index = -1
+        for i in range(max_points):
+            index = int(round(i * step))
+            if index != last_index:
+                sampled.append(points[index])
+                last_index = index
+        return sampled
+
+    def downsample_time_points_by_minute(self, points, bucket_minutes=1.0, max_points=1500):
+        """Keep the latest point in each elapsed-time bucket.
+
+        Graph 1 can easily have thousands of loot events. Drawing every dot and
+        line segment makes Tkinter slow, while one point per minute is enough to
+        see the return trend.
+        """
+        points = list(points or [])
+        if not points:
+            return []
+        if bucket_minutes <= 0:
+            return self.downsample_points(points, max_points)
+        sampled_by_bucket = {}
+        for point in points:
+            try:
+                bucket = int(float(point.get("x", 0.0)) // float(bucket_minutes))
+            except (TypeError, ValueError):
+                bucket = len(sampled_by_bucket)
+            sampled_by_bucket[bucket] = point
+        sampled = list(sampled_by_bucket.values())
+        if points[0] not in sampled:
+            sampled.insert(0, points[0])
+        if points[-1] not in sampled:
+            sampled.append(points[-1])
+        return self.downsample_points(sampled, max_points)
+
+    def refresh_loot_tab(self):
+        if not hasattr(self, "loot_value_time_canvas"):
+            return
+        session = self.loot_source_session()
+        loot_events = self.loot_events_for_session(session)
+        self.refresh_loot_item_checks()
+        self.loot_events_tree.delete(*self.loot_events_tree.get_children())
+
+        if not session:
+            self.loot_summary_var.set("No active or saved session yet.")
+            self.clear_chart(self.loot_value_time_canvas, "No loot data")
+            self.clear_chart(self.loot_cost_canvas, "No loot data")
+            self.clear_chart(self.loot_items_time_canvas, "No loot data")
+            return
+
+        ped_cycled = float(session.get("ped_cycled", 0.0) or 0.0)
+        loot_total = sum(float(event.get("value_ped", 0.0) or 0.0) for event in loot_events)
+        cost_per_kill = ped_cycled / len(loot_events) if loot_events else 0.0
+        item_totals = self.loot_item_totals(loot_events)
+        top_items = "; ".join(f"{item}: {qty}" for item, qty in list(item_totals.items())[:6]) or "-"
+        source = "active session" if self.current_session is not None else "saved session"
+        tree_limit = 500
+        hidden_rows = max(0, len(loot_events) - tree_limit)
+        hidden_text = f" | Event table shows last {tree_limit:,} only" if hidden_rows else ""
+        self.loot_summary_var.set(
+            f"Source: {source} | Loot events/kills: {len(loot_events)} | PED cycled: {ped_cycled:.4f} | "
+            f"Loot: {loot_total:.4f} PED ({percent(loot_total, ped_cycled):.2f}%) | "
+            f"Cost per kill/event: {cost_per_kill:.6f} PED{hidden_text}\n"
+            f"Unique items: {len(item_totals)} | Top items: {top_items}"
+        )
+
+        for loot_event in loot_events[-tree_limit:]:
+            cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
+            self.loot_events_tree.insert("", "end", values=(
+                loot_event.get("index", ""),
+                loot_event.get("ended_at", loot_event.get("started_at", "")),
+                sum(int(v or 0) for v in (loot_event.get("items", {}) or {}).values()),
+                f"{float(loot_event.get('value_ped', 0.0) or 0.0):.4f}",
+                f"{cost_ped:.4f}",
+                f"{(float(loot_event.get('value_ped', 0.0) or 0.0) / cost_ped):.2f}x" if cost_ped else "",
+            ))
+        self.apply_tree_sort(self.loot_events_tree)
+
+        # Use the first real loot timestamp, not the app session start time.
+        # When you resync old chat.log lines, the session start can be later
+        # than the loot timestamps, which made every elapsed-time X value clamp
+        # to 0 and caused the item graph to draw one vertical line.
+        base_time = self.first_loot_event_time(loot_events)
+        has_real_time_axis = base_time is not None
+
+        # Graph 1: cumulative loot return over elapsed loot time.
+        cumulative_loot = 0.0
+        cumulative_cost = 0.0
+        loot_value_points = []
+        for index, loot_event in enumerate(loot_events, start=1):
+            value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
+            event_cost = float(loot_event.get("cost_ped", 0.0) or 0.0)
+            if event_cost <= 0 and cost_per_kill > 0:
+                event_cost = cost_per_kill
+            cumulative_loot += value_ped
+            cumulative_cost += event_cost
+            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+            x_value = self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index)
+            denominator = cumulative_cost if cumulative_cost > 0 else ped_cycled
+            loot_value_points.append({
+                "x": x_value,
+                "y": percent(cumulative_loot, denominator),
+                "label": self.format_chart_time_label(event_time, index) if has_real_time_axis else str(index),
+            })
+        self.render_line_chart(
+            self.loot_value_time_canvas,
+            self.downsample_time_points_by_minute(loot_value_points, bucket_minutes=1.0),
+            title="Cumulative loot / cumulative cost",
+            x_label="Elapsed time" if has_real_time_axis else "Loot event #",
+            y_label="Loot return",
+            x_is_time=has_real_time_axis,
+            y_suffix="%",
+            smooth=False,
+            y_reference_lines=[(100.0, "100%")],
+        )
+
+        scatter_points = []
+        for index, loot_event in enumerate(loot_events, start=1):
+            cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
+            value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
+            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+            scatter_points.append({
+                "x": cost_ped,
+                "y": value_ped,
+                "label": self.format_chart_time_label(event_time, index),
+            })
+        self.render_scatter_chart(
+            self.loot_cost_canvas,
+            self.downsample_points(scatter_points, max_points=1500),
+            title="Loot value vs cost per kill",
+            x_label="Cost per kill (PED)",
+            y_label="Loot value (PED)",
+            y_suffix=" PED",
+            draw_break_even=True,
+            draw_multiplier_lines=True,
+        )
+
+        selected_items = self.selected_loot_items()
+        if not selected_items:
+            selected_items = list(item_totals.keys())[:5]
+        item_series = []
+        for item in selected_items[:12]:
+            raw_points = []
+            for index, loot_event in enumerate(loot_events, start=1):
+                quantity = int((loot_event.get("items", {}) or {}).get(item, 0) or 0)
+                if quantity <= 0:
+                    continue
+                event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+                raw_points.append({
+                    "x": self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index),
+                    "y": quantity,
+                    "label": self.format_chart_time_label(event_time, index) if has_real_time_axis else str(index),
+                })
+            if raw_points:
+                if has_real_time_axis:
+                    buckets = {}
+                    for point in raw_points:
+                        bucket = int(float(point.get("x", 0.0)) // 1.0)
+                        if bucket not in buckets:
+                            buckets[bucket] = {"x": float(bucket), "y": 0, "label": self._time_axis_label(float(bucket))}
+                        buckets[bucket]["y"] += int(point.get("y", 0) or 0)
+                    points = list(buckets.values())
+                else:
+                    points = raw_points
+                item_series.append((item, self.downsample_points(points, 800)))
+        self.render_multi_point_chart(
+            self.loot_items_time_canvas,
+            item_series,
+            title="Looted item quantity by time",
+            x_label="Elapsed time" if has_real_time_axis else "Loot event #",
+            y_label="Items looted",
+            x_is_time=has_real_time_axis,
+        )
+
+    def clear_chart(self, canvas, text="No data"):
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 320)
+        height = max(canvas.winfo_height(), 170)
+        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
+        canvas.create_text(width / 2, height / 2, text=text, fill="#667085")
+
+    def redraw_chart_canvas(self, canvas):
+        payload = self.loot_chart_payloads.get(canvas)
+        if not payload:
+            self.clear_chart(canvas, "No loot data")
+            return
+        kind = payload.get("kind")
+        if kind == "line":
+            self._draw_line_chart_payload(canvas, payload)
+        elif kind == "scatter":
+            self._draw_scatter_chart_payload(canvas, payload)
+        elif kind == "multi_line":
+            self._draw_multi_line_chart_payload(canvas, payload)
+        elif kind == "multi_points":
+            self._draw_multi_point_chart_payload(canvas, payload)
+        else:
+            self.clear_chart(canvas, "No loot data")
+
+    def reset_loot_zoom(self):
+        self.loot_zoom_ranges = {}
+        self.loot_selection_var.set("Zoom reset. Drag across any loot graph to zoom and show totals for the selected range.")
+        self.refresh_loot_tab()
+
+    def on_loot_chart_drag_start(self, canvas, event):
+        meta = self.loot_chart_meta.get(canvas)
+        if not meta:
+            return
+        self.loot_drag = {"canvas": canvas, "start_x": event.x, "rect": None}
+
+    def on_loot_chart_drag_motion(self, canvas, event):
+        if not self.loot_drag or self.loot_drag.get("canvas") is not canvas:
+            return
+        meta = self.loot_chart_meta.get(canvas)
+        if not meta:
+            return
+        rect_id = self.loot_drag.get("rect")
+        if rect_id:
+            canvas.delete(rect_id)
+        left = meta["left"]
+        right = meta["right"]
+        top = meta["top"]
+        bottom = meta["bottom"]
+        x1 = max(left, min(right, self.loot_drag.get("start_x", event.x)))
+        x2 = max(left, min(right, event.x))
+        rect_id = canvas.create_rectangle(min(x1, x2), top, max(x1, x2), bottom, outline="#f59e0b", fill="#fde68a", stipple="gray25")
+        self.loot_drag["rect"] = rect_id
+
+    def on_loot_chart_drag_end(self, canvas, event):
+        if not self.loot_drag or self.loot_drag.get("canvas") is not canvas:
+            return
+        meta = self.loot_chart_meta.get(canvas)
+        drag = self.loot_drag
+        self.loot_drag = None
+        rect_id = drag.get("rect")
+        if rect_id:
+            canvas.delete(rect_id)
+        if not meta:
+            return
+        start_x = drag.get("start_x", event.x)
+        end_x = event.x
+        if abs(end_x - start_x) < 8:
+            return
+        min_sel = self._canvas_x_to_data(canvas, min(start_x, end_x), meta)
+        max_sel = self._canvas_x_to_data(canvas, max(start_x, end_x), meta)
+        if max_sel <= min_sel:
+            return
+        self.loot_selection_var.set(self.describe_loot_chart_selection(canvas, min_sel, max_sel))
+        self.loot_zoom_ranges[canvas] = (min_sel, max_sel)
+        self.redraw_all_loot_charts()
+
+    def redraw_all_loot_charts(self):
+        for canvas in (getattr(self, "loot_value_time_canvas", None), getattr(self, "loot_cost_canvas", None), getattr(self, "loot_items_time_canvas", None)):
+            if canvas is not None:
+                self.redraw_chart_canvas(canvas)
+
+    def _canvas_x_to_data(self, canvas, px, meta):
+        left = meta["left"]
+        right = meta["right"]
+        min_x = meta["min_x"]
+        max_x = meta["max_x"]
+        px = max(left, min(right, float(px)))
+        if right <= left:
+            return min_x
+        return min_x + (max_x - min_x) * ((px - left) / (right - left))
+
+    def _visible_x_bounds(self, min_x, max_x, canvas=None):
+        zoom_range = self.loot_zoom_ranges.get(canvas) if canvas is not None else None
+        if zoom_range:
+            zoom_min, zoom_max = zoom_range
+            clipped_min = max(float(min_x), float(zoom_min))
+            clipped_max = min(float(max_x), float(zoom_max))
+            if clipped_max > clipped_min:
+                return clipped_min, clipped_max
+        return float(min_x), float(max_x)
+
+    def _points_in_x_range(self, points, min_x, max_x):
+        return [point for point in list(points or []) if min_x <= float(point.get("x", 0.0) or 0.0) <= max_x]
+
+    def _remember_chart_meta(self, canvas, *, left, top, right, bottom, min_x, max_x, kind):
+        self.loot_chart_meta[canvas] = {
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "min_x": float(min_x),
+            "max_x": float(max_x),
+            "kind": kind,
+        }
+
+    def _selection_time_text(self, min_x, max_x, x_is_time):
+        if x_is_time:
+            return f"{self._time_axis_label(min_x)} - {self._time_axis_label(max_x)} ({self._time_axis_label(max_x - min_x)})"
+        return f"{min_x:.4f} - {max_x:.4f}"
+
+    def describe_loot_chart_selection(self, canvas, min_x, max_x):
+        payload = self.loot_chart_payloads.get(canvas) or {}
+        kind = payload.get("kind")
+        x_is_time = bool(payload.get("x_is_time", False))
+        range_text = self._selection_time_text(min_x, max_x, x_is_time)
+        if kind == "line":
+            points = self._points_in_x_range(payload.get("points") or [], min_x, max_x)
+            if not points:
+                return f"Selected {range_text}: no return points."
+            first = float(points[0].get("y", 0.0) or 0.0)
+            last = float(points[-1].get("y", 0.0) or 0.0)
+            return f"Selected {range_text}: {len(points)} plotted return points, return {first:.2f}% -> {last:.2f}%."
+        if kind == "scatter":
+            points = self._points_in_x_range(payload.get("points") or [], min_x, max_x)
+            if not points:
+                return f"Selected {range_text}: no loot events."
+            total_cost = sum(float(point.get("x", 0.0) or 0.0) for point in points)
+            total_loot = sum(float(point.get("y", 0.0) or 0.0) for point in points)
+            avg_multi = (total_loot / total_cost) if total_cost else 0.0
+            return f"Selected cost range {range_text}: {len(points)} loot events, total cost {total_cost:.4f} PED, total loot {total_loot:.4f} PED, average {avg_multi:.2f}x."
+        if kind in ("multi_points", "multi_line"):
+            totals = []
+            for name, points in payload.get("series") or []:
+                selected = self._points_in_x_range(points, min_x, max_x)
+                total = sum(float(point.get("y", 0.0) or 0.0) for point in selected)
+                if total > 0:
+                    totals.append((name, total))
+            totals.sort(key=lambda item: item[1], reverse=True)
+            if not totals:
+                return f"Selected {range_text}: no selected item drops."
+            top = "; ".join(f"{name}: {total:.0f}" for name, total in totals[:8])
+            return f"Selected {range_text}: item totals: {top}"
+        return f"Selected {range_text}."
+
+    def elapsed_minutes(self, base_time, event_time, fallback_index):
+        if base_time is None or event_time is None:
+            return float(fallback_index)
+        return max(0.0, (event_time - base_time).total_seconds() / 60.0)
+
+    def format_chart_time_label(self, event_time, fallback_index):
+        if event_time is None:
+            return str(fallback_index)
+        return event_time.strftime("%H:%M:%S")
+
+    def _chart_area(self, canvas):
+        width = max(canvas.winfo_width(), 320)
+        height = max(canvas.winfo_height(), 170)
+        # Reserve a right-side lane for legends and reference labels, so they
+        # do not overlap the axis values or plotted data.
+        left, top, right, bottom = 58, 28, max(120, width - 190), height - 40
+        return width, height, left, top, right, bottom
+
+    def _format_axis_value(self, value, suffix=""):
+        value = float(value)
+        if suffix == "%":
+            if abs(value) >= 100:
+                text = f"{value:.0f}"
+            elif abs(value) >= 10:
+                text = f"{value:.1f}"
+            else:
+                text = f"{value:.2f}"
+        elif abs(value) >= 100:
+            text = f"{value:.0f}"
+        elif abs(value) >= 10:
+            text = f"{value:.1f}"
+        elif abs(value) >= 1:
+            text = f"{value:.2f}"
+        else:
+            text = f"{value:.4f}"
+        if suffix:
+            return f"{text}{suffix}"
+        return text
+
+    def _time_axis_label(self, minutes_value):
+        minutes_value = float(minutes_value)
+        total_seconds = int(round(minutes_value * 60.0))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        if hours > 0:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:d}:{seconds:02d}"
+
+    def _draw_xy_axes(self, canvas, title, x_label, y_label, min_x, max_x, min_y, max_y, *, x_is_time=False, y_suffix=""):
+        width, height, left, top, right, bottom = self._chart_area(canvas)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
+        axis_color = "#8a95a3"
+        grid_color = "#e6e9ee"
+        text_color = "#111827"
+        muted_color = "#475467"
+
+        canvas.create_text(width / 2, 14, text=title, fill=text_color, font=("Arial", 11, "bold"))
+        canvas.create_line(left, bottom, right, bottom, fill=axis_color)
+        canvas.create_line(left, top, left, bottom, fill=axis_color)
+
+        x_range = max(max_x - min_x, 1e-9)
+        y_range = max(max_y - min_y, 1e-9)
+
+        for i in range(5):
+            frac = i / 4
+            y = bottom - (bottom - top) * frac
+            y_value = min_y + y_range * frac
+            canvas.create_line(left, y, right, y, fill=grid_color)
+            canvas.create_text(left - 6, y, anchor="e", text=self._format_axis_value(y_value, y_suffix), fill=muted_color, font=("Arial", 8))
+
+        for i in range(6):
+            frac = i / 5
+            x = left + (right - left) * frac
+            x_value = min_x + x_range * frac
+            canvas.create_line(x, top, x, bottom, fill=grid_color)
+            label = self._time_axis_label(x_value) if x_is_time else self._format_axis_value(x_value)
+            canvas.create_text(x, bottom + 14, anchor="n", text=label, fill=muted_color, font=("Arial", 8))
+
+        canvas.create_text((left + right) / 2, height - 8, text=x_label, fill=text_color, font=("Arial", 9))
+        canvas.create_text(14, (top + bottom) / 2, text=y_label, fill=text_color, font=("Arial", 9), angle=90)
+        return width, height, left, top, right, bottom
+
+    def _project_point(self, x, y, left, top, right, bottom, min_x, max_x, min_y, max_y):
+        x_range = max(max_x - min_x, 1e-9)
+        y_range = max(max_y - min_y, 1e-9)
+        px = left + (right - left) * ((float(x) - min_x) / x_range)
+        py = bottom - (bottom - top) * ((float(y) - min_y) / y_range)
+        return px, py
+
+    def render_line_chart(self, canvas, points, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, y_reference_lines=None):
+        payload = {
+            "kind": "line",
+            "points": list(points or []),
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "x_is_time": bool(x_is_time),
+            "y_suffix": y_suffix,
+            "smooth": bool(smooth),
+            "y_reference_lines": list(y_reference_lines or []),
+        }
+        self.loot_chart_payloads[canvas] = payload
+        self._draw_line_chart_payload(canvas, payload)
+
+    def _draw_line_chart_payload(self, canvas, payload):
+        all_points = list(payload.get("points") or [])
+        if not all_points:
+            self.clear_chart(canvas, "No loot data")
+            return
+        all_x_values = [float(point.get("x", 0.0) or 0.0) for point in all_points]
+        full_min_x = 0.0 if bool(payload.get("x_is_time", True)) else min(all_x_values)
+        full_max_x = max(all_x_values)
+        if full_min_x == full_max_x:
+            full_max_x = full_min_x + 1.0
+        min_x, max_x = self._visible_x_bounds(full_min_x, full_max_x, canvas)
+        points = self._points_in_x_range(all_points, min_x, max_x)
+        if not points:
+            self.clear_chart(canvas, "No data in selected zoom range")
+            return
+        y_values = [float(point.get("y", 0.0) or 0.0) for point in points]
+        min_y = 0.0
+        max_y = (max(y_values) * 1.10) if max(y_values) > 0 else 1.0
+        reference_lines = list(payload.get("y_reference_lines") or [])
+        for reference_value, _reference_label in reference_lines:
+            try:
+                max_y = max(max_y, float(reference_value) * 1.08)
+            except (TypeError, ValueError):
+                pass
+        _, _, left, top, right, bottom = self._draw_xy_axes(
+            canvas,
+            payload.get("title", ""),
+            payload.get("x_label", ""),
+            payload.get("y_label", ""),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            x_is_time=bool(payload.get("x_is_time", True)),
+            y_suffix=str(payload.get("y_suffix", "") or ""),
+        )
+        self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="line")
+        for reference_value, reference_label in reference_lines:
+            try:
+                reference_value = float(reference_value)
+            except (TypeError, ValueError):
+                continue
+            if min_y <= reference_value <= max_y:
+                x1, y1 = self._project_point(min_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
+                x2, y2 = self._project_point(max_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
+                canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=2)
+                canvas.create_text(x2 - 4, y2 - 5, anchor="se", text=str(reference_label), fill="#15803d", font=("Arial", 9, "bold"))
+        coords = []
+        for point in points:
+            px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+            coords.extend([px, py])
+        if len(coords) >= 4:
+            canvas.create_line(*coords, fill="#2563eb", width=2, smooth=bool(payload.get("smooth", False)))
+        # Drawing an oval for every point is expensive with long sessions.
+        dot_stride = max(1, len(points) // 250)
+        for idx, point in enumerate(points):
+            if idx % dot_stride != 0 and idx != len(points) - 1:
+                continue
+            px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+            canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill="#2563eb", outline="")
+
+    def render_scatter_chart(self, canvas, points, *, title, x_label, y_label, x_is_time=False, y_suffix="", draw_break_even=False, draw_multiplier_lines=False):
+        payload = {
+            "kind": "scatter",
+            "points": list(points or []),
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "x_is_time": bool(x_is_time),
+            "y_suffix": y_suffix,
+            "draw_break_even": bool(draw_break_even),
+            "draw_multiplier_lines": bool(draw_multiplier_lines),
+        }
+        self.loot_chart_payloads[canvas] = payload
+        self._draw_scatter_chart_payload(canvas, payload)
+
+    def _draw_scatter_chart_payload(self, canvas, payload):
+        all_points = list(payload.get("points") or [])
+        if not all_points:
+            self.clear_chart(canvas, "No loot data")
+            return
+        all_x_values = [float(point.get("x", 0.0) or 0.0) for point in all_points]
+        full_min_x = 0.0
+        full_max_x = (max(all_x_values) * 1.10) if max(all_x_values) > 0 else 1.0
+        min_x, max_x = self._visible_x_bounds(full_min_x, full_max_x, canvas)
+        points = self._points_in_x_range(all_points, min_x, max_x)
+        if not points:
+            self.clear_chart(canvas, "No data in selected zoom range")
+            return
+        x_values = [float(point.get("x", 0.0) or 0.0) for point in points]
+        y_values = [float(point.get("y", 0.0) or 0.0) for point in points]
+        min_y = 0.0
+        max_y = (max(y_values) * 1.10) if max(y_values) > 0 else 1.0
+
+        positive_costs = sorted(float(point.get("x", 0.0) or 0.0) for point in points if float(point.get("x", 0.0) or 0.0) > 0)
+        reference_cost = positive_costs[len(positive_costs) // 2] if positive_costs else 0.0
+        multiplier_values = []
+        if payload.get("draw_break_even"):
+            multiplier_values.append(1.0)
+        if payload.get("draw_multiplier_lines"):
+            observed_max_multiplier = 0.0
+            for point in points:
+                x = float(point.get("x", 0.0) or 0.0)
+                y = float(point.get("y", 0.0) or 0.0)
+                if x > 0:
+                    observed_max_multiplier = max(observed_max_multiplier, y / x)
+            for multiplier in (2.0, 5.0, 10.0, 20.0, 50.0, 100.0):
+                if observed_max_multiplier >= multiplier * 0.85:
+                    multiplier_values.append(multiplier)
+        if reference_cost > 0:
+            for multiplier in multiplier_values:
+                max_y = max(max_y, reference_cost * multiplier * 1.08)
+
+        _, _, left, top, right, bottom = self._draw_xy_axes(
+            canvas,
+            payload.get("title", ""),
+            payload.get("x_label", ""),
+            payload.get("y_label", ""),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            x_is_time=bool(payload.get("x_is_time", False)),
+            y_suffix=str(payload.get("y_suffix", "") or ""),
+        )
+        self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="scatter")
+        # Horizontal multiplier guides use the median visible cost as the reference cost.
+        # This keeps the guides parallel to the X axis while still showing where x1/x5/x10
+        # loot values are for the common kill cost cluster.
+        if reference_cost > 0:
+            for multiplier in multiplier_values:
+                if multiplier <= 0:
+                    continue
+                y_value = reference_cost * multiplier
+                if not (min_y <= y_value <= max_y):
+                    continue
+                x1, y1 = self._project_point(min_x, y_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
+                x2, y2 = self._project_point(max_x, y_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
+                width = 2 if multiplier == 1.0 else 1
+                canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=width)
+                label = "1.0x" if multiplier == 1.0 else f"x{multiplier:g}"
+                canvas.create_text(right + 8, y2, anchor="w", text=label, fill="#15803d", font=("Arial", 9, "bold"))
+        for point in points:
+            px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#2563eb", outline="")
+
+    def _draw_chart_legend(self, canvas, entries, *, right, top, bottom):
+        entries = [(name, color) for name, color in entries if name]
+        if not entries:
+            return
+        visible_entries = entries[:12]
+        line_height = 17
+        max_text_width = 0
+        for name, _color in visible_entries:
+            max_text_width = max(max_text_width, min(180, max(80, len(str(name)[:28]) * 7)))
+        width = max(canvas.winfo_width(), 320)
+        box_left = right + 12
+        box_right = min(width - 8, box_left + max_text_width + 32)
+        if box_right <= box_left + 60:
+            box_right = width - 8
+            box_left = max(58, box_right - max_text_width - 32)
+        box_top = top + 6
+        box_bottom = min(bottom - 6, box_top + 8 + len(visible_entries) * line_height)
+        canvas.create_rectangle(box_left, box_top, box_right, box_bottom, fill="#ffffff", outline="#94a3b8")
+        y = box_top + 12
+        for name, color in visible_entries:
+            if y > box_bottom - 4:
+                break
+            text = str(name)[:28]
+            canvas.create_line(box_left + 8, y, box_left + 22, y, fill=color, width=3)
+            canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=("Arial", 9, "bold"))
+            y += line_height
+
+    def render_multi_line_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False):
+        payload = {
+            "kind": "multi_line",
+            "series": [(name, list(points or [])) for name, points in list(series or [])],
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "x_is_time": bool(x_is_time),
+            "y_suffix": y_suffix,
+            "smooth": bool(smooth),
+        }
+        self.loot_chart_payloads[canvas] = payload
+        self._draw_multi_line_chart_payload(canvas, payload)
+
+    def _draw_multi_line_chart_payload(self, canvas, payload):
+        series = list(payload.get("series") or [])
+        if not series:
+            self.clear_chart(canvas, "No selected item data")
+            return
+        all_points = [point for _, points in series for point in points]
+        if not all_points:
+            self.clear_chart(canvas, "No selected item data")
+            return
+        x_values = [float(point.get("x", 0.0) or 0.0) for point in all_points]
+        y_values = [float(point.get("y", 0.0) or 0.0) for point in all_points]
+        min_x = 0.0 if bool(payload.get("x_is_time", True)) else min(x_values)
+        max_x = max(x_values) if x_values else 1.0
+        if min_x == max_x:
+            max_x = min_x + 1.0
+        min_y = 0.0
+        max_y = (max(y_values) * 1.10) if max(y_values) > 0 else 1.0
+        _, _, left, top, right, bottom = self._draw_xy_axes(
+            canvas,
+            payload.get("title", ""),
+            payload.get("x_label", ""),
+            payload.get("y_label", ""),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            x_is_time=bool(payload.get("x_is_time", True)),
+            y_suffix=str(payload.get("y_suffix", "") or ""),
+        )
+        palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
+        legend_entries = []
+        for index, (name, points) in enumerate(series):
+            if not points:
+                continue
+            color = palette[index % len(palette)]
+            legend_entries.append((name, color))
+            coords = []
+            for point in points:
+                px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+                coords.extend([px, py])
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=2, smooth=bool(payload.get("smooth", False)))
+            for point in points[-1:]:
+                px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+                canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline="")
+        self._draw_chart_legend(canvas, legend_entries, right=right, top=top, bottom=bottom)
+
+    def render_multi_point_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True):
+        payload = {
+            "kind": "multi_points",
+            "series": [(name, list(points or [])) for name, points in list(series or [])],
+            "title": title,
+            "x_label": x_label,
+            "y_label": y_label,
+            "x_is_time": bool(x_is_time),
+        }
+        self.loot_chart_payloads[canvas] = payload
+        self._draw_multi_point_chart_payload(canvas, payload)
+
+    def _draw_multi_point_chart_payload(self, canvas, payload):
+        series = list(payload.get("series") or [])
+        if not series:
+            self.clear_chart(canvas, "No selected item data")
+            return
+        all_points = [point for _, points in series for point in points]
+        if not all_points:
+            self.clear_chart(canvas, "No selected item data")
+            return
+        x_values = [float(point.get("x", 0.0) or 0.0) for point in all_points]
+        full_min_x = 0.0 if bool(payload.get("x_is_time", True)) else min(x_values)
+        full_max_x = max(x_values) if x_values else 1.0
+        if full_min_x == full_max_x:
+            full_max_x = full_min_x + 1.0
+        min_x, max_x = self._visible_x_bounds(full_min_x, full_max_x, canvas)
+        visible_series = []
+        visible_points_all = []
+        for name, points in series:
+            selected_points = self._points_in_x_range(points, min_x, max_x)
+            if selected_points:
+                visible_series.append((name, selected_points))
+                visible_points_all.extend(selected_points)
+        if not visible_points_all:
+            self.clear_chart(canvas, "No selected item data in zoom range")
+            return
+        y_values = [float(point.get("y", 0.0) or 0.0) for point in visible_points_all]
+        min_y = 0.0
+        max_y = (max(y_values) * 1.15) if max(y_values) > 0 else 1.0
+        _, _, left, top, right, bottom = self._draw_xy_axes(
+            canvas,
+            payload.get("title", ""),
+            payload.get("x_label", ""),
+            payload.get("y_label", ""),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            x_is_time=bool(payload.get("x_is_time", True)),
+            y_suffix="",
+        )
+        self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="multi_points")
+        palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
+        legend_entries = []
+        for index, (name, points) in enumerate(visible_series):
+            if not points:
+                continue
+            color = palette[index % len(palette)]
+            legend_entries.append((name, color))
+            # Draw per-event quantity as stems/dots instead of cumulative lines.
+            for point in points:
+                px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
+                _, zero_y = self._project_point(point.get("x", 0.0), 0.0, left, top, right, bottom, min_x, max_x, min_y, max_y)
+                canvas.create_line(px, zero_y, px, py, fill=color, width=1)
+                canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline="")
+        self._draw_chart_legend(canvas, legend_entries, right=right, top=top, bottom=bottom)
+
     def create_hunting_tab(self):
         frame = ttk.Frame(self.hunting_tab, padding=12)
         frame.pack(fill="x")
@@ -810,7 +1906,7 @@ class SkillTrackerApp:
 
         columns = (
             "started", "ended", "weapon", "mob", "attacks", "damage", "ped",
-            "dpp", "efficiency", "ped_h", "loot", "loot_percent", "skill_tt",
+            "dpp", "efficiency", "ped_h", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
             "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
             "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
         )
@@ -821,6 +1917,8 @@ class SkillTrackerApp:
             ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
             ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
             ("loot_percent", "Loot %", 75),
+            ("loot_events", "Loot events", 90),
+            ("cost_per_kill", "Cost/kill", 90),
             ("skill_tt", "TT-equiv total", 105), ("skill_points", "Point total", 115),
             ("skill_tt_percent", "Skill TT %", 85),
             ("avg_skill_tt_per_hour", "Avg skill TT/h", 105),
@@ -915,6 +2013,7 @@ class SkillTrackerApp:
 
     def on_session_selected(self, event=None):
         self.show_session_details(self.selected_session_from_table())
+        self.refresh_loot_tab()
 
     def refresh_selected_session_details(self, event=None):
         self.show_session_details(self.selected_session_from_table())
@@ -939,6 +2038,8 @@ class SkillTrackerApp:
         ped_cycled = float(session.get('ped_cycled', 0.0))
         loot_ped = float(session.get('loot_ped_total', 0.0))
         loot_percent = percent(loot_ped, ped_cycled)
+        loot_event_count = len(self.loot_events_for_session(session))
+        cost_per_kill = ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(skill_tt_total, ped_cycled)
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
         attachments = ", ".join(session.get("attachments", []) or []) or "-"
@@ -952,7 +2053,8 @@ class SkillTrackerApp:
             f"Attacks: {session.get('attacks_total', 0)} "
             f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, jammed {session.get('jammed_attacks', 0)}) | "
             f"Damage: {float(session.get('damage_total', 0.0)):.1f} | PED cycled: {ped_cycled:.4f} | "
-            f"Loot: {loot_ped:.4f} PED ({loot_percent:.2f}%)\n"
+            f"Loot: {loot_ped:.4f} PED ({loot_percent:.2f}%) | Loot events/kills: {loot_event_count} | "
+            f"Cost/kill: {cost_per_kill:.6f} PED\n"
             f"Skill gain messages: {skill_events_total} | Point total: {skill_points_total:.4f} | "
             f"TT-equivalent total: {skill_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
             f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
@@ -1614,6 +2716,7 @@ class SkillTrackerApp:
         if self.current_session is None:
             return
         session = self.current_session
+        previous_event_type = session.events[-1].get("type", "") if session.events else ""
         session.events.append(event)
         if len(session.events) > 300:
             session.events = session.events[-300:]
@@ -1658,11 +2761,59 @@ class SkillTrackerApp:
                     session.attachments,
                 )
         elif event_type == "loot":
-            session.loot_ped_total += float(event["value_ped"])
-            self.append_event(f"{event['timestamp']} loot +{event['value_ped']:.4f} PED")
+            if ignored_loot_item_name(event.get("item", "")):
+                return
+            loot_value = float(event["value_ped"])
+            self.add_loot_to_session(session, event, previous_event_type)
+            session.loot_ped_total = sum(float(loot_event.get("value_ped", 0.0) or 0.0) for loot_event in session.loot_events)
+            self.append_event(
+                f"{event['timestamp']} loot +{loot_value:.4f} PED | "
+                f"{event.get('item', 'Unknown item')} x{int(event.get('quantity', 1) or 1)}"
+            )
 
         session.end_offset = self.log_offset
         session.total_profession_gain_by_profession = self.calculate_profession_gains_for_session(session)
+
+    def add_loot_to_session(self, session: MonitorSession, event, previous_event_type: str):
+        item = event.get("item") or "Unknown item"
+        if ignored_loot_item_name(item):
+            return
+        loot_value = float(event.get("value_ped", 0.0) or 0.0)
+        quantity = int(event.get("quantity", 0) or 0)
+        if quantity <= 1 and item in STACKABLE_ITEM_PED_VALUE:
+            quantity = parse_loot_item_quantity(item, item, loot_value)
+        if quantity <= 0:
+            quantity = 1
+        event["quantity"] = quantity
+        loot_events = session.loot_events
+
+        continue_previous = bool(loot_events and previous_event_type == "loot")
+        if not continue_previous and loot_events and previous_event_type == "skill_gain":
+            previous_time = parse_chat_timestamp(str(loot_events[-1].get("ended_at", "")))
+            current_time = parse_chat_timestamp(str(event.get("timestamp", "")))
+            if previous_time is not None and current_time is not None:
+                continue_previous = abs((current_time - previous_time).total_seconds()) <= LOOT_EVENT_CONTINUE_SECONDS
+
+        if continue_previous:
+            loot_event = loot_events[-1]
+        else:
+            previous_cost = sum(float(loot_event.get("cost_ped", 0.0) or 0.0) for loot_event in loot_events)
+            loot_event = {
+                "index": len(loot_events) + 1,
+                "started_at": event.get("timestamp", ""),
+                "ended_at": event.get("timestamp", ""),
+                "value_ped": 0.0,
+                "cost_ped": max(0.0, float(session.ped_cycled) - previous_cost),
+                "items": {},
+                "messages": [],
+            }
+            loot_events.append(loot_event)
+
+        loot_event["ended_at"] = event.get("timestamp", loot_event.get("ended_at", ""))
+        loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0) or 0.0) + loot_value
+        loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0) or 0) + quantity
+        loot_event.setdefault("messages", []).append(event.get("message", ""))
+        session.loot_event_count = len(loot_events)
 
     def calculate_profession_gains_for_session(self, session: MonitorSession):
         gains = {}
@@ -1762,6 +2913,8 @@ class SkillTrackerApp:
         top_text = ", ".join(f"{name}: +{value:.4f}" for name, value in top_professions) or "-"
         total_skill_gain_events = sum(s.skill_gain_events_by_skill.values())
         loot_percent = percent(s.loot_ped_total, s.ped_cycled)
+        loot_event_count = len(self.loot_events_for_session(asdict(s)))
+        cost_per_kill = s.ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(s.skill_gain_tt_total, s.ped_cycled)
         skill_messages_per_attack = percent(total_skill_gain_events, s.attacks_total)
         top_skills = []
@@ -1778,7 +2931,8 @@ class SkillTrackerApp:
             f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Amp: {s.amplifier or '-'} | Attachments: {attachments}\n"
             f"Mob: {s.mob or '-'} {s.maturity or ''}\n"
             f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, jammed {s.jammed_attacks}) | "
-            f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%)\n"
+            f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%) | "
+            f"Loot events/kills: {loot_event_count} | Cost/kill: {cost_per_kill:.6f} PED\n"
             f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
             f"TT-equivalent total: {s.skill_gain_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
             f"Skill messages/attack: {skill_messages_per_attack:.2f}%\n"
@@ -1786,6 +2940,7 @@ class SkillTrackerApp:
             f"Top profession gains: {top_text}\n"
             f"{profession_projection_text}"
         )
+        self.schedule_loot_refresh()
 
     def append_event(self, text: str):
         self.event_text.insert("end", text + "\n")
@@ -1832,6 +2987,8 @@ class SkillTrackerApp:
             mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
             ped_cycled = float(session.get('ped_cycled', 0.0))
             loot_ped = float(session.get('loot_ped_total', 0.0))
+            loot_event_count = len(self.loot_events_for_session(session))
+            cost_per_kill = ped_cycled / loot_event_count if loot_event_count else 0.0
             weapon = session.get("weapon", "")
             amplifier = session.get("amplifier", "")
             attachments = session.get("attachments", []) or []
@@ -1859,6 +3016,8 @@ class SkillTrackerApp:
                 f"{ped_per_hour:.2f}" if ped_per_hour else "",
                 f"{loot_ped:.4f}",
                 f"{percent(loot_ped, ped_cycled):.2f}%",
+                loot_event_count,
+                f"{cost_per_kill:.6f}" if cost_per_kill else "",
                 f"{skill_tt_total:.4f}",
                 f"{skill_tt_percent:.2f}%",
                 f"{avg_skill_tt_per_hour:.4f}" if avg_skill_tt_per_hour else "",
