@@ -55,7 +55,7 @@ SESSIONS_FILE = Path("skill_tracker_sessions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-graphs-zoom-v7"
+LOOT_TRACKER_GRAPH_VERSION = "loot-graphs-layout-v8"
 LOOT_EVENT_CONTINUE_SECONDS = 8
 
 
@@ -1416,9 +1416,10 @@ class SkillTrackerApp:
     def _chart_area(self, canvas):
         width = max(canvas.winfo_width(), 320)
         height = max(canvas.winfo_height(), 170)
-        # Reserve a right-side lane for legends and reference labels, so they
-        # do not overlap the axis values or plotted data.
-        left, top, right, bottom = 58, 28, max(120, width - 190), height - 40
+        # Use almost the full canvas width. Legends/reference labels are drawn
+        # inside the plot area now, so we do not waste a large empty lane on
+        # the right side of every chart.
+        left, top, right, bottom = 58, 28, width - 28, height - 40
         return width, height, left, top, right, bottom
 
     def _format_axis_value(self, value, suffix=""):
@@ -1555,7 +1556,9 @@ class SkillTrackerApp:
                 x1, y1 = self._project_point(min_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
                 x2, y2 = self._project_point(max_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
                 canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=2)
-                canvas.create_text(x2 - 4, y2 - 5, anchor="se", text=str(reference_label), fill="#15803d", font=("Arial", 9, "bold"))
+                label_x = max(left + 36, min(right - 6, x2 - 6))
+                label_y = max(top + 10, min(bottom - 10, y2 - 8))
+                canvas.create_text(label_x, label_y, anchor="e", text=str(reference_label), fill="#15803d", font=("Arial", 9, "bold"))
         coords = []
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
@@ -1650,7 +1653,8 @@ class SkillTrackerApp:
                 width = 2 if multiplier == 1.0 else 1
                 canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=width)
                 label = "1.0x" if multiplier == 1.0 else f"x{multiplier:g}"
-                canvas.create_text(right + 8, y2, anchor="w", text=label, fill="#15803d", font=("Arial", 9, "bold"))
+                label_y = max(top + 10, min(bottom - 10, y2 - 7))
+                canvas.create_text(right - 6, label_y, anchor="e", text=label, fill="#15803d", font=("Arial", 9, "bold"))
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
             canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#2563eb", outline="")
@@ -1659,25 +1663,25 @@ class SkillTrackerApp:
         entries = [(name, color) for name, color in entries if name]
         if not entries:
             return
-        visible_entries = entries[:12]
-        line_height = 17
+        visible_entries = entries[:10]
+        line_height = 16
         max_text_width = 0
         for name, _color in visible_entries:
-            max_text_width = max(max_text_width, min(180, max(80, len(str(name)[:28]) * 7)))
-        width = max(canvas.winfo_width(), 320)
-        box_left = right + 12
-        box_right = min(width - 8, box_left + max_text_width + 32)
-        if box_right <= box_left + 60:
-            box_right = width - 8
-            box_left = max(58, box_right - max_text_width - 32)
-        box_top = top + 6
-        box_bottom = min(bottom - 6, box_top + 8 + len(visible_entries) * line_height)
+            max_text_width = max(max_text_width, min(165, max(70, len(str(name)[:24]) * 7)))
+
+        # Draw the legend inside the plotting area, in the top-right corner.
+        # This avoids both problems: no overlap with axis tick values, and no
+        # large unused empty space to the right of charts that have no legend.
+        box_right = right - 8
+        box_left = max(64, box_right - max_text_width - 34)
+        box_top = top + 8
+        box_bottom = min(bottom - 8, box_top + 8 + len(visible_entries) * line_height)
         canvas.create_rectangle(box_left, box_top, box_right, box_bottom, fill="#ffffff", outline="#94a3b8")
         y = box_top + 12
         for name, color in visible_entries:
             if y > box_bottom - 4:
                 break
-            text = str(name)[:28]
+            text = str(name)[:24]
             canvas.create_line(box_left + 8, y, box_left + 22, y, fill=color, width=3)
             canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=("Arial", 9, "bold"))
             y += line_height
