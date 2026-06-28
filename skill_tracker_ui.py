@@ -55,7 +55,7 @@ SESSIONS_FILE = Path("skill_tracker_sessions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-save-all-events-v9"
+LOOT_TRACKER_GRAPH_VERSION = "loot-quantity-pause-v11-from-uploaded-base"
 LOOT_EVENT_CONTINUE_SECONDS = 8
 
 
@@ -291,14 +291,22 @@ def normalize_loot_item_name(raw_name: str) -> str:
     not a separate bucket for every quantity.
     """
     name = str(raw_name or "").strip()
-    name = re.sub(r"\s+x\s+[0-9][0-9,]*(?:\.[0-9]+)?$", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"\s+x\s*\(?\s*[0-9][0-9,]*(?:\.[0-9]+)?\s*\)?$", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"\s+\([0-9][0-9,]*(?:\.[0-9]+)?\)$", "", name).strip()
     return name or "Unknown item"
 
 
 def parse_loot_item_quantity(raw_name: str, item_name: str | None = None, value_ped: float | None = None) -> int:
     name = str(raw_name or "")
-    match = re.search(r"\s+x\s+([0-9][0-9,]*)", name, flags=re.IGNORECASE)
+    match = re.search(r"\s+x\s*\(?\s*([0-9][0-9,]*)\s*\)?", name, flags=re.IGNORECASE)
+    if match:
+        try:
+            return max(1, int(match.group(1).replace(",", "")))
+        except ValueError:
+            return 1
+
+    # Also accept old/simple quantity suffixes like "Animal Hide (12)".
+    match = re.search(r"\(([0-9][0-9,]*)\)\s*$", name)
     if match:
         try:
             return max(1, int(match.group(1).replace(",", "")))
@@ -517,6 +525,7 @@ class SkillTrackerApp:
 
         self.current_session: MonitorSession | None = None
         self.monitoring = False
+        self.sync_paused = False
         self.log_offset = int(self.state.get("last_log_offset", 0) or 0)
         self.last_log_path = self.state.get("chat_log_path", "")
         self.log_time_cutoff_at = None
@@ -746,7 +755,9 @@ class SkillTrackerApp:
         ttk.Button(top, text="Browse", command=self.browse_chat_log).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="Start Sync", command=self.start_sync).grid(row=0, column=3, padx=4)
         ttk.Button(top, text="Stop Sync", command=self.stop_sync).grid(row=0, column=4, padx=4)
-        ttk.Label(top, textvariable=self.monitor_status_var, font=("Arial", 11, "bold")).grid(row=0, column=5, padx=12)
+        self.pause_sync_button = ttk.Button(top, text="Pause Sync", command=self.toggle_pause_sync)
+        self.pause_sync_button.grid(row=0, column=5, padx=4)
+        ttk.Label(top, textvariable=self.monitor_status_var, font=("Arial", 11, "bold")).grid(row=0, column=6, padx=12)
         ttk.Label(top, text="Start from:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Combobox(
             top,
@@ -2428,6 +2439,9 @@ class SkillTrackerApp:
             count_hunting=self.count_hunting_var.get(),
         )
         self.monitoring = True
+        self.sync_paused = False
+        if hasattr(self, "pause_sync_button"):
+            self.pause_sync_button.configure(text="Pause Sync")
         self.monitor_status_var.set("Syncing")
         self.append_event(resume_message)
         self.update_session_summary()
@@ -2454,6 +2468,9 @@ class SkillTrackerApp:
         self.current_session = None
         self.log_time_cutoff_at = None
         self.monitoring = False
+        self.sync_paused = False
+        if hasattr(self, "pause_sync_button"):
+            self.pause_sync_button.configure(text="Pause Sync")
         self.reader_active = False
         self.reader_done_pending = False
         self.monitor_status_var.set("Stopped")
@@ -2462,10 +2479,65 @@ class SkillTrackerApp:
         self.refresh_sessions_table()
         self.save_state()
 
+    def toggle_pause_sync(self):
+        if self.sync_paused:
+            self.resume_sync()
+        else:
+            self.pause_sync()
+
+    def pause_sync(self):
+        """Pause log reading but keep the current session open.
+
+        Stop Sync still ends and saves the session. Pause Sync only freezes the
+        reader at the current byte offset, so Resume Sync can continue into the
+        same MonitorSession without creating a new run.
+        """
+        if not self.monitoring or self.current_session is None:
+            self.monitor_status_var.set("Stopped")
+            return
+        if self.sync_paused:
+            return
+
+        self.sync_paused = True
+        self.reader_stop_event.set()
+        if self.reader_thread is not None and self.reader_thread.is_alive():
+            self.reader_thread.join()
+        self.process_reader_queue(max_batches=1_000_000)
+        self.reader_active = False
+        self.reader_done_pending = False
+        self.save_state()
+        if hasattr(self, "pause_sync_button"):
+            self.pause_sync_button.configure(text="Resume Sync")
+        self.monitor_status_var.set("Paused")
+        self.monitor_progress_var.set(f"Paused at offset {self.log_offset:,}. Press Resume Sync to continue this same session.")
+        self.append_event(f"Paused sync at offset {self.log_offset}")
+
+    def resume_sync(self):
+        if not self.monitoring or self.current_session is None:
+            self.monitor_status_var.set("Stopped")
+            self.sync_paused = False
+            if hasattr(self, "pause_sync_button"):
+                self.pause_sync_button.configure(text="Pause Sync")
+            return
+        if not self.sync_paused:
+            return
+
+        self.sync_paused = False
+        self.reader_stop_event.clear()
+        if hasattr(self, "pause_sync_button"):
+            self.pause_sync_button.configure(text="Pause Sync")
+        self.monitor_status_var.set("Syncing")
+        self.monitor_progress_var.set(f"Resuming from offset {self.log_offset:,}...")
+        self.append_event(f"Resumed sync from offset {self.log_offset}")
+        self.start_log_reader_until_current_eof()
+
     def monitor_tick(self):
         if self.monitoring:
             self.process_reader_queue(max_batches=3)
-            if not self.reader_active and not self.reader_done_pending:
+            if self.sync_paused:
+                if not self.reader_active:
+                    self.monitor_status_var.set("Paused")
+            elif not self.reader_active and not self.reader_done_pending:
                 self.start_log_reader_until_current_eof()
         self.root.after(200, self.monitor_tick)
 
