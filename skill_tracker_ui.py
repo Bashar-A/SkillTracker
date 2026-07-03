@@ -114,16 +114,47 @@ def find_skill_after_tt_delta(current_points: float, delta_tt: float) -> float:
 
 
 def load_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    for candidate in (path, path.with_suffix(path.suffix + ".bak")):
+        if not candidate.exists():
+            continue
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return default
 
 
 def save_json(path: Path, data):
-    path.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+    """Atomically save JSON and keep a backup of the previous valid file.
+
+    A power loss during write should not leave the main JSON half-written.
+    The temporary file is fully written/flushed and then moved into place with
+    os.replace, which is atomic on the same filesystem.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=4, ensure_ascii=False)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    backup_path = path.with_suffix(path.suffix + ".bak")
+    backup_temp_path = path.with_suffix(path.suffix + ".bak.tmp")
+
+    if path.exists():
+        try:
+            backup_temp_path.write_bytes(path.read_bytes())
+            os.replace(backup_temp_path, backup_path)
+        except Exception:
+            try:
+                if backup_temp_path.exists():
+                    backup_temp_path.unlink()
+            except Exception:
+                pass
+
+    with temp_path.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
 
 
 def load_current_skills():
@@ -401,6 +432,8 @@ class MonitorSession:
     mob: str = ""
     maturity: str = ""
     count_hunting: bool = False
+    current_skills_at_start: dict = field(default_factory=dict)
+    current_skills_at_end: dict = field(default_factory=dict)
     # Skill gain details saved with every session.
     # IMPORTANT: Entropia chat.log gain values are skill-point deltas, not TT deltas.
     # skill_gains_points: sum of raw chat.log gains per skill.
@@ -1917,6 +1950,7 @@ class SkillTrackerApp:
         top = ttk.Frame(self.sessions_tab, padding=10)
         top.pack(fill="x")
         ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
+        ttk.Button(top, text="Load Current Skills from Selected Session", command=self.load_current_skills_from_selected_session).pack(side="left", padx=6)
         ttk.Button(top, text="Delete Selected Session", command=self.delete_selected_session).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
@@ -2060,10 +2094,12 @@ class SkillTrackerApp:
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
         attachments = ", ".join(session.get("attachments", []) or []) or "-"
         profession_projection_text = self.profession_projection_text(session)
+        saved_skill_snapshot_count = len(self.session_skill_snapshot(session))
 
         self.session_detail_summary_var.set(
             f"Started: {session.get('started_at', '')} | Ended: {session.get('ended_at', '')}\n"
             f"Log: {session.get('chat_log_path', '')}\n"
+            f"Saved current-skills snapshot: {saved_skill_snapshot_count} skills\n"
             f"Weapon: {session.get('weapon', '-') or '-'} | Amp: {session.get('amplifier', '') or '-'} | Attachments: {attachments}\n"
             f"Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
             f"Attacks: {session.get('attacks_total', 0)} "
@@ -2114,6 +2150,51 @@ class SkillTrackerApp:
                 line = str(event)
             self.session_detail_events_text.insert("end", line + "\n")
         self.session_detail_events_text.see("1.0")
+
+    def skill_snapshot(self):
+        return {str(k): float(v) for k, v in sorted(self.current_skills.items())}
+
+    def session_skill_snapshot(self, session):
+        if not session:
+            return {}
+        snapshot = session.get("current_skills_at_end") or session.get("current_skills") or {}
+        result = {}
+        for key, value in snapshot.items():
+            try:
+                result[str(key)] = float(value)
+            except (TypeError, ValueError):
+                pass
+        return result
+
+    def load_current_skills_from_selected_session(self):
+        session = self.selected_session_from_table()
+        if not session:
+            messagebox.showwarning("No session selected", "Select a session first.")
+            return
+
+        snapshot = self.session_skill_snapshot(session)
+        if not snapshot:
+            messagebox.showwarning(
+                "No skills snapshot",
+                "This session has no saved current-skills snapshot. Only sessions saved after this update can be restored.",
+            )
+            return
+
+        started = session.get("started_at", "")
+        ended = session.get("ended_at", "") or "not ended"
+        if not messagebox.askyesno(
+            "Load skills from session",
+            f"Replace current_skills.json and the current in-memory skills with the skills saved at the end of this session?\n\n"
+            f"Started: {started}\nEnded: {ended}\nSkills: {len(snapshot)}",
+        ):
+            return
+
+        self.current_skills = snapshot
+        save_current_skills(self.current_skills)
+        self.load_profession_keep_selection()
+        self.refresh_session_skill_tree()
+        self.update_session_summary()
+        messagebox.showinfo("Skills loaded", f"Loaded {len(snapshot)} skills from the selected session.")
 
     def browse_chat_log(self):
         filename = filedialog.askopenfilename(
@@ -2437,6 +2518,8 @@ class SkillTrackerApp:
             mob=self.mob_var.get(),
             maturity=self.maturity_var.get(),
             count_hunting=self.count_hunting_var.get(),
+            current_skills_at_start=self.skill_snapshot(),
+            current_skills_at_end=self.skill_snapshot(),
         )
         self.monitoring = True
         self.sync_paused = False
@@ -2462,9 +2545,11 @@ class SkillTrackerApp:
 
         self.current_session.ended_at = now_iso()
         self.current_session.end_offset = self.log_offset
+        self.current_session.current_skills_at_end = self.skill_snapshot()
+        save_current_skills(self.current_skills)
         self.sessions.append(asdict(self.current_session))
         save_json(SESSIONS_FILE, self.sessions)
-        self.append_event("Stopped sync session and saved it")
+        self.append_event("Stopped sync session, saved current skills, and saved the session")
         self.current_session = None
         self.log_time_cutoff_at = None
         self.monitoring = False
@@ -2850,6 +2935,7 @@ class SkillTrackerApp:
             )
 
         session.end_offset = self.log_offset
+        session.current_skills_at_end = self.skill_snapshot()
         session.total_profession_gain_by_profession = self.calculate_profession_gains_for_session(session)
 
     def add_loot_to_session(self, session: MonitorSession, event, previous_event_type: str):
