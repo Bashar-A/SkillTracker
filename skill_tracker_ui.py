@@ -449,7 +449,11 @@ class MonitorSession:
     total_profession_gain_by_profession: dict = field(default_factory=dict)
     normal_hits: int = 0
     critical_hits: int = 0
-    jammed_attacks: int = 0
+    # Target defenses are grouped together because the exact message depends
+    # on weapon type: Jammed, Evaded, or Dodged.
+    defended_attacks: int = 0
+    # A plain "You missed" is kept separate because it is caused by hit ability.
+    missed_attacks: int = 0
     attacks_total: int = 0
     damage_total: float = 0.0
     loot_ped_total: float = 0.0
@@ -466,6 +470,7 @@ class ChatLogParser:
     improved_re = re.compile(r"^Your (.+?) has improved by ([0-9]+(?:\.[0-9]+)?)$")
     normal_damage_re = re.compile(r"^You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
     crit_damage_re = re.compile(r"^Critical hit - Additional damage! You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
+    target_defense_re = re.compile(r"^The target (Jammed|Evaded|Dodged) your attack$")
     loot_re = re.compile(r"^You received (.+?) Value: ([0-9]+(?:\.[0-9]+)?) PED$")
 
     @classmethod
@@ -494,8 +499,17 @@ class ChatLogParser:
         if normal:
             return {"type": "normal_hit", "timestamp": timestamp, "damage": float(normal.group(1)), "message": message}
 
-        if message == "The target Jammed your attack":
-            return {"type": "jammed", "timestamp": timestamp, "message": message}
+        target_defense = cls.target_defense_re.match(message)
+        if target_defense:
+            return {
+                "type": "defended_attack",
+                "timestamp": timestamp,
+                "defense": target_defense.group(1).lower(),
+                "message": message,
+            }
+
+        if message == "You missed":
+            return {"type": "miss", "timestamp": timestamp, "message": message}
 
         gain = cls.gain_experience_re.match(message)
         if gain:
@@ -958,7 +972,7 @@ class SkillTrackerApp:
         previous_event_cost = 0.0
         for event in session.get("events", []) or []:
             etype = event.get("type", "")
-            if etype in ("normal_hit", "crit", "jammed") and session.get("count_hunting", False):
+            if etype in ("normal_hit", "crit", "defended_attack", "miss", "jammed") and session.get("count_hunting", False):
                 running_cost += cost_per_attack
             elif etype == "loot":
                 if reconstructed and previous_type == "loot":
@@ -1939,7 +1953,8 @@ class SkillTrackerApp:
         ttk.Label(
             help_box,
             text=(
-                "PED cycled increments on your attack events only: normal hit, critical hit, or 'The target Jammed your attack'.\n"
+                "PED cycled increments on every player attack: normal hit, critical hit, target Jammed/Evaded/Dodged, or 'You missed'.\n"
+                "Jammed, Evaded, and Dodged are one target-defense category; 'You missed' is counted separately.\n"
                 "It ignores enemy attacks like 'The attack missed you' and 'You took damage'.\n"
                 "Per attack cost is calculated from weapon, amplifier, and attachment decay / 100 + ammo_burn / 10000 PED."
             ),
@@ -1955,7 +1970,7 @@ class SkillTrackerApp:
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
         columns = (
-            "started", "ended", "weapon", "mob", "attacks", "damage", "ped",
+            "started", "ended", "weapon", "mob", "attacks", "defended", "misses", "damage", "ped",
             "dpp", "efficiency", "ped_h", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
             "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
             "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
@@ -1963,7 +1978,8 @@ class SkillTrackerApp:
         self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
         setup = [
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
-            ("mob", "Mob", 170), ("attacks", "Attacks", 75), ("damage", "Damage", 85),
+            ("mob", "Mob", 170), ("attacks", "Attacks", 75),
+            ("defended", "J/E/D", 70), ("misses", "Misses", 70), ("damage", "Damage", 85),
             ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
             ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
             ("loot_percent", "Loot %", 75),
@@ -2096,6 +2112,9 @@ class SkillTrackerApp:
         profession_projection_text = self.profession_projection_text(session)
         saved_skill_snapshot_count = len(self.session_skill_snapshot(session))
 
+        defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
+        missed_attacks = int(session.get("missed_attacks", 0) or 0)
+
         self.session_detail_summary_var.set(
             f"Started: {session.get('started_at', '')} | Ended: {session.get('ended_at', '')}\n"
             f"Log: {session.get('chat_log_path', '')}\n"
@@ -2103,7 +2122,8 @@ class SkillTrackerApp:
             f"Weapon: {session.get('weapon', '-') or '-'} | Amp: {session.get('amplifier', '') or '-'} | Attachments: {attachments}\n"
             f"Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
             f"Attacks: {session.get('attacks_total', 0)} "
-            f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, jammed {session.get('jammed_attacks', 0)}) | "
+            f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, "
+            f"defended {defended_attacks}, misses {missed_attacks}) | "
             f"Damage: {float(session.get('damage_total', 0.0)):.1f} | PED cycled: {ped_cycled:.4f} | "
             f"Loot: {loot_ped:.4f} PED ({loot_percent:.2f}%) | Loot events/kills: {loot_event_count} | "
             f"Cost/kill: {cost_per_kill:.6f} PED\n"
@@ -2142,8 +2162,11 @@ class SkillTrackerApp:
                 line = f"{timestamp} | skill | {event.get('skill', '')}: +{float(event.get('delta_points', event.get('delta_tt', 0.0))):.6f} points | {event.get('message', '')}"
             elif etype in ("normal_hit", "crit"):
                 line = f"{timestamp} | {etype} | damage {float(event.get('damage', 0.0)):.1f} | {event.get('message', '')}"
-            elif etype == "jammed":
-                line = f"{timestamp} | jammed | {event.get('message', '')}"
+            elif etype in ("defended_attack", "jammed"):
+                defense = event.get("defense", "jammed" if etype == "jammed" else "defended")
+                line = f"{timestamp} | defended ({defense}) | {event.get('message', '')}"
+            elif etype == "miss":
+                line = f"{timestamp} | miss | {event.get('message', '')}"
             elif etype == "loot":
                 line = f"{timestamp} | loot | +{float(event.get('value_ped', 0.0)):.4f} PED | {event.get('message', '')}"
             else:
@@ -2904,7 +2927,7 @@ class SkillTrackerApp:
             session.skill_gain_points_total += point_gain
             session.skill_gain_tt_total += tt_gain
             self.append_event(f"{event['timestamp']} skill +{point_gain:.4f} pts: {skill} ({old_points:.4f} -> {new_points:.4f})")
-        elif event_type in ("normal_hit", "crit", "jammed"):
+        elif event_type in ("normal_hit", "crit", "defended_attack", "miss", "jammed"):
             session.attacks_total += 1
             if event_type == "normal_hit":
                 session.normal_hits += 1
@@ -2914,9 +2937,13 @@ class SkillTrackerApp:
                 session.critical_hits += 1
                 session.damage_total += float(event["damage"])
                 self.append_event(f"{event['timestamp']} CRIT {event['damage']:.1f}")
+            elif event_type in ("defended_attack", "jammed"):
+                session.defended_attacks += 1
+                defense = event.get("defense", "jammed" if event_type == "jammed" else "defended")
+                self.append_event(f"{event['timestamp']} target {defense}")
             else:
-                session.jammed_attacks += 1
-                self.append_event(f"{event['timestamp']} jammed/missed attack")
+                session.missed_attacks += 1
+                self.append_event(f"{event['timestamp']} missed (hit ability)")
             if session.count_hunting:
                 session.ped_cycled += hunting_setup_cost_per_shot_ped(
                     session.weapon,
@@ -3094,7 +3121,8 @@ class SkillTrackerApp:
         self.session_summary_var.set(
             f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Amp: {s.amplifier or '-'} | Attachments: {attachments}\n"
             f"Mob: {s.mob or '-'} {s.maturity or ''}\n"
-            f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, jammed {s.jammed_attacks}) | "
+            f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, "
+            f"defended {s.defended_attacks}, misses {s.missed_attacks}) | "
             f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%) | "
             f"Loot events/kills: {loot_event_count} | Cost/kill: {cost_per_kill:.6f} PED\n"
             f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
@@ -3167,12 +3195,16 @@ class SkillTrackerApp:
             avg_skill_tt_per_hour = (skill_tt_percent / 100.0) * ped_per_hour if ped_per_hour else 0.0
             avg_loss = avg_ped_loss_per_100(efficiency)
             skill_tt_minus_avg_loss = skill_tt_percent - avg_loss if avg_loss is not None else None
+            defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
+            missed_attacks = int(session.get("missed_attacks", 0) or 0)
             self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
                 session.get("started_at", ""),
                 session.get("ended_at", ""),
                 weapon_display,
                 mob,
                 session.get("attacks_total", 0),
+                defended_attacks,
+                missed_attacks,
                 f"{float(session.get('damage_total', 0.0)):.1f}",
                 f"{ped_cycled:.4f}",
                 f"{dpp:.3f}" if dpp else "",
