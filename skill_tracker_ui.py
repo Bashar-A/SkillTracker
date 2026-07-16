@@ -52,6 +52,7 @@ except ImportError:
 CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
+HUNTING_SETUPS_FILE = Path("hunting_setups.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
@@ -569,6 +570,9 @@ class SkillTrackerApp:
         self.current_skills = load_current_skills()
         self.state = load_json(TRACKER_STATE_FILE, {})
         self.sessions = load_json(SESSIONS_FILE, [])
+        self.hunting_setups = load_json(HUNTING_SETUPS_FILE, {})
+        if not isinstance(self.hunting_setups, dict):
+            self.hunting_setups = {}
 
         self.current_session: MonitorSession | None = None
         self.monitoring = False
@@ -626,6 +630,8 @@ class SkillTrackerApp:
         self.mob_var = tk.StringVar(value=self.state.get("mob", ""))
         self.maturity_var = tk.StringVar(value=self.state.get("maturity", ""))
         self.count_hunting_var = tk.BooleanVar(value=bool(self.state.get("count_hunting", False)))
+        self.hunting_setup_name_var = tk.StringVar(value=str(self.state.get("selected_hunting_setup", "") or ""))
+        self.hunting_setup_status_var = tk.StringVar(value="")
         self.weapon_cost_var = tk.StringVar(value="Cost/shot: 0.000000 PED")
         self.mob_info_var = tk.StringVar(value="Mob: -")
         self.all_weapon_names = sorted(WEAPONS.keys(), key=str.lower)
@@ -1875,10 +1881,28 @@ class SkillTrackerApp:
         self._draw_chart_legend(canvas, legend_entries, right=right, top=top, bottom=bottom)
 
     def create_hunting_tab(self):
+        profiles = ttk.LabelFrame(self.hunting_tab, text="Saved hunting setups", padding=10)
+        profiles.pack(fill="x", padx=12, pady=(12, 0))
+
+        ttk.Label(profiles, text="Setup name:").grid(row=0, column=0, sticky="w")
+        self.hunting_setup_combo = ttk.Combobox(
+            profiles,
+            textvariable=self.hunting_setup_name_var,
+            values=sorted(self.hunting_setups.keys(), key=str.lower),
+            width=48,
+        )
+        self.hunting_setup_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        self.hunting_setup_combo.bind("<<ComboboxSelected>>", self.load_named_hunting_setup)
+        ttk.Button(profiles, text="Load", command=self.load_named_hunting_setup).grid(row=0, column=2, padx=4)
+        ttk.Button(profiles, text="Save / Update", command=self.save_named_hunting_setup).grid(row=0, column=3, padx=4)
+        ttk.Button(profiles, text="Delete", command=self.delete_named_hunting_setup).grid(row=0, column=4, padx=4)
+        ttk.Label(profiles, textvariable=self.hunting_setup_status_var).grid(row=1, column=1, columnspan=4, sticky="w", padx=8, pady=(5, 0))
+        profiles.columnconfigure(1, weight=1)
+
         frame = ttk.Frame(self.hunting_tab, padding=12)
         frame.pack(fill="x")
 
-        ttk.Checkbutton(frame, text="Count hunting / PED cycled during sync", variable=self.count_hunting_var, command=self.save_state).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Checkbutton(frame, text="Count hunting / PED cycled during sync", variable=self.count_hunting_var, command=self.on_hunting_changed).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(frame, text="Weapon search:").grid(row=1, column=0, sticky="w")
         weapon_search = ttk.Entry(frame, textvariable=self.weapon_filter_var, width=35)
@@ -1944,7 +1968,7 @@ class SkillTrackerApp:
         self.maturity_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
         ttk.Label(frame, textvariable=self.mob_info_var).grid(row=11, column=2, sticky="w")
 
-        ttk.Button(frame, text="Save Hunting Setup", command=self.save_state).grid(row=12, column=1, sticky="w", padx=8, pady=12)
+        ttk.Label(frame, text="The current selection is saved automatically. Use Saved hunting setups above for named profiles.").grid(row=12, column=1, sticky="w", padx=8, pady=12)
         frame.columnconfigure(1, weight=1)
         self.update_maturity_values()
 
@@ -2399,6 +2423,111 @@ class SkillTrackerApp:
     def clear_mob_filter(self):
         self.mob_filter_var.set("")
         self.mob_combo.configure(values=self.all_mob_names)
+
+    def resolve_hunting_setup_name(self, name: str) -> str | None:
+        requested = str(name or "").strip()
+        if not requested:
+            return None
+        requested_folded = requested.casefold()
+        for existing_name in self.hunting_setups:
+            if str(existing_name).casefold() == requested_folded:
+                return str(existing_name)
+        return None
+
+    def refresh_hunting_setup_values(self):
+        if hasattr(self, "hunting_setup_combo"):
+            self.hunting_setup_combo.configure(values=sorted(self.hunting_setups.keys(), key=str.lower))
+
+    def current_hunting_setup_payload(self):
+        return {
+            "weapon": self.weapon_var.get(),
+            "amplifier": self.selected_amplifier(),
+            "attachments": self.selected_attachments(),
+            "mob": self.mob_var.get(),
+            "maturity": self.maturity_var.get(),
+            "count_hunting": bool(self.count_hunting_var.get()),
+        }
+
+    def save_named_hunting_setup(self):
+        typed_name = self.hunting_setup_name_var.get().strip()
+        if not typed_name:
+            messagebox.showwarning("Setup name required", "Enter a name for this hunting setup first.")
+            return
+
+        existing_name = self.resolve_hunting_setup_name(typed_name)
+        save_name = existing_name or typed_name
+        if existing_name and not messagebox.askyesno(
+            "Update hunting setup",
+            f"Replace the saved setup '{existing_name}' with the current weapon, attachments, mob, and maturity?",
+        ):
+            return
+
+        self.hunting_setups[save_name] = self.current_hunting_setup_payload()
+        save_json(HUNTING_SETUPS_FILE, self.hunting_setups)
+        self.hunting_setup_name_var.set(save_name)
+        self.refresh_hunting_setup_values()
+        self.hunting_setup_status_var.set(f"Saved setup: {save_name}")
+        self.save_state()
+
+    def load_named_hunting_setup(self, event=None):
+        requested_name = self.hunting_setup_name_var.get().strip()
+        setup_name = self.resolve_hunting_setup_name(requested_name)
+        if not setup_name:
+            if event is None:
+                messagebox.showwarning("Setup not found", "Choose a saved hunting setup first.")
+            return
+
+        setup = self.hunting_setups.get(setup_name) or {}
+        if not isinstance(setup, dict):
+            messagebox.showerror("Invalid setup", f"The saved setup '{setup_name}' is not valid.")
+            return
+
+        weapon = str(setup.get("weapon", "") or "")
+        amplifier = str(setup.get("amplifier", "") or "")
+        attachments = list(setup.get("attachments", []) or [])[:3]
+        mob = str(setup.get("mob", "") or "")
+        maturity = str(setup.get("maturity", "") or "")
+
+        self.clear_weapon_filter()
+        self.clear_amplifier_filter()
+        self.clear_attachment_filter()
+        self.clear_mob_filter()
+
+        self.weapon_var.set(weapon if weapon in WEAPONS else "")
+        self.amplifier_var.set(amplifier if amplifier in AMPLIFIERS else "")
+        while len(attachments) < 3:
+            attachments.append("")
+        for attachment_var, attachment_name in zip(self.attachment_vars, attachments):
+            attachment_var.set(attachment_name if attachment_name in ATTACHMENTS else "")
+
+        self.mob_var.set(mob if mob in MOBS else "")
+        self.maturity_var.set("")
+        self.update_maturity_values()
+        valid_maturities = set(((MOBS.get(self.mob_var.get()) or {}).get("maturities") or {}).keys())
+        if maturity in valid_maturities:
+            self.maturity_var.set(maturity)
+
+        self.count_hunting_var.set(bool(setup.get("count_hunting", False)))
+        self.hunting_setup_name_var.set(setup_name)
+        self.refresh_hunting_info()
+        self.hunting_setup_status_var.set(f"Loaded setup: {setup_name}")
+        self.save_state()
+
+    def delete_named_hunting_setup(self):
+        requested_name = self.hunting_setup_name_var.get().strip()
+        setup_name = self.resolve_hunting_setup_name(requested_name)
+        if not setup_name:
+            messagebox.showwarning("Setup not found", "Choose a saved hunting setup first.")
+            return
+        if not messagebox.askyesno("Delete hunting setup", f"Delete the saved setup '{setup_name}'?"):
+            return
+
+        del self.hunting_setups[setup_name]
+        save_json(HUNTING_SETUPS_FILE, self.hunting_setups)
+        self.hunting_setup_name_var.set("")
+        self.hunting_setup_status_var.set(f"Deleted setup: {setup_name}")
+        self.refresh_hunting_setup_values()
+        self.save_state()
 
     def selected_attachments(self):
         attachments = []
@@ -3295,6 +3424,7 @@ class SkillTrackerApp:
             "mob": self.mob_var.get(),
             "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
+            "selected_hunting_setup": self.hunting_setup_name_var.get().strip(),
             "sync_start_mode": self.sync_start_mode_var.get(),
         }
         save_json(TRACKER_STATE_FILE, self.state)
