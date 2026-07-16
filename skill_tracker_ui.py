@@ -53,10 +53,11 @@ CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
 HUNTING_SETUPS_FILE = Path("hunting_setups.json")
+LOOT_MARKUPS_FILE = Path("loot_markups.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-quantity-pause-v11-from-uploaded-base"
+LOOT_TRACKER_GRAPH_VERSION = "loot-item-mu-summary-v12"
 LOOT_EVENT_CONTINUE_SECONDS = 8
 
 
@@ -573,6 +574,16 @@ class SkillTrackerApp:
         self.hunting_setups = load_json(HUNTING_SETUPS_FILE, {})
         if not isinstance(self.hunting_setups, dict):
             self.hunting_setups = {}
+        raw_loot_markups = load_json(LOOT_MARKUPS_FILE, {})
+        self.loot_markups = {}
+        if isinstance(raw_loot_markups, dict):
+            for item_name, markup in raw_loot_markups.items():
+                try:
+                    markup_value = float(markup)
+                except (TypeError, ValueError):
+                    continue
+                if markup_value >= 100.0:
+                    self.loot_markups[str(item_name)] = markup_value
 
         self.current_session: MonitorSession | None = None
         self.monitoring = False
@@ -645,6 +656,9 @@ class SkillTrackerApp:
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
         self.loot_summary_var = tk.StringVar(value="No loot session selected")
+        self.loot_markup_status_var = tk.StringVar(value="Double-click an MU cell to edit it. Default MU is 100%.")
+        self.loot_item_summary_iid_to_name = {}
+        self.loot_markup_editor = None
         self.loot_item_filter_var = tk.StringVar()
         self.loot_item_vars = {}
         self.loot_chart_payloads = {}
@@ -876,6 +890,34 @@ class SkillTrackerApp:
         summary.pack(fill="x", padx=10, pady=6)
         ttk.Label(summary, textvariable=self.loot_summary_var, justify="left").pack(anchor="w")
 
+        item_summary_frame = ttk.LabelFrame(self.loot_tab, text="Looted items grouped by name", padding=6)
+        item_summary_frame.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(item_summary_frame, textvariable=self.loot_markup_status_var).pack(anchor="w", pady=(0, 4))
+        item_columns = ("item", "quantity", "value", "loot_percent", "markup", "after_mu")
+        self.loot_item_summary_tree = ttk.Treeview(
+            item_summary_frame,
+            columns=item_columns,
+            show="headings",
+            height=7,
+        )
+        item_setup = [
+            ("item", "Item", 300),
+            ("quantity", "Quantity", 90),
+            ("value", "Value PED", 105),
+            ("loot_percent", "% of total loot", 115),
+            ("markup", "MU %", 90),
+            ("after_mu", "Value after MU", 125),
+        ]
+        for col, title, width in item_setup:
+            self.loot_item_summary_tree.heading(col, text=title)
+            self.loot_item_summary_tree.column(col, width=width, anchor="w" if col == "item" else "center")
+        self.make_tree_sortable(self.loot_item_summary_tree, {col: title for col, title, _ in item_setup})
+        item_summary_scroll = ttk.Scrollbar(item_summary_frame, orient="vertical", command=self.loot_item_summary_tree.yview)
+        self.loot_item_summary_tree.configure(yscrollcommand=item_summary_scroll.set)
+        self.loot_item_summary_tree.pack(side="left", fill="x", expand=True)
+        item_summary_scroll.pack(side="right", fill="y")
+        self.loot_item_summary_tree.bind("<Double-1>", self.begin_loot_markup_edit)
+
         selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
         selection.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(selection, textvariable=self.loot_selection_var, justify="left").pack(anchor="w")
@@ -1073,6 +1115,162 @@ class SkillTrackerApp:
                 totals[item] = totals.get(item, 0) + int(quantity or 0)
         return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0].lower())))
 
+    def loot_item_value_totals(self, loot_events):
+        """Group loot by item name with summed quantity and TT value.
+
+        Current sessions preserve each original loot message, so item values are
+        exact even when several items belong to the same loot event. For very old
+        sessions without messages, the event value is assigned directly when
+        there is one item, or proportionally by quantity as a best-effort fallback.
+        """
+        totals = {}
+        loot_message_re = re.compile(r"^You received (.+?) Value: ([0-9]+(?:\.[0-9]+)?) PED$")
+
+        def add(item_name, quantity, value_ped):
+            if ignored_loot_item_name(item_name):
+                return
+            row = totals.setdefault(item_name, {"quantity": 0, "value_ped": 0.0})
+            row["quantity"] += max(0, int(quantity or 0))
+            row["value_ped"] += max(0.0, float(value_ped or 0.0))
+
+        for loot_event in list(loot_events or []):
+            parsed_messages = 0
+            for message in list(loot_event.get("messages", []) or []):
+                match = loot_message_re.match(str(message or ""))
+                if not match:
+                    continue
+                raw_item_name = match.group(1).strip()
+                item_name = normalize_loot_item_name(raw_item_name)
+                value_ped = float(match.group(2))
+                quantity = parse_loot_item_quantity(raw_item_name, item_name, value_ped)
+                add(item_name, quantity, value_ped)
+                parsed_messages += 1
+
+            if parsed_messages:
+                continue
+
+            items = {
+                str(item): max(0, int(quantity or 0))
+                for item, quantity in (loot_event.get("items", {}) or {}).items()
+                if not ignored_loot_item_name(item)
+            }
+            if not items:
+                continue
+            event_value = max(0.0, float(loot_event.get("value_ped", 0.0) or 0.0))
+            if len(items) == 1:
+                item_name, quantity = next(iter(items.items()))
+                add(item_name, quantity, event_value)
+                continue
+
+            total_quantity = sum(items.values())
+            for item_name, quantity in items.items():
+                allocated_value = event_value * quantity / total_quantity if total_quantity else 0.0
+                add(item_name, quantity, allocated_value)
+
+        return dict(sorted(totals.items(), key=lambda item: (-item[1]["value_ped"], item[0].lower())))
+
+    def loot_markup_for_item(self, item_name: str) -> float:
+        try:
+            return max(100.0, float(self.loot_markups.get(item_name, 100.0)))
+        except (TypeError, ValueError):
+            return 100.0
+
+    def save_loot_markups(self):
+        save_json(
+            LOOT_MARKUPS_FILE,
+            {item: float(value) for item, value in sorted(self.loot_markups.items(), key=lambda pair: pair[0].lower())},
+        )
+
+    def refresh_loot_item_summary_table(self, item_stats, loot_total: float) -> float:
+        if not hasattr(self, "loot_item_summary_tree"):
+            return float(loot_total or 0.0)
+        if self.loot_markup_editor is not None:
+            self.cancel_loot_markup_edit()
+        self.loot_item_summary_tree.delete(*self.loot_item_summary_tree.get_children())
+        self.loot_item_summary_iid_to_name = {}
+        total_after_mu = 0.0
+        for index, (item_name, data) in enumerate(item_stats.items()):
+            quantity = int(data.get("quantity", 0) or 0)
+            value_ped = float(data.get("value_ped", 0.0) or 0.0)
+            markup = self.loot_markup_for_item(item_name)
+            after_mu = value_ped * markup / 100.0
+            total_after_mu += after_mu
+            iid = f"loot_item_summary_{index}"
+            self.loot_item_summary_iid_to_name[iid] = item_name
+            self.loot_item_summary_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    item_name,
+                    quantity,
+                    f"{value_ped:.4f}",
+                    f"{percent(value_ped, loot_total):.2f}%",
+                    f"{markup:.2f}%",
+                    f"{after_mu:.4f}",
+                ),
+            )
+        self.apply_tree_sort(self.loot_item_summary_tree)
+        return total_after_mu
+
+    def begin_loot_markup_edit(self, event):
+        tree = self.loot_item_summary_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        if tree.identify_column(event.x) != "#5":
+            return
+        iid = tree.identify_row(event.y)
+        item_name = self.loot_item_summary_iid_to_name.get(iid)
+        if not iid or not item_name:
+            return
+        bbox = tree.bbox(iid, "markup")
+        if not bbox:
+            return
+        self.cancel_loot_markup_edit()
+        x, y, width, height = bbox
+        editor = ttk.Entry(tree, justify="center")
+        editor.insert(0, f"{self.loot_markup_for_item(item_name):g}")
+        editor.select_range(0, "end")
+        editor.place(x=x, y=y, width=width, height=height)
+        self.loot_markup_editor = editor
+        self.loot_markup_editor_item = item_name
+        editor.bind("<Return>", self.commit_loot_markup_edit)
+        editor.bind("<Escape>", self.cancel_loot_markup_edit)
+        editor.bind("<FocusOut>", self.commit_loot_markup_edit)
+        editor.focus_set()
+
+    def commit_loot_markup_edit(self, event=None):
+        editor = self.loot_markup_editor
+        if editor is None:
+            return
+        item_name = getattr(self, "loot_markup_editor_item", "")
+        raw_value = editor.get().strip().replace("%", "").replace(",", ".")
+        self.loot_markup_editor = None
+        self.loot_markup_editor_item = ""
+        editor.destroy()
+        try:
+            markup = float(raw_value)
+        except ValueError:
+            self.loot_markup_status_var.set(f"Invalid MU for {item_name}. Enter a number such as 101 or 125.5.")
+            return
+        if markup < 100.0:
+            self.loot_markup_status_var.set(f"MU for {item_name} must be 100% or higher.")
+            return
+        self.loot_markups[item_name] = markup
+        self.save_loot_markups()
+        self.loot_markup_status_var.set(f"Saved {item_name} MU at {markup:g}% in {LOOT_MARKUPS_FILE}.")
+        self.refresh_loot_tab()
+
+    def cancel_loot_markup_edit(self, event=None):
+        editor = self.loot_markup_editor
+        self.loot_markup_editor = None
+        self.loot_markup_editor_item = ""
+        if editor is not None:
+            try:
+                editor.destroy()
+            except tk.TclError:
+                pass
+
     def selected_loot_items(self):
         return [item for item, var in self.loot_item_vars.items() if var.get()]
 
@@ -1184,6 +1382,9 @@ class SkillTrackerApp:
 
         if not session:
             self.loot_summary_var.set("No active or saved session yet.")
+            if hasattr(self, "loot_item_summary_tree"):
+                self.loot_item_summary_tree.delete(*self.loot_item_summary_tree.get_children())
+                self.loot_item_summary_iid_to_name = {}
             self.clear_chart(self.loot_value_time_canvas, "No loot data")
             self.clear_chart(self.loot_cost_canvas, "No loot data")
             self.clear_chart(self.loot_items_time_canvas, "No loot data")
@@ -1193,13 +1394,15 @@ class SkillTrackerApp:
         loot_total = sum(float(event.get("value_ped", 0.0) or 0.0) for event in loot_events)
         cost_per_kill = ped_cycled / len(loot_events) if loot_events else 0.0
         item_totals = self.loot_item_totals(loot_events)
+        item_value_totals = self.loot_item_value_totals(loot_events)
+        loot_after_mu = self.refresh_loot_item_summary_table(item_value_totals, loot_total)
         top_items = "; ".join(f"{item}: {qty}" for item, qty in list(item_totals.items())[:6]) or "-"
         source = "active session" if self.current_session is not None else "saved session"
         self.loot_summary_var.set(
             f"Source: {source} | Loot events/kills: {len(loot_events)} | PED cycled: {ped_cycled:.4f} | "
-            f"Loot: {loot_total:.4f} PED ({percent(loot_total, ped_cycled):.2f}%) | "
-            f"Cost per kill/event: {cost_per_kill:.6f} PED | Event table shows all saved loot events\n"
-            f"Unique items: {len(item_totals)} | Top items: {top_items}"
+            f"TT loot: {loot_total:.4f} PED ({percent(loot_total, ped_cycled):.2f}%) | "
+            f"Loot after MU: {loot_after_mu:.4f} PED ({percent(loot_after_mu, ped_cycled):.2f}% of cycled)\n"
+            f"Cost per kill/event: {cost_per_kill:.6f} PED | Unique items: {len(item_value_totals)} | Top items: {top_items}"
         )
 
         # Show every saved loot event. Earlier versions only displayed the last
