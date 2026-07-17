@@ -164,12 +164,7 @@ def save_json(path: Path, data):
 
 
 def load_weekly_market_markups(path: Path):
-    """Load the latest weekly market markup for every item.
-
-    Manual values from loot_markups.json are handled separately and always win.
-    Percentage market entries are stored as a multiplier percentage. Fixed
-    entries are stored as TT+ PED per item.
-    """
+    """Load weekly markup from the single latest record stored for each item."""
     data = load_json(path, {})
     result = {}
     if not isinstance(data, dict):
@@ -179,50 +174,33 @@ def load_weekly_market_markups(path: Path):
     if not isinstance(items, dict):
         return result
 
-    for entry in items.values():
-        if not isinstance(entry, dict):
+    for market_entry in items.values():
+        if not isinstance(market_entry, dict):
             continue
-        item_name = str(entry.get("item", "") or "").strip()
+        item_name = str(market_entry.get("item", "") or "").strip()
         if not item_name:
             continue
-        snapshots = entry.get("snapshots", []) or []
-        if not isinstance(snapshots, list):
+
+        markup_type = None
+        markup_value = None
+        periods = market_entry.get("periods", {})
+        if isinstance(periods, dict):
+            week = periods.get("week", {})
+            if isinstance(week, dict):
+                markup = week.get("markup", {})
+                if isinstance(markup, dict):
+                    markup_type = markup.get("type")
+                    markup_value = markup.get("value")
+
+        try:
+            markup_value = float(markup_value)
+        except (TypeError, ValueError):
             continue
 
-        # Prefer the newest snapshot that has usable weekly markup data.
-        for snapshot in reversed(snapshots):
-            if not isinstance(snapshot, dict):
-                continue
-            markup_type = None
-            markup_value = None
-
-            periods = snapshot.get("periods", {})
-            if isinstance(periods, dict):
-                week = periods.get("week", {})
-                if isinstance(week, dict):
-                    markup = week.get("markup", {})
-                    if isinstance(markup, dict):
-                        markup_type = markup.get("type")
-                        markup_value = markup.get("value")
-
-            # Backward compatibility with the earlier collector schema.
-            if markup_value is None:
-                week = snapshot.get("week", {})
-                if isinstance(week, dict) and week.get("markup_percent") is not None:
-                    markup_type = "percentage"
-                    markup_value = week.get("markup_percent")
-
-            try:
-                markup_value = float(markup_value)
-            except (TypeError, ValueError):
-                continue
-
-            if markup_type == "percentage" and markup_value >= 100.0:
-                result[item_name] = {"type": "percentage", "value": markup_value}
-                break
-            if markup_type == "fixed" and markup_value >= 0.0:
-                result[item_name] = {"type": "fixed", "value": markup_value}
-                break
+        if markup_type == "percentage" and markup_value >= 0:
+            result[item_name] = {"type": "percentage", "value": markup_value}
+        elif markup_type == "fixed" and markup_value >= 0:
+            result[item_name] = {"type": "fixed", "value": markup_value}
 
     return result
 

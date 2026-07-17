@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import os
@@ -307,13 +306,17 @@ def parse_market_clipboard(text: str) -> list[dict[str, Any]]:
 
 def empty_database() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "updated_at": None,
         "items": {},
     }
 
 
 def load_database(path: Path) -> dict[str, Any]:
+    """Load market data and migrate old snapshot-based files in memory.
+
+    Every item is represented by exactly one latest market-data object.
+    """
     if not path.exists():
         return empty_database()
 
@@ -328,15 +331,35 @@ def load_database(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"{path} must contain a JSON object.")
 
-    data.setdefault("schema_version", 2)
-    data.setdefault("updated_at", None)
-    data.setdefault("items", {})
-
-    if not isinstance(data["items"], dict):
+    raw_items = data.get("items", {})
+    if not isinstance(raw_items, dict):
         raise RuntimeError(f'{path}: "items" must be a JSON object.')
 
-    return data
+    migrated_items = {}
+    for key, entry in raw_items.items():
+        if not isinstance(entry, dict):
+            continue
+        latest = entry
+        old_snapshots = entry.get("snapshots")
+        if isinstance(old_snapshots, list) and old_snapshots:
+            latest = old_snapshots[-1]
+        if not isinstance(latest, dict):
+            continue
+        item_name = str(latest.get("item", entry.get("item", "")) or "").strip()
+        tier = latest.get("tier", entry.get("tier", 0))
+        if not item_name:
+            continue
+        latest = dict(latest)
+        latest.pop("snapshots", None)
+        latest["item"] = item_name
+        latest["tier"] = tier
+        migrated_items[item_key(latest)] = latest
 
+    return {
+        "schema_version": 4,
+        "updated_at": data.get("updated_at"),
+        "items": migrated_items,
+    }
 
 def save_database_atomic(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -355,48 +378,26 @@ def item_key(snapshot: dict[str, Any]) -> str:
     return f'{snapshot["item"]}::tier={snapshot["tier"]}'
 
 
-def comparable_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+def comparable_market_data(market_data: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
-        for key, value in snapshot.items()
+        for key, value in market_data.items()
         if key != "captured_at"
     }
 
 
-def snapshot_hash(snapshot: dict[str, Any]) -> str:
-    serialized = json.dumps(
-        comparable_snapshot(snapshot),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+def save_latest_item(database: dict[str, Any], market_data: dict[str, Any]) -> bool:
+    """Replace the item's previous market data with the newest copy."""
+    key = item_key(market_data)
+    previous = database["items"].get(key)
 
-    return hashlib.sha256(serialized).hexdigest()
+    if isinstance(previous, dict):
+        if comparable_market_data(previous) == comparable_market_data(market_data):
+            return False
 
-
-def add_snapshot(database: dict[str, Any], snapshot: dict[str, Any]) -> bool:
-    key = item_key(snapshot)
-
-    entry = database["items"].setdefault(
-        key,
-        {
-            "item": snapshot["item"],
-            "tier": snapshot["tier"],
-            "market_format": snapshot["market_format"],
-            "snapshots": [],
-        },
-    )
-
-    snapshots = entry.setdefault("snapshots", [])
-
-    # Ignore only an unchanged latest snapshot for the same item.
-    if snapshots and snapshot_hash(snapshots[-1]) == snapshot_hash(snapshot):
-        return False
-
-    entry["market_format"] = snapshot["market_format"]
-    snapshots.append(snapshot)
-    database["updated_at"] = snapshot["captured_at"]
-
+    database["items"][key] = market_data
+    database["schema_version"] = 4
+    database["updated_at"] = market_data["captured_at"]
     return True
 
 
@@ -408,6 +409,8 @@ def run() -> None:
 
     try:
         database = load_database(OUTPUT_FILE)
+        # Rewrite old snapshot-based files immediately into the one-record-per-item schema.
+        save_database_atomic(OUTPUT_FILE, database)
     except RuntimeError as exc:
         print(f"Startup error: {exc}", file=sys.stderr)
         raise SystemExit(1)
@@ -426,25 +429,25 @@ def run() -> None:
             previous_clipboard = clipboard
 
             try:
-                snapshots = parse_market_clipboard(clipboard)
+                market_rows = parse_market_clipboard(clipboard)
             except ValueError as exc:
                 print(f"Recognized market table but failed to parse it: {exc}")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            for snapshot in snapshots:
-                if add_snapshot(database, snapshot):
+            for market_data in market_rows:
+                if save_latest_item(database, market_data):
                     save_database_atomic(OUTPUT_FILE, database)
                     print(
-                        f'[{snapshot["captured_at"]}] Saved '
-                        f'{snapshot["item"]} '
-                        f'(tier {snapshot["tier"]}, '
-                        f'{snapshot["market_format"]})'
+                        f'[{market_data["captured_at"]}] Saved '
+                        f'{market_data["item"]} '
+                        f'(tier {market_data["tier"]}, '
+                        f'{market_data["market_format"]})'
                     )
                 else:
                     print(
                         f'Ignored unchanged copy: '
-                        f'{snapshot["item"]} (tier {snapshot["tier"]})'
+                        f'{market_data["item"]} (tier {market_data["tier"]})'
                     )
 
         time.sleep(POLL_INTERVAL_SECONDS)
