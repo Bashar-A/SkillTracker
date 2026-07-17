@@ -2608,7 +2608,7 @@ class SkillTrackerApp:
         top.pack(fill="x")
         ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
         ttk.Button(top, text="Load Current Skills from Selected Session", command=self.load_current_skills_from_selected_session).pack(side="left", padx=6)
-        ttk.Button(top, text="Delete Selected Session", command=self.delete_selected_session).pack(side="left", padx=6)
+        ttk.Button(top, text="Delete Selected Sessions", command=self.delete_selected_sessions).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
         columns = (
@@ -2617,7 +2617,13 @@ class SkillTrackerApp:
             "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
             "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
         )
-        self.sessions_tree = ttk.Treeview(self.sessions_tab, columns=columns, show="headings", height=22)
+        self.sessions_tree = ttk.Treeview(
+            self.sessions_tab,
+            columns=columns,
+            show="headings",
+            height=22,
+            selectmode="extended",
+        )
         setup = [
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
             ("mob", "Mob", 170), ("attacks", "Attacks", 75),
@@ -2706,16 +2712,20 @@ class SkillTrackerApp:
         self.session_detail_events_text = tk.Text(events_frame, height=10, wrap="none")
         self.session_detail_events_text.pack(fill="both", expand=True)
 
+    def selected_session_indices_from_table(self):
+        indices = []
+        for iid in self.sessions_tree.selection():
+            try:
+                index = int(str(iid).replace("session_", ""))
+            except ValueError:
+                continue
+            if 0 <= index < len(self.sessions):
+                indices.append(index)
+        return sorted(set(indices))
+
     def selected_session_index_from_table(self):
-        selected = self.sessions_tree.selection()
-        if not selected:
-            return None
-        iid = selected[0]
-        try:
-            index = int(iid.replace("session_", ""))
-        except ValueError:
-            return None
-        return index if 0 <= index < len(self.sessions) else None
+        indices = self.selected_session_indices_from_table()
+        return indices[0] if indices else None
 
     def selected_session_from_table(self):
         index = self.selected_session_index_from_table()
@@ -3987,26 +3997,47 @@ class SkillTrackerApp:
         self.refresh_sessions_table()
         self.show_session_details(None)
 
-    def delete_selected_session(self):
-        index = self.selected_session_index_from_table()
-        if index is None:
-            messagebox.showwarning("No session selected", "Select a session to delete first.")
+    def delete_selected_sessions(self):
+        indices = self.selected_session_indices_from_table()
+        if not indices:
+            messagebox.showwarning("No sessions selected", "Select one or more sessions to delete first.")
             return
 
-        session = self.sessions[index]
-        started = session.get("started_at", "")
-        weapon = session.get("weapon", "") or "-"
-        mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip() or "-"
-        if not messagebox.askyesno(
-            "Delete selected session",
-            f"Delete session from {started}?\n\nWeapon: {weapon}\nMob: {mob}",
-        ):
+        selected_sessions = [self.sessions[index] for index in indices]
+        if len(selected_sessions) == 1:
+            session = selected_sessions[0]
+            started = session.get("started_at", "")
+            weapon = session.get("weapon", "") or "-"
+            mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip() or "-"
+            confirmation = (
+                f"Delete the selected session?\n\n"
+                f"Started: {started}\nWeapon: {weapon}\nMob: {mob}"
+            )
+        else:
+            preview_lines = []
+            for session in selected_sessions[:8]:
+                started = session.get("started_at", "")
+                weapon = session.get("weapon", "") or "-"
+                mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip() or "-"
+                preview_lines.append(f"• {started} | {weapon} | {mob}")
+            if len(selected_sessions) > len(preview_lines):
+                preview_lines.append(f"• ...and {len(selected_sessions) - len(preview_lines)} more")
+            confirmation = (
+                f"Delete {len(selected_sessions)} selected sessions?\n\n"
+                + "\n".join(preview_lines)
+            )
+
+        if not messagebox.askyesno("Delete selected sessions", confirmation):
             return
 
-        del self.sessions[index]
+        # Remove from highest index to lowest so earlier indices do not shift.
+        for index in sorted(indices, reverse=True):
+            del self.sessions[index]
+
         save_json(SESSIONS_FILE, self.sessions)
         self.refresh_sessions_table()
         self.show_session_details(None)
+        self.refresh_loot_tab()
 
     def save_state(self, last_log_read_at=None):
         """Save app state without accidentally moving the log cutoff forward.
