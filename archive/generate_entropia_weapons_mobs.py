@@ -144,6 +144,42 @@ def extract_planets(item: dict[str, Any]) -> list[str]:
     return planets
 
 
+
+def extract_mob_type(item: dict[str, Any]) -> Any:
+    """Extract mob type such as Animal, Robot, or Mutant."""
+    value = deep_first(
+        item,
+        ("Type",),
+        ("type",),
+        ("MobType",),
+        ("mobType",),
+        ("Mob_Type",),
+        ("mob_type",),
+        ("Properties", "Type"),
+        ("Properties", "MobType"),
+        ("Properties", "Mob_Type"),
+        ("properties", "type"),
+        ("properties", "mobType"),
+        ("properties", "mob_type"),
+    )
+
+    if isinstance(value, dict):
+        value = first_value(value, "Name", "name", "Type", "type", "Value", "value")
+
+    if isinstance(value, list):
+        values: list[str] = []
+        for entry in value:
+            if isinstance(entry, dict):
+                entry = first_value(entry, "Name", "name", "Type", "type", "Value", "value")
+            if entry is not None and str(entry).strip():
+                values.append(str(entry).strip())
+        return values
+
+    if value is None or value == "":
+        return None
+
+    return str(value).strip()
+
 def extract_maturities(item: dict[str, Any]) -> list[Any]:
     for key in ("Maturities", "maturities", "Maturity", "maturity", "MobMaturities", "mobMaturities"):
         value = item.get(key)
@@ -225,6 +261,7 @@ def build_mobs(raw_items: list[Any]) -> dict[str, dict[str, Any]]:
             }
 
         result[str(name)] = {
+            "type": extract_mob_type(item),
             "planets": extract_planets(item),
             "maturities": dict(sorted(maturities.items(), key=lambda x: x[0].lower())),
         }
@@ -250,6 +287,7 @@ def print_inspect(path: Path, limit: int) -> None:
                 mprops = maturities[0].get("Properties") or maturities[0].get("properties")
                 if isinstance(mprops, dict):
                     print("First maturity Properties keys:", list(mprops.keys()))
+            print("Mob type found:", extract_mob_type(item))
             print("Planets found:", extract_planets(item))
         else:
             print(type(item).__name__, item)
