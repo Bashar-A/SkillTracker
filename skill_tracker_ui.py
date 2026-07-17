@@ -659,6 +659,7 @@ class SkillTrackerApp:
         self.loot_markup_status_var = tk.StringVar(value="Double-click an MU cell to edit it. Default MU is 100%.")
         self.loot_item_summary_iid_to_name = {}
         self.loot_markup_editor = None
+        self.loot_event_iid_to_event = {}
         self.loot_item_filter_var = tk.StringVar()
         self.loot_item_vars = {}
         self.loot_chart_payloads = {}
@@ -866,6 +867,10 @@ class SkillTrackerApp:
             "current": "Current skill",
         })
         self.session_skill_tree.pack(fill="both", expand=True, padx=10, pady=6)
+        self.session_skill_tree.bind(
+            "<Double-1>",
+            lambda event: self.open_skill_gain_details_from_tree(event, self.session_skill_tree, "active"),
+        )
 
         event_frame = ttk.LabelFrame(self.monitor_tab, text="Recent parsed events", padding=6)
         event_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -970,6 +975,7 @@ class SkillTrackerApp:
             self.loot_events_tree.column(col, width=width, anchor="center")
         self.make_tree_sortable(self.loot_events_tree, {col: title for col, title, _ in setup})
         self.loot_events_tree.pack(fill="both", expand=True)
+        self.loot_events_tree.bind("<Double-1>", self.open_loot_event_details)
 
         graph1 = ttk.LabelFrame(right, text="1. Loot value / elapsed time (% return)", padding=6)
         graph1.pack(fill="both", expand=True, pady=(0, 6))
@@ -1168,6 +1174,281 @@ class SkillTrackerApp:
                 add(item_name, quantity, allocated_value)
 
         return dict(sorted(totals.items(), key=lambda item: (-item[1]["value_ped"], item[0].lower())))
+
+    def loot_event_item_details(self, loot_event):
+        """Return exact per-item quantity and value details for one loot event.
+
+        Newer sessions retain every original loot message, which provides exact
+        value-per-item data. Old sessions without messages use the same
+        quantity-proportional fallback as the grouped loot summary.
+        """
+        details = {}
+
+        def add(item_name, quantity, value_ped, message=""):
+            if ignored_loot_item_name(item_name):
+                return
+            row = details.setdefault(
+                item_name,
+                {"quantity": 0, "value_ped": 0.0, "messages": []},
+            )
+            row["quantity"] += max(0, int(quantity or 0))
+            row["value_ped"] += max(0.0, float(value_ped or 0.0))
+            if message:
+                row["messages"].append(str(message))
+
+        parsed_messages = 0
+        for message in list((loot_event or {}).get("messages", []) or []):
+            match = ChatLogParser.loot_re.match(str(message or ""))
+            if not match:
+                continue
+            raw_item_name = match.group(1).strip()
+            item_name = normalize_loot_item_name(raw_item_name)
+            value_ped = float(match.group(2))
+            quantity = parse_loot_item_quantity(raw_item_name, item_name, value_ped)
+            add(item_name, quantity, value_ped, message)
+            parsed_messages += 1
+
+        if not parsed_messages:
+            items = {
+                str(item): max(0, int(quantity or 0))
+                for item, quantity in ((loot_event or {}).get("items", {}) or {}).items()
+                if not ignored_loot_item_name(item)
+            }
+            event_value = max(0.0, float((loot_event or {}).get("value_ped", 0.0) or 0.0))
+            if len(items) == 1:
+                item_name, quantity = next(iter(items.items()))
+                add(item_name, quantity, event_value)
+            elif items:
+                total_quantity = sum(items.values())
+                for item_name, quantity in items.items():
+                    allocated_value = event_value * quantity / total_quantity if total_quantity else 0.0
+                    add(item_name, quantity, allocated_value)
+
+        return dict(sorted(details.items(), key=lambda pair: (-pair[1]["value_ped"], pair[0].lower())))
+
+    def open_loot_event_details(self, event=None):
+        tree = self.loot_events_tree
+        iid = tree.identify_row(event.y) if event is not None else ""
+        if not iid:
+            selected = tree.selection()
+            iid = selected[0] if selected else ""
+        loot_event = self.loot_event_iid_to_event.get(iid)
+        if not loot_event:
+            return
+        tree.selection_set(iid)
+        tree.focus(iid)
+
+        item_details = self.loot_event_item_details(loot_event)
+        event_index = loot_event.get("index", "")
+        started_at = loot_event.get("started_at", "")
+        ended_at = loot_event.get("ended_at", started_at)
+        loot_value = float(loot_event.get("value_ped", 0.0) or 0.0)
+        cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
+        after_mu = sum(
+            float(row.get("value_ped", 0.0) or 0.0) * self.loot_markup_for_item(item_name) / 100.0
+            for item_name, row in item_details.items()
+        )
+
+        window = tk.Toplevel(self.root)
+        window.title(f"Loot event #{event_index} details")
+        window.geometry("900x560")
+        window.minsize(720, 420)
+        window.transient(self.root)
+
+        summary = ttk.LabelFrame(window, text="Event summary", padding=10)
+        summary.pack(fill="x", padx=10, pady=10)
+        ttk.Label(
+            summary,
+            text=(
+                f"Event: #{event_index} | Start: {started_at or '-'} | End: {ended_at or '-'}\n"
+                f"Cost: {cost_ped:.6f} PED | TT loot: {loot_value:.4f} PED "
+                f"({percent(loot_value, cost_ped):.2f}% return) | "
+                f"After MU: {after_mu:.4f} PED ({percent(after_mu, cost_ped):.2f}% return)"
+            ),
+            justify="left",
+        ).pack(anchor="w")
+
+        table_frame = ttk.LabelFrame(window, text="Items", padding=6)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("item", "quantity", "value", "event_percent", "markup", "after_mu")
+        detail_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        setup = [
+            ("item", "Item", 300),
+            ("quantity", "Quantity", 90),
+            ("value", "TT value PED", 110),
+            ("event_percent", "% of event", 105),
+            ("markup", "MU %", 85),
+            ("after_mu", "Value after MU", 125),
+        ]
+        for column, title, width in setup:
+            detail_tree.heading(column, text=title)
+            detail_tree.column(column, width=width, anchor="w" if column == "item" else "center")
+        detail_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=detail_tree.yview)
+        detail_tree.configure(yscrollcommand=detail_scroll.set)
+        detail_tree.pack(side="left", fill="both", expand=True)
+        detail_scroll.pack(side="right", fill="y")
+
+        for item_name, row in item_details.items():
+            quantity = int(row.get("quantity", 0) or 0)
+            value_ped = float(row.get("value_ped", 0.0) or 0.0)
+            markup = self.loot_markup_for_item(item_name)
+            item_after_mu = value_ped * markup / 100.0
+            detail_tree.insert(
+                "",
+                "end",
+                values=(
+                    item_name,
+                    quantity,
+                    f"{value_ped:.4f}",
+                    f"{percent(value_ped, loot_value):.2f}%",
+                    f"{markup:.2f}%",
+                    f"{item_after_mu:.4f}",
+                ),
+            )
+
+        messages_frame = ttk.LabelFrame(window, text="Original loot messages", padding=6)
+        messages_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        message_text = tk.Text(messages_frame, height=7, wrap="none")
+        message_y = ttk.Scrollbar(messages_frame, orient="vertical", command=message_text.yview)
+        message_x = ttk.Scrollbar(messages_frame, orient="horizontal", command=message_text.xview)
+        message_text.configure(yscrollcommand=message_y.set, xscrollcommand=message_x.set)
+        message_text.grid(row=0, column=0, sticky="nsew")
+        message_y.grid(row=0, column=1, sticky="ns")
+        message_x.grid(row=1, column=0, sticky="ew")
+        messages_frame.rowconfigure(0, weight=1)
+        messages_frame.columnconfigure(0, weight=1)
+        messages = list(loot_event.get("messages", []) or [])
+        if messages:
+            for message in messages:
+                message_text.insert("end", str(message) + "\n")
+        else:
+            message_text.insert("end", "Original messages are unavailable for this older saved event.\n")
+        message_text.configure(state="disabled")
+
+    def skill_gain_message_details(self, session, skill_name: str):
+        """Build chronological per-message skill details for current and old sessions."""
+        if isinstance(session, MonitorSession):
+            session = asdict(session)
+        session = session or {}
+        start_snapshot = session.get("current_skills_at_start", {}) or {}
+        current_points = parse_float(start_snapshot.get(skill_name), 0.0)
+        details = []
+        for event in list(session.get("events", []) or []):
+            if event.get("type") != "skill_gain" or str(event.get("skill", "")) != str(skill_name):
+                continue
+            point_gain = parse_float(event.get("delta_points", event.get("delta_tt", 0.0)), 0.0)
+            old_points = parse_float(event.get("skill_points_before"), current_points)
+            new_points = parse_float(event.get("skill_points_after"), old_points + point_gain)
+            stored_tt_gain = event.get("tt_gain")
+            if stored_tt_gain is None:
+                try:
+                    tt_gain = skill_tt_value(new_points) - skill_tt_value(old_points)
+                except Exception:
+                    tt_gain = 0.0
+            else:
+                tt_gain = parse_float(stored_tt_gain, 0.0)
+            details.append({
+                "timestamp": event.get("timestamp", ""),
+                "point_gain": point_gain,
+                "tt_gain": tt_gain,
+                "old_points": old_points,
+                "new_points": new_points,
+                "message": event.get("message", ""),
+            })
+            current_points = new_points
+        return details
+
+    def open_skill_gain_details_from_tree(self, event, tree, source="active"):
+        iid = tree.identify_row(event.y) if event is not None else ""
+        if not iid:
+            selected = tree.selection()
+            iid = selected[0] if selected else ""
+        if not iid:
+            return
+        values = tree.item(iid, "values")
+        if not values:
+            return
+        skill_name = str(values[0])
+        tree.selection_set(iid)
+        tree.focus(iid)
+
+        if source == "active":
+            session = self.current_session
+            source_text = "active session"
+        else:
+            session = self.selected_session_from_table()
+            source_text = "selected saved session"
+        if session is None:
+            messagebox.showwarning("No session", "There is no session available for this skill.")
+            return
+
+        details = self.skill_gain_message_details(session, skill_name)
+        session_data = asdict(session) if isinstance(session, MonitorSession) else session
+        total_points = sum(float(row.get("point_gain", 0.0) or 0.0) for row in details)
+        total_tt = sum(float(row.get("tt_gain", 0.0) or 0.0) for row in details)
+        start_points = parse_float((session_data.get("current_skills_at_start", {}) or {}).get(skill_name), 0.0)
+        end_points = details[-1]["new_points"] if details else start_points
+
+        window = tk.Toplevel(self.root)
+        window.title(f"{skill_name} gain messages")
+        window.geometry("1100x560")
+        window.minsize(820, 400)
+        window.transient(self.root)
+
+        summary = ttk.LabelFrame(window, text="Skill summary", padding=10)
+        summary.pack(fill="x", padx=10, pady=10)
+        ttk.Label(
+            summary,
+            text=(
+                f"Skill: {skill_name} | Source: {source_text} | Messages: {len(details)}\n"
+                f"Total gain: {total_points:.6f} points / {total_tt:.8f} TT-equivalent | "
+                f"Skill: {start_points:.6f} -> {end_points:.6f}"
+            ),
+            justify="left",
+        ).pack(anchor="w")
+
+        table_frame = ttk.LabelFrame(window, text="Each skill gain message", padding=6)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        columns = ("number", "time", "points", "tt", "before", "after", "message")
+        detail_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
+        setup = [
+            ("number", "#", 45),
+            ("time", "Time", 145),
+            ("points", "Point gain", 95),
+            ("tt", "TT-equivalent", 115),
+            ("before", "Before", 100),
+            ("after", "After", 100),
+            ("message", "Original message", 430),
+        ]
+        for column, title, width in setup:
+            detail_tree.heading(column, text=title)
+            detail_tree.column(column, width=width, anchor="w" if column == "message" else "center")
+        detail_y = ttk.Scrollbar(table_frame, orient="vertical", command=detail_tree.yview)
+        detail_x = ttk.Scrollbar(table_frame, orient="horizontal", command=detail_tree.xview)
+        detail_tree.configure(yscrollcommand=detail_y.set, xscrollcommand=detail_x.set)
+        detail_tree.grid(row=0, column=0, sticky="nsew")
+        detail_y.grid(row=0, column=1, sticky="ns")
+        detail_x.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        for index, row in enumerate(details, start=1):
+            detail_tree.insert(
+                "",
+                "end",
+                values=(
+                    index,
+                    row.get("timestamp", ""),
+                    f"{float(row.get('point_gain', 0.0) or 0.0):.6f}",
+                    f"{float(row.get('tt_gain', 0.0) or 0.0):.8f}",
+                    f"{float(row.get('old_points', 0.0) or 0.0):.6f}",
+                    f"{float(row.get('new_points', 0.0) or 0.0):.6f}",
+                    row.get("message", ""),
+                ),
+            )
+
+        if not details:
+            detail_tree.insert("", "end", values=("", "", "", "", "", "", "No saved gain messages for this skill."))
 
     def loot_markup_for_item(self, item_name: str) -> float:
         try:
@@ -1379,6 +1660,7 @@ class SkillTrackerApp:
         loot_events = self.loot_events_for_session(session)
         self.refresh_loot_item_checks()
         self.loot_events_tree.delete(*self.loot_events_tree.get_children())
+        self.loot_event_iid_to_event = {}
 
         if not session:
             self.loot_summary_var.set("No active or saved session yet.")
@@ -1409,9 +1691,11 @@ class SkillTrackerApp:
         # 500 rows, which looked like older loot events were not saved.
         # The graphs are still downsampled separately, so drawing performance is
         # not tied to the number of rows shown here.
-        for loot_event in loot_events:
+        for row_index, loot_event in enumerate(loot_events):
             cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
-            self.loot_events_tree.insert("", "end", values=(
+            iid = f"loot_event_{row_index}"
+            self.loot_event_iid_to_event[iid] = loot_event
+            self.loot_events_tree.insert("", "end", iid=iid, values=(
                 loot_event.get("index", ""),
                 loot_event.get("ended_at", loot_event.get("started_at", "")),
                 sum(int(v or 0) for v in (loot_event.get("items", {}) or {}).values()),
@@ -2281,6 +2565,10 @@ class SkillTrackerApp:
             self.session_detail_skill_tree.column(col, width=width, anchor="center" if col != "skill" else "w")
         self.make_tree_sortable(self.session_detail_skill_tree, {col: title for col, title, _ in setup})
         self.session_detail_skill_tree.pack(fill="both", expand=True)
+        self.session_detail_skill_tree.bind(
+            "<Double-1>",
+            lambda event: self.open_skill_gain_details_from_tree(event, self.session_detail_skill_tree, "saved"),
+        )
 
         events_frame = ttk.LabelFrame(self.session_details_tab, text="Saved parsed events (display limited, file saves all)", padding=6)
         events_frame.pack(fill="both", expand=True, padx=10, pady=6)
@@ -3252,6 +3540,9 @@ class SkillTrackerApp:
                 tt_gain = skill_tt_value(new_points) - skill_tt_value(old_points)
             except Exception:
                 tt_gain = 0.0
+            event["skill_points_before"] = old_points
+            event["skill_points_after"] = new_points
+            event["tt_gain"] = tt_gain
             self.current_skills[skill] = new_points
             session.skill_gains_points[skill] = session.skill_gains_points.get(skill, 0.0) + point_gain
             session.skill_gains_tt[skill] = session.skill_gains_tt.get(skill, 0.0) + tt_gain
