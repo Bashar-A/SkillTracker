@@ -5,6 +5,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 import tkinter as tk
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -606,6 +607,21 @@ class SkillTrackerApp:
         self.reader_last_progress_at = 0.0
         self.reader_processed_batches = 0
 
+        # Keep log parsing and the Tkinter UI decoupled. Parsed data is applied
+        # immediately, while expensive widget redraws and disk writes are
+        # throttled. This prevents long chat.log imports from making the window
+        # appear frozen even though the reader is still progressing.
+        self.live_ui_dirty = False
+        self.live_ui_last_refresh_at = 0.0
+        self.live_ui_refresh_interval = 0.45
+        self.live_persist_last_at = 0.0
+        self.live_persist_interval = 1.5
+        self.pending_last_log_read_at = ""
+        self.pending_event_lines = deque(maxlen=1200)
+        self.recent_event_line_limit = 600
+        self.last_loot_live_refresh_at = 0.0
+        self.loot_live_refresh_interval = 3.0
+
         self.profession_var = tk.StringVar()
         default_projection_profession = "Animal Looter" if "Animal Looter" in PROFESSIONS else next(iter(PROFESSIONS), "")
         self.session_projection_profession_var = tk.StringVar(value=default_projection_profession)
@@ -679,6 +695,7 @@ class SkillTrackerApp:
 
     def create_ui(self):
         notebook = ttk.Notebook(self.root)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True)
 
         self.profession_tab = ttk.Frame(notebook)
@@ -701,6 +718,22 @@ class SkillTrackerApp:
         self.create_sessions_tab()
         self.create_session_details_tab()
         self.create_profession_tab()
+        notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
+
+    def is_tab_active(self, tab):
+        try:
+            return self.notebook.select() == str(tab)
+        except (AttributeError, tk.TclError):
+            return False
+
+    def on_notebook_tab_changed(self, event=None):
+        # Heavy loot tables/charts are refreshed on demand when their tab is
+        # opened, rather than after every parsed log batch.
+        if self.is_tab_active(getattr(self, "loot_tab", None)):
+            self.refresh_loot_tab()
+            self.last_loot_live_refresh_at = time.monotonic()
+        elif self.is_tab_active(getattr(self, "profession_tab", None)):
+            self.refresh_profession_current_values()
 
     def make_tree_sortable(self, tree, headings):
         self.tree_heading_titles[tree] = dict(headings)
@@ -1000,7 +1033,10 @@ class SkillTrackerApp:
 
     def loot_source_session(self):
         if self.current_session is not None:
-            return asdict(self.current_session)
+            # A shallow mapping is enough for read-only loot rendering. asdict()
+            # recursively copied every saved event and became very expensive in
+            # long sessions.
+            return vars(self.current_session)
         selected = self.selected_session_from_table() if hasattr(self, "sessions_tree") else None
         if selected:
             return selected
@@ -1721,16 +1757,20 @@ class SkillTrackerApp:
         self.loot_item_check_signature = signature
 
     def schedule_loot_refresh(self, delay_ms=750):
-        """Debounce expensive loot chart redraws while the log reader is busy."""
-        if not hasattr(self, "loot_value_time_canvas"):
+        """Debounce expensive loot redraws and skip them while the tab is hidden."""
+        if not hasattr(self, "loot_value_time_canvas") or not self.is_tab_active(self.loot_tab):
             return
         if self.loot_refresh_after_id is not None:
             return
+        if self.reader_active:
+            delay_ms = max(int(delay_ms), int(self.loot_live_refresh_interval * 1000))
         self.loot_refresh_after_id = self.root.after(delay_ms, self._run_scheduled_loot_refresh)
 
     def _run_scheduled_loot_refresh(self):
         self.loot_refresh_after_id = None
-        self.refresh_loot_tab()
+        if self.is_tab_active(self.loot_tab):
+            self.refresh_loot_tab()
+            self.last_loot_live_refresh_at = time.monotonic()
 
     def first_loot_event_time(self, loot_events):
         for loot_event in loot_events:
@@ -3311,7 +3351,8 @@ class SkillTrackerApp:
             self.pause_sync_button.configure(text="Pause Sync")
         self.monitor_status_var.set("Syncing")
         self.append_event(resume_message)
-        self.update_session_summary()
+        self.live_ui_dirty = True
+        self.refresh_live_ui(force=True)
         self.start_log_reader_until_current_eof()
 
     def stop_sync(self):
@@ -3325,15 +3366,18 @@ class SkillTrackerApp:
         self.reader_stop_event.set()
         if self.reader_thread is not None and self.reader_thread.is_alive():
             self.reader_thread.join()
-        self.process_reader_queue(max_batches=1_000_000)
+        self.process_reader_queue(max_batches=1_000_000, time_budget_ms=None, force_refresh=True)
 
         self.current_session.ended_at = now_iso()
         self.current_session.end_offset = self.log_offset
         self.current_session.current_skills_at_end = self.skill_snapshot()
-        save_current_skills(self.current_skills)
+        self.current_session.total_profession_gain_by_profession = self.calculate_profession_gains_for_session(self.current_session)
+        self.maybe_persist_live_state(force=True)
+        self.refresh_live_ui(force=True)
         self.sessions.append(asdict(self.current_session))
         save_json(SESSIONS_FILE, self.sessions)
         self.append_event("Stopped sync session, saved current skills, and saved the session")
+        self.flush_event_text()
         self.current_session = None
         self.log_time_cutoff_at = None
         self.monitoring = False
@@ -3371,10 +3415,11 @@ class SkillTrackerApp:
         self.reader_stop_event.set()
         if self.reader_thread is not None and self.reader_thread.is_alive():
             self.reader_thread.join()
-        self.process_reader_queue(max_batches=1_000_000)
+        self.process_reader_queue(max_batches=1_000_000, time_budget_ms=None, force_refresh=True)
         self.reader_active = False
         self.reader_done_pending = False
-        self.save_state()
+        self.maybe_persist_live_state(force=True)
+        self.refresh_live_ui(force=True)
         if hasattr(self, "pause_sync_button"):
             self.pause_sync_button.configure(text="Resume Sync")
         self.monitor_status_var.set("Paused")
@@ -3402,13 +3447,15 @@ class SkillTrackerApp:
 
     def monitor_tick(self):
         if self.monitoring:
-            self.process_reader_queue(max_batches=3)
+            self.process_reader_queue(max_batches=8, time_budget_ms=45)
+            self.refresh_live_ui()
+            self.maybe_persist_live_state()
             if self.sync_paused:
                 if not self.reader_active:
                     self.monitor_status_var.set("Paused")
             elif not self.reader_active and not self.reader_done_pending:
                 self.start_log_reader_until_current_eof()
-        self.root.after(200, self.monitor_tick)
+        self.root.after(100, self.monitor_tick)
 
     def start_log_reader_until_current_eof(self):
         """Start a background reader for everything currently present in chat.log.
@@ -3512,11 +3559,20 @@ class SkillTrackerApp:
         self.reader_thread = threading.Thread(target=worker, name="chat-log-reader", daemon=True)
         self.reader_thread.start()
 
-    def process_reader_queue(self, max_batches=3):
-        """Apply parsed worker batches on the Tkinter thread."""
+    def process_reader_queue(self, max_batches=3, time_budget_ms=45, force_refresh=False):
+        """Apply parsed batches without monopolizing Tkinter's event loop.
+
+        The worker may parse a large historical log much faster than Tkinter can
+        redraw widgets. Data application therefore has a small time budget per
+        tick, while visual refreshes and persistence are handled separately.
+        """
         processed_batches = 0
         refresh_needed = False
+        started = time.perf_counter()
+
         while processed_batches < max_batches:
+            if time_budget_ms is not None and (time.perf_counter() - started) * 1000.0 >= float(time_budget_ms):
+                break
             try:
                 item = self.reader_queue.get_nowait()
             except queue.Empty:
@@ -3525,8 +3581,11 @@ class SkillTrackerApp:
             kind = item[0]
             if kind == "progress":
                 _, lines_seen, current_offset, end_offset = item
-                percent = (current_offset / end_offset * 100.0) if end_offset else 100.0
-                self.monitor_progress_var.set(f"Scanning log: {percent:.1f}% | lines checked: {lines_seen:,} | offset {current_offset:,}/{end_offset:,}")
+                progress_percent = (current_offset / end_offset * 100.0) if end_offset else 100.0
+                self.monitor_progress_var.set(
+                    f"Scanning log: {progress_percent:.1f}% | lines checked: {lines_seen:,} | "
+                    f"offset {current_offset:,}/{end_offset:,} | queued batches: {self.reader_queue.qsize():,}"
+                )
                 continue
 
             if kind == "batch":
@@ -3536,14 +3595,18 @@ class SkillTrackerApp:
                 for event in events:
                     self.apply_event(event)
                 self.log_offset = int(batch_end_offset)
+                if self.current_session is not None:
+                    self.current_session.end_offset = self.log_offset
                 if newest_iso:
-                    self.save_state(last_log_read_at=newest_iso)
-                else:
-                    self.save_state()
+                    self.pending_last_log_read_at = str(newest_iso)
                 processed_batches += 1
                 self.reader_processed_batches += 1
                 refresh_needed = True
-                self.monitor_progress_var.set(f"Applied {len(events):,} parsed events | offset {self.log_offset:,}")
+                self.live_ui_dirty = True
+                self.monitor_progress_var.set(
+                    f"Applied {len(events):,} parsed events | offset {self.log_offset:,} | "
+                    f"queued batches: {self.reader_queue.qsize():,}"
+                )
                 continue
 
             if kind == "done":
@@ -3561,33 +3624,29 @@ class SkillTrackerApp:
                 self.reader_done_pending = False
                 self.monitor_status_var.set(f"Read error: {message}")
                 self.append_event(f"Read error: {message}")
+                self.live_ui_dirty = True
                 continue
 
-        if refresh_needed:
-            save_current_skills(self.current_skills)
-            self.refresh_session_skill_tree()
-            self.update_session_summary()
-            self.load_profession_keep_selection()
+        if refresh_needed or force_refresh:
+            self.refresh_live_ui(force=force_refresh)
+            self.maybe_persist_live_state(force=force_refresh)
 
         if self.reader_done_pending and not self.reader_active:
-            # Finalize only after all earlier queued batches were already applied.
-            # If there are still queued batches, wait for the next tick.
-            has_pending_batch = False
             try:
-                # Peek is not supported, so use queue size as a cheap signal. If
-                # anything remains, it will be processed before finalization.
-                has_pending_batch = self.reader_queue.qsize() > 0
+                has_pending_items = self.reader_queue.qsize() > 0
             except NotImplementedError:
-                has_pending_batch = False
-            if not has_pending_batch:
+                has_pending_items = False
+            if not has_pending_items:
                 if self.reader_final_offset is not None:
                     self.log_offset = int(self.reader_final_offset)
+                if self.current_session is not None:
+                    self.current_session.end_offset = self.log_offset
                 if self.reader_final_last_read_at:
-                    self.save_state(last_log_read_at=self.reader_final_last_read_at)
-                else:
-                    self.save_state()
+                    self.pending_last_log_read_at = self.reader_final_last_read_at
                 self.reader_done_pending = False
                 self.reader_final_last_read_at = ""
+                self.maybe_persist_live_state(force=True)
+                self.refresh_live_ui(force=True)
                 self.monitor_status_var.set("Syncing")
                 self.monitor_progress_var.set(f"Caught up. Current offset: {self.log_offset:,}. Waiting for new lines...")
                 if self.log_time_cutoff_at is not None:
@@ -3651,12 +3710,12 @@ class SkillTrackerApp:
             if self.current_session is not None:
                 self.current_session.log_cutoff_at = ""
 
-        save_current_skills(self.current_skills)
-        last_read_at = newest_line_at.isoformat(timespec="seconds") if newest_line_at else None
-        self.save_state(last_log_read_at=last_read_at)
-        self.refresh_session_skill_tree()
-        self.update_session_summary()
-        self.load_profession_keep_selection()
+        last_read_at = newest_line_at.isoformat(timespec="seconds") if newest_line_at else ""
+        if last_read_at:
+            self.pending_last_log_read_at = last_read_at
+        self.live_ui_dirty = True
+        self.maybe_persist_live_state(force=True)
+        self.refresh_live_ui(force=True)
 
     def apply_event(self, event):
         if self.current_session is None:
@@ -3719,15 +3778,14 @@ class SkillTrackerApp:
                 return
             loot_value = float(event["value_ped"])
             self.add_loot_to_session(session, event, previous_event_type)
-            session.loot_ped_total = sum(float(loot_event.get("value_ped", 0.0) or 0.0) for loot_event in session.loot_events)
+            session.loot_ped_total += loot_value
             self.append_event(
                 f"{event['timestamp']} loot +{loot_value:.4f} PED | "
                 f"{event.get('item', 'Unknown item')} x{int(event.get('quantity', 1) or 1)}"
             )
 
         session.end_offset = self.log_offset
-        session.current_skills_at_end = self.skill_snapshot()
-        session.total_profession_gain_by_profession = self.calculate_profession_gains_for_session(session)
+        self.live_ui_dirty = True
 
     def add_loot_to_session(self, session: MonitorSession, event, previous_event_type: str):
         item = event.get("item") or "Unknown item"
@@ -3752,13 +3810,15 @@ class SkillTrackerApp:
         if continue_previous:
             loot_event = loot_events[-1]
         else:
-            previous_cost = sum(float(loot_event.get("cost_ped", 0.0) or 0.0) for loot_event in loot_events)
+            previous_cost = float(getattr(session, "_loot_cost_accounted", 0.0) or 0.0)
+            event_cost = max(0.0, float(session.ped_cycled) - previous_cost)
+            setattr(session, "_loot_cost_accounted", previous_cost + event_cost)
             loot_event = {
                 "index": len(loot_events) + 1,
                 "started_at": event.get("timestamp", ""),
                 "ended_at": event.get("timestamp", ""),
                 "value_ped": 0.0,
-                "cost_ped": max(0.0, float(session.ped_cycled) - previous_cost),
+                "cost_ped": event_cost,
                 "items": {},
                 "messages": [],
             }
@@ -3868,7 +3928,7 @@ class SkillTrackerApp:
         top_text = ", ".join(f"{name}: +{value:.4f}" for name, value in top_professions) or "-"
         total_skill_gain_events = sum(s.skill_gain_events_by_skill.values())
         loot_percent = percent(s.loot_ped_total, s.ped_cycled)
-        loot_event_count = len(self.loot_events_for_session(asdict(s)))
+        loot_event_count = len(s.loot_events)
         cost_per_kill = s.ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(s.skill_gain_tt_total, s.ped_cycled)
         skill_messages_per_attack = percent(total_skill_gain_events, s.attacks_total)
@@ -3896,11 +3956,82 @@ class SkillTrackerApp:
             f"Top profession gains: {top_text}\n"
             f"{profession_projection_text}"
         )
-        self.schedule_loot_refresh()
 
     def append_event(self, text: str):
-        self.event_text.insert("end", text + "\n")
+        # Writing one Tk Text row per parsed event is extremely expensive. Keep
+        # the latest messages in a bounded queue and flush them in one insert.
+        self.pending_event_lines.append(str(text))
+        if not self.monitoring:
+            self.flush_event_text()
+
+    def flush_event_text(self):
+        if not self.pending_event_lines or not hasattr(self, "event_text"):
+            return
+        lines = list(self.pending_event_lines)
+        self.pending_event_lines.clear()
+        self.event_text.insert("end", "\n".join(lines) + "\n")
+        try:
+            line_count = int(self.event_text.index("end-1c").split(".")[0])
+            surplus = line_count - int(self.recent_event_line_limit)
+            if surplus > 0:
+                self.event_text.delete("1.0", f"{surplus + 1}.0")
+        except (ValueError, tk.TclError):
+            pass
         self.event_text.see("end")
+
+    def refresh_profession_current_values(self):
+        # Update only existing rows. Rebuilding the complete profession table on
+        # every log batch caused selection flicker and large UI stalls.
+        for skill_name, data in self.entries.items():
+            current = float(self.current_skills.get(skill_name, 0.0))
+            if current == float(data.get("current", 0.0)):
+                continue
+            data["current"] = current
+            if float(data.get("delta", 0.0)) == 0.0:
+                data["new"] = current
+                data["skill_gain"] = 0.0
+                data["profession_gain"] = 0.0
+            self.update_skill_tree_row(skill_name)
+
+    def maybe_persist_live_state(self, force=False):
+        if not self.monitoring or self.current_session is None:
+            return
+        now = time.monotonic()
+        if not force and now - self.live_persist_last_at < self.live_persist_interval:
+            return
+        self.current_session.current_skills_at_end = self.skill_snapshot()
+        save_current_skills(self.current_skills)
+        if self.pending_last_log_read_at:
+            self.save_state(last_log_read_at=self.pending_last_log_read_at)
+            self.pending_last_log_read_at = ""
+        else:
+            self.save_state()
+        self.live_persist_last_at = now
+
+    def refresh_live_ui(self, force=False):
+        now = time.monotonic()
+        if not force:
+            if not self.live_ui_dirty and not self.pending_event_lines:
+                return
+            if now - self.live_ui_last_refresh_at < self.live_ui_refresh_interval:
+                return
+
+        if self.current_session is not None:
+            self.current_session.current_skills_at_end = self.skill_snapshot()
+            self.current_session.total_profession_gain_by_profession = self.calculate_profession_gains_for_session(self.current_session)
+            self.refresh_session_skill_tree()
+            self.update_session_summary()
+            self.refresh_profession_current_values()
+
+            if self.is_tab_active(self.loot_tab) and (
+                force or now - self.last_loot_live_refresh_at >= self.loot_live_refresh_interval
+            ):
+                self.refresh_loot_tab()
+                self.last_loot_live_refresh_at = now
+
+        self.flush_event_text()
+        self.live_ui_dirty = False
+        self.live_ui_last_refresh_at = now
 
     def load_profession_keep_selection(self):
         selected_profession = self.profession_var.get()
@@ -4091,6 +4222,7 @@ class SkillTrackerApp:
         else:
             self.save_state()
             save_current_skills(self.current_skills)
+            self.flush_event_text()
         self.root.destroy()
 
 
