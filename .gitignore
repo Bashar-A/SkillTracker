@@ -18,6 +18,7 @@ dist/
 current_skills.json
 skill_tracker_state.json
 skill_tracker_sessions.json
+market_data.json
 
 # Logs
 *.log

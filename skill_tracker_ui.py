@@ -55,6 +55,7 @@ TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
 HUNTING_SETUPS_FILE = Path("hunting_setups.json")
 LOOT_MARKUPS_FILE = Path("loot_markups.json")
+MARKET_DATA_FILE = Path("market_data.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
@@ -158,6 +159,72 @@ def save_json(path: Path, data):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+
+
+
+
+def load_weekly_market_markups(path: Path):
+    """Load the latest weekly market markup for every item.
+
+    Manual values from loot_markups.json are handled separately and always win.
+    Percentage market entries are stored as a multiplier percentage. Fixed
+    entries are stored as TT+ PED per item.
+    """
+    data = load_json(path, {})
+    result = {}
+    if not isinstance(data, dict):
+        return result
+
+    items = data.get("items", {})
+    if not isinstance(items, dict):
+        return result
+
+    for entry in items.values():
+        if not isinstance(entry, dict):
+            continue
+        item_name = str(entry.get("item", "") or "").strip()
+        if not item_name:
+            continue
+        snapshots = entry.get("snapshots", []) or []
+        if not isinstance(snapshots, list):
+            continue
+
+        # Prefer the newest snapshot that has usable weekly markup data.
+        for snapshot in reversed(snapshots):
+            if not isinstance(snapshot, dict):
+                continue
+            markup_type = None
+            markup_value = None
+
+            periods = snapshot.get("periods", {})
+            if isinstance(periods, dict):
+                week = periods.get("week", {})
+                if isinstance(week, dict):
+                    markup = week.get("markup", {})
+                    if isinstance(markup, dict):
+                        markup_type = markup.get("type")
+                        markup_value = markup.get("value")
+
+            # Backward compatibility with the earlier collector schema.
+            if markup_value is None:
+                week = snapshot.get("week", {})
+                if isinstance(week, dict) and week.get("markup_percent") is not None:
+                    markup_type = "percentage"
+                    markup_value = week.get("markup_percent")
+
+            try:
+                markup_value = float(markup_value)
+            except (TypeError, ValueError):
+                continue
+
+            if markup_type == "percentage" and markup_value >= 100.0:
+                result[item_name] = {"type": "percentage", "value": markup_value}
+                break
+            if markup_type == "fixed" and markup_value >= 0.0:
+                result[item_name] = {"type": "fixed", "value": markup_value}
+                break
+
+    return result
 
 
 def load_current_skills():
@@ -577,6 +644,11 @@ class SkillTrackerApp:
             self.hunting_setups = {}
         raw_loot_markups = load_json(LOOT_MARKUPS_FILE, {})
         self.loot_markups = {}
+        self.market_weekly_markups = load_weekly_market_markups(MARKET_DATA_FILE)
+        try:
+            self.market_data_mtime_ns = MARKET_DATA_FILE.stat().st_mtime_ns
+        except OSError:
+            self.market_data_mtime_ns = 0
         if isinstance(raw_loot_markups, dict):
             for item_name, markup in raw_loot_markups.items():
                 try:
@@ -672,7 +744,7 @@ class SkillTrackerApp:
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
         self.loot_summary_var = tk.StringVar(value="No loot session selected")
-        self.loot_markup_status_var = tk.StringVar(value="Double-click an item row for its drop history; double-click the MU cell to edit markup. Default MU is 100%.")
+        self.loot_markup_status_var = tk.StringVar(value="Double-click an item row for its drop history; double-click the MU cell to set a manual percentage. Otherwise weekly market_data.json markup is used, then 100%.")
         self.loot_item_summary_iid_to_name = {}
         self.loot_markup_editor = None
         self.loot_event_iid_to_event = {}
@@ -943,7 +1015,7 @@ class SkillTrackerApp:
             ("quantity", "Quantity", 90),
             ("value", "Value PED", 105),
             ("loot_percent", "% of total loot", 115),
-            ("markup", "MU %", 90),
+            ("markup", "MU", 110),
             ("after_mu", "Value after MU", 125),
         ]
         for col, title, width in item_setup:
@@ -1306,7 +1378,11 @@ class SkillTrackerApp:
         loot_value = float(loot_event.get("value_ped", 0.0) or 0.0)
         cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
         after_mu = sum(
-            float(row.get("value_ped", 0.0) or 0.0) * self.loot_markup_for_item(item_name) / 100.0
+            self.loot_value_after_markup(
+                item_name,
+                float(row.get("value_ped", 0.0) or 0.0),
+                int(row.get("quantity", 0) or 0),
+            )
             for item_name, row in item_details.items()
         )
 
@@ -1338,7 +1414,7 @@ class SkillTrackerApp:
             ("quantity", "Quantity", 90),
             ("value", "TT value PED", 110),
             ("event_percent", "% of event", 105),
-            ("markup", "MU %", 85),
+            ("markup", "MU", 105),
             ("after_mu", "Value after MU", 125),
         ]
         for column, title, width in setup:
@@ -1352,8 +1428,8 @@ class SkillTrackerApp:
         for item_name, row in item_details.items():
             quantity = int(row.get("quantity", 0) or 0)
             value_ped = float(row.get("value_ped", 0.0) or 0.0)
-            markup = self.loot_markup_for_item(item_name)
-            item_after_mu = value_ped * markup / 100.0
+            markup_display = self.loot_markup_display(item_name)
+            item_after_mu = self.loot_value_after_markup(item_name, value_ped, quantity)
             detail_tree.insert(
                 "",
                 "end",
@@ -1362,7 +1438,7 @@ class SkillTrackerApp:
                     quantity,
                     f"{value_ped:.4f}",
                     f"{percent(value_ped, loot_value):.2f}%",
-                    f"{markup:.2f}%",
+                    markup_display,
                     f"{item_after_mu:.4f}",
                 ),
             )
@@ -1511,11 +1587,67 @@ class SkillTrackerApp:
         if not details:
             detail_tree.insert("", "end", values=("", "", "", "", "", "", "No saved gain messages for this skill."))
 
-    def loot_markup_for_item(self, item_name: str) -> float:
+    def reload_market_data_if_changed(self):
+        """Reload market_data.json after the clipboard collector updates it."""
         try:
-            return max(100.0, float(self.loot_markups.get(item_name, 100.0)))
-        except (TypeError, ValueError):
-            return 100.0
+            current_mtime_ns = MARKET_DATA_FILE.stat().st_mtime_ns
+        except OSError:
+            current_mtime_ns = 0
+        if current_mtime_ns == self.market_data_mtime_ns:
+            return
+        self.market_weekly_markups = load_weekly_market_markups(MARKET_DATA_FILE)
+        self.market_data_mtime_ns = current_mtime_ns
+
+    def loot_markup_info_for_item(self, item_name: str):
+        """Return effective MU data, with manual values taking priority."""
+        if item_name in self.loot_markups:
+            try:
+                return {
+                    "type": "percentage",
+                    "value": max(100.0, float(self.loot_markups[item_name])),
+                    "source": "manual",
+                }
+            except (TypeError, ValueError):
+                pass
+
+        market_markup = self.market_weekly_markups.get(item_name)
+        if isinstance(market_markup, dict):
+            try:
+                value = float(market_markup.get("value"))
+            except (TypeError, ValueError):
+                value = None
+            markup_type = market_markup.get("type")
+            if markup_type == "percentage" and value is not None and value >= 100.0:
+                return {"type": "percentage", "value": value, "source": "weekly market"}
+            if markup_type == "fixed" and value is not None and value >= 0.0:
+                return {"type": "fixed", "value": value, "source": "weekly market"}
+
+        return {"type": "percentage", "value": 100.0, "source": "default"}
+
+    def loot_markup_for_item(self, item_name: str) -> float:
+        """Backward-compatible percentage accessor used by the manual editor."""
+        info = self.loot_markup_info_for_item(item_name)
+        if info["type"] == "percentage":
+            return float(info["value"])
+        return 100.0
+
+    def loot_markup_display(self, item_name: str) -> str:
+        info = self.loot_markup_info_for_item(item_name)
+        if info["type"] == "fixed":
+            text = f"TT+{float(info['value']):g} PED"
+        else:
+            text = f"{float(info['value']):.2f}%"
+        if info.get("source") == "weekly market":
+            text += " (W)"
+        return text
+
+    def loot_value_after_markup(self, item_name: str, value_ped: float, quantity: int = 1) -> float:
+        info = self.loot_markup_info_for_item(item_name)
+        value_ped = max(0.0, float(value_ped or 0.0))
+        quantity = max(0, int(quantity or 0))
+        if info["type"] == "fixed":
+            return value_ped + float(info["value"]) * quantity
+        return value_ped * float(info["value"]) / 100.0
 
     def save_loot_markups(self):
         save_json(
@@ -1534,8 +1666,8 @@ class SkillTrackerApp:
         for index, (item_name, data) in enumerate(item_stats.items()):
             quantity = int(data.get("quantity", 0) or 0)
             value_ped = float(data.get("value_ped", 0.0) or 0.0)
-            markup = self.loot_markup_for_item(item_name)
-            after_mu = value_ped * markup / 100.0
+            markup_display = self.loot_markup_display(item_name)
+            after_mu = self.loot_value_after_markup(item_name, value_ped, quantity)
             total_after_mu += after_mu
             iid = f"loot_item_summary_{index}"
             self.loot_item_summary_iid_to_name[iid] = item_name
@@ -1548,7 +1680,7 @@ class SkillTrackerApp:
                     quantity,
                     f"{value_ped:.4f}",
                     f"{percent(value_ped, loot_total):.2f}%",
-                    f"{markup:.2f}%",
+                    markup_display,
                     f"{after_mu:.4f}",
                 ),
             )
@@ -1584,8 +1716,8 @@ class SkillTrackerApp:
         ped_cycled = float((session or {}).get("ped_cycled", 0.0) or 0.0)
         total_quantity = sum(int(row.get("quantity", 0) or 0) for row in drops)
         total_value = sum(float(row.get("value_ped", 0.0) or 0.0) for row in drops)
-        markup = self.loot_markup_for_item(item_name)
-        total_after_mu = total_value * markup / 100.0
+        markup_display = self.loot_markup_display(item_name)
+        total_after_mu = self.loot_value_after_markup(item_name, total_value, total_quantity)
 
         window = tk.Toplevel(self.root)
         window.title(f"{item_name} loot details")
@@ -1600,7 +1732,7 @@ class SkillTrackerApp:
             text=(
                 f"Item: {item_name} | Loot events containing item: {len(drops)} | Total quantity: {total_quantity}\n"
                 f"TT value: {total_value:.4f} PED ({percent(total_value, total_loot):.2f}% of total loot) | "
-                f"MU: {markup:.2f}% | After MU: {total_after_mu:.4f} PED "
+                f"MU: {markup_display} | After MU: {total_after_mu:.4f} PED "
                 f"({percent(total_after_mu, ped_cycled):.2f}% of PED cycled)"
             ),
             justify="left",
@@ -1618,7 +1750,7 @@ class SkillTrackerApp:
             ("value", "TT value PED", 95),
             ("item_percent", "% of item total", 105),
             ("event_percent", "% of event", 90),
-            ("markup", "MU %", 70),
+            ("markup", "MU", 100),
             ("after_mu", "After MU", 90),
             ("message", "Original message(s)", 360),
         ]
@@ -1637,7 +1769,9 @@ class SkillTrackerApp:
         for row in drops:
             value_ped = float(row.get("value_ped", 0.0) or 0.0)
             event_value = float(row.get("event_value_ped", 0.0) or 0.0)
-            item_after_mu = value_ped * markup / 100.0
+            item_after_mu = self.loot_value_after_markup(
+                item_name, value_ped, int(row.get("quantity", 0) or 0)
+            )
             messages = " | ".join(str(message) for message in row.get("messages", []) if message)
             if not messages:
                 messages = "Original message unavailable for this older saved event."
@@ -1652,7 +1786,7 @@ class SkillTrackerApp:
                     f"{value_ped:.4f}",
                     f"{percent(value_ped, total_value):.2f}%",
                     f"{percent(value_ped, event_value):.2f}%",
-                    f"{markup:.2f}%",
+                    markup_display,
                     f"{item_after_mu:.4f}",
                     messages,
                 ),
@@ -1677,7 +1811,7 @@ class SkillTrackerApp:
         self.cancel_loot_markup_edit()
         x, y, width, height = bbox
         editor = ttk.Entry(tree, justify="center")
-        editor.insert(0, f"{self.loot_markup_for_item(item_name):g}")
+        editor.insert(0, f"{float(self.loot_markups.get(item_name, self.loot_markup_for_item(item_name))):g}")
         editor.select_range(0, "end")
         editor.place(x=x, y=y, width=width, height=height)
         self.loot_markup_editor = editor
@@ -1706,7 +1840,7 @@ class SkillTrackerApp:
             return
         self.loot_markups[item_name] = markup
         self.save_loot_markups()
-        self.loot_markup_status_var.set(f"Saved {item_name} MU at {markup:g}% in {LOOT_MARKUPS_FILE}.")
+        self.loot_markup_status_var.set(f"Saved manual override for {item_name}: {markup:g}% in {LOOT_MARKUPS_FILE}.")
         self.refresh_loot_tab()
 
     def cancel_loot_markup_edit(self, event=None):
@@ -1827,6 +1961,7 @@ class SkillTrackerApp:
     def refresh_loot_tab(self):
         if not hasattr(self, "loot_value_time_canvas"):
             return
+        self.reload_market_data_if_changed()
         session = self.loot_source_session()
         loot_events = self.loot_events_for_session(session)
         self.refresh_loot_item_checks()
