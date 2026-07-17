@@ -63,6 +63,16 @@ STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
 LOOT_TRACKER_GRAPH_VERSION = "loot-item-mu-summary-v12"
 LOOT_EVENT_CONTINUE_SECONDS = 8
 
+# Entropia attributes contribute to professions at 20 times their displayed
+# value. For example, 10 Psyche is treated as 200 profession skill points
+# before the profession weight is applied.
+PROFESSION_ATTRIBUTES_X20 = {
+    "Agility",
+    "Intelligence",
+    "Psyche",
+    "Stamina",
+    "Strength",
+}
 
 
 X = np.array([
@@ -352,6 +362,20 @@ def percent(numerator, denominator) -> float:
     except (TypeError, ValueError):
         return 0.0
 
+
+
+
+def profession_weighted_value(skill_name: str, value: float) -> float:
+    """Return the value used by every profession formula.
+
+    Attributes are displayed on a 0-100 style scale in Entropia but count as
+    twenty skill points per displayed point in profession calculations.
+    Regular skills are used unchanged.
+    """
+    value = parse_float(value, 0.0)
+    if str(skill_name).strip() in PROFESSION_ATTRIBUTES_X20:
+        return value * 20.0
+    return value
 
 def ignored_loot_item_name(item_name: str) -> bool:
     lower_name = str(item_name or "").lower()
@@ -2904,12 +2928,22 @@ class SkillTrackerApp:
         self.refresh_mob_analysis()
 
     def current_profession_level(self, profession_name: str) -> float:
-        """Calculate a profession level from the currently saved skill points."""
+        """Calculate a profession level from current skills and attributes.
+
+        Entropia attributes use an x20 contribution in profession formulas.
+        Normal skills use their stored value directly. The resulting weighted
+        value remains on the tracker's 100x profession scale and is normalized
+        by ``calculated_looter_levels`` before being displayed.
+        """
         profession = PROFESSIONS.get(profession_name) or {}
         skills = profession.get("skills", {}) or {}
         total = 0.0
         for skill_name, weight in skills.items():
-            total += parse_float(self.current_skills.get(skill_name), 0.0) * parse_float(weight, 0.0) / 100.0
+            skill_value = profession_weighted_value(
+                skill_name,
+                self.current_skills.get(skill_name, 0.0),
+            )
+            total += skill_value * parse_float(weight, 0.0) / 100.0
         return total
 
     def calculated_looter_levels(self) -> dict:
@@ -3548,7 +3582,7 @@ class SkillTrackerApp:
                 messagebox.showerror("Calculation error", f"{skill_name}: {ex}")
                 return
             skill_gain = new_x - data["current"]
-            profession_gain = skill_gain * data["weight"] / 100.0
+            profession_gain = profession_weighted_value(skill_name, skill_gain) * data["weight"] / 100.0
             total_profession_gain += profession_gain
             data.update({"new": new_x, "skill_gain": skill_gain, "profession_gain": profession_gain})
             if self.auto_update_current_skills_var.get() and data["delta"] != 0:
@@ -4367,7 +4401,11 @@ class SkillTrackerApp:
         for profession_name, profession in PROFESSIONS.items():
             total = 0.0
             for skill, weight in profession["skills"].items():
-                total += session.skill_gains_points.get(skill, 0.0) * float(weight) / 100.0
+                weighted_gain = profession_weighted_value(
+                    skill,
+                    session.skill_gains_points.get(skill, 0.0),
+                )
+                total += weighted_gain * float(weight) / 100.0
             if total:
                 gains[profession_name] = total
         return gains
@@ -4396,7 +4434,7 @@ class SkillTrackerApp:
                 point_gain = find_skill_after_tt_delta(current_points, tt_delta) - current_points
             except Exception:
                 point_gain = 0.0
-            total += point_gain * float(weight) / 100.0
+            total += profession_weighted_value(skill, point_gain) * float(weight) / 100.0
 
         return total
 
