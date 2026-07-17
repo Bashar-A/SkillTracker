@@ -53,6 +53,7 @@ except ImportError:
 CURRENT_SKILLS_FILE = Path("current_skills.json")
 TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
+ANALYSIS_SESSIONS_FILE = Path("mob_analysis_sessions.json")
 HUNTING_SETUPS_FILE = Path("hunting_setups.json")
 LOOT_MARKUPS_FILE = Path("loot_markups.json")
 MARKET_DATA_FILE = Path("market_data.json")
@@ -617,6 +618,9 @@ class SkillTrackerApp:
         self.current_skills = load_current_skills()
         self.state = load_json(TRACKER_STATE_FILE, {})
         self.sessions = load_json(SESSIONS_FILE, [])
+        self.analysis_sessions = load_json(ANALYSIS_SESSIONS_FILE, [])
+        if not isinstance(self.analysis_sessions, list):
+            self.analysis_sessions = []
         self.hunting_setups = load_json(HUNTING_SETUPS_FILE, {})
         if not isinstance(self.hunting_setups, dict):
             self.hunting_setups = {}
@@ -736,6 +740,23 @@ class SkillTrackerApp:
         self.loot_item_check_signature = None
         self.loot_refresh_after_id = None
 
+        # Mob-hunting analysis inputs. Each mob uses the looter profession that
+        # matches MOBS[mob]["type"]. Only explicitly exported valid sessions
+        # from ANALYSIS_SESSIONS_FILE participate in these calculations.
+        self.analysis_efficiency_var = tk.StringVar(value=str(self.state.get("analysis_efficiency", "0")))
+        # Looter levels are calculated from current_skills.json on startup.
+        # The Entry widgets remain editable, so calculated values can be
+        # overridden manually for hypothetical analysis.
+        self.analysis_looter_vars = {
+            "Animal": tk.StringVar(value="0"),
+            "Robot": tk.StringVar(value="0"),
+            "Mutant": tk.StringVar(value="0"),
+        }
+        self.load_analysis_looters_from_current_skills()
+        self.mob_analysis_status_var = tk.StringVar(value="No analysis calculated yet.")
+        self.mob_analysis_iid_to_result = {}
+        self.mob_analysis_results = []
+
         self.create_ui()
         self.load_profession()
         self.refresh_hunting_info()
@@ -754,11 +775,13 @@ class SkillTrackerApp:
         self.sessions_tab = ttk.Frame(notebook)
         self.session_details_tab = ttk.Frame(notebook)
         self.loot_tab = ttk.Frame(notebook)
+        self.mob_analysis_tab = ttk.Frame(notebook)
 
         notebook.add(self.monitor_tab, text="Live Monitor")
         notebook.add(self.loot_tab, text="Loot Tracker")
         notebook.add(self.hunting_tab, text="Hunting Setup")
         notebook.add(self.sessions_tab, text="Previous Sessions")
+        notebook.add(self.mob_analysis_tab, text="What Mob to Hunt")
         notebook.add(self.session_details_tab, text="Session Details")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
@@ -766,6 +789,7 @@ class SkillTrackerApp:
         self.create_loot_tab()
         self.create_hunting_tab()
         self.create_sessions_tab()
+        self.create_mob_analysis_tab()
         self.create_session_details_tab()
         self.create_profession_tab()
         notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
@@ -784,6 +808,8 @@ class SkillTrackerApp:
             self.last_loot_live_refresh_at = time.monotonic()
         elif self.is_tab_active(getattr(self, "profession_tab", None)):
             self.refresh_profession_current_values()
+        elif self.is_tab_active(getattr(self, "mob_analysis_tab", None)):
+            self.refresh_mob_analysis()
 
     def make_tree_sortable(self, tree, headings):
         self.tree_heading_titles[tree] = dict(headings)
@@ -2761,6 +2787,8 @@ class SkillTrackerApp:
         top.pack(fill="x")
         ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
         ttk.Button(top, text="Load Current Skills from Selected Session", command=self.load_current_skills_from_selected_session).pack(side="left", padx=6)
+        ttk.Button(top, text="Add Selected to Mob Analysis", command=self.add_selected_sessions_to_analysis).pack(side="left", padx=6)
+        ttk.Button(top, text="Remove Selected from Mob Analysis", command=self.remove_selected_sessions_from_analysis).pack(side="left", padx=6)
         ttk.Button(top, text="Delete Selected Sessions", command=self.delete_selected_sessions).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
 
@@ -2801,7 +2829,397 @@ class SkillTrackerApp:
         self.sessions_tree.configure(xscrollcommand=sessions_xscroll.set)
         self.sessions_tree.pack(fill="both", expand=True, padx=10, pady=(10, 0))
         sessions_xscroll.pack(fill="x", padx=10, pady=(0, 10))
+        self.sessions_tree.tag_configure("analysis_valid", background="#dff3df")
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
+
+    def add_selected_sessions_to_analysis(self):
+        indices = self.selected_session_indices_from_table()
+        if not indices:
+            messagebox.showwarning("No sessions selected", "Select one or more valid sessions first.")
+            return
+
+        existing_by_id = {
+            str(session.get("id", "")): index
+            for index, session in enumerate(self.analysis_sessions)
+            if isinstance(session, dict) and session.get("id")
+        }
+        added = 0
+        updated = 0
+        skipped = 0
+        for index in indices:
+            session = self.sessions[index]
+            if not isinstance(session, dict):
+                skipped += 1
+                continue
+            mob_name = str(session.get("mob", "") or "").strip()
+            ped_cycled = parse_float(session.get("ped_cycled"), 0.0)
+            if not mob_name or ped_cycled <= 0:
+                skipped += 1
+                continue
+            copied = json.loads(json.dumps(session, ensure_ascii=False))
+            session_id = str(copied.get("id", "") or "")
+            if session_id and session_id in existing_by_id:
+                self.analysis_sessions[existing_by_id[session_id]] = copied
+                updated += 1
+            else:
+                self.analysis_sessions.append(copied)
+                if session_id:
+                    existing_by_id[session_id] = len(self.analysis_sessions) - 1
+                added += 1
+
+        save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
+        self.mob_analysis_status_var.set(
+            f"Analysis sessions: {len(self.analysis_sessions)} | added {added}, updated {updated}, skipped {skipped}."
+        )
+        self.refresh_sessions_table()
+        self.refresh_mob_analysis()
+        messagebox.showinfo(
+            "Mob analysis sessions saved",
+            f"Saved to {ANALYSIS_SESSIONS_FILE}.\n\nAdded: {added}\nUpdated: {updated}\nSkipped: {skipped}",
+        )
+
+    def remove_selected_sessions_from_analysis(self):
+        indices = self.selected_session_indices_from_table()
+        if not indices:
+            messagebox.showwarning("No sessions selected", "Select one or more sessions first.")
+            return
+        selected_ids = {
+            str(self.sessions[index].get("id", "") or "")
+            for index in indices
+            if isinstance(self.sessions[index], dict)
+        }
+        selected_ids.discard("")
+        if not selected_ids:
+            messagebox.showwarning("Missing session IDs", "The selected sessions cannot be matched to the analysis file.")
+            return
+        before = len(self.analysis_sessions)
+        self.analysis_sessions = [
+            session for session in self.analysis_sessions
+            if not isinstance(session, dict) or str(session.get("id", "") or "") not in selected_ids
+        ]
+        removed = before - len(self.analysis_sessions)
+        save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
+        self.mob_analysis_status_var.set(f"Removed {removed} session(s). Valid analysis sessions: {len(self.analysis_sessions)}.")
+        self.refresh_sessions_table()
+        self.refresh_mob_analysis()
+
+    def current_profession_level(self, profession_name: str) -> float:
+        """Calculate a profession level from the currently saved skill points."""
+        profession = PROFESSIONS.get(profession_name) or {}
+        skills = profession.get("skills", {}) or {}
+        total = 0.0
+        for skill_name, weight in skills.items():
+            total += parse_float(self.current_skills.get(skill_name), 0.0) * parse_float(weight, 0.0) / 100.0
+        return total
+
+    def calculated_looter_levels(self) -> dict:
+        """Return normalized looter profession levels on the 0-100 scale.
+
+        Entropia skill points are stored in the tracker on a 100x scale for
+        profession calculations, so a calculated value such as 4913 means
+        profession level 49.13.
+        """
+        return {
+            "Animal": self.current_profession_level("Animal Looter") / 100.0,
+            "Robot": self.current_profession_level("Robot Looter") / 100.0,
+            "Mutant": self.current_profession_level("Mutant Looter") / 100.0,
+        }
+
+    def load_analysis_looters_from_current_skills(self):
+        for looter_type, level in self.calculated_looter_levels().items():
+            variable = self.analysis_looter_vars.get(looter_type)
+            if variable is not None:
+                variable.set(f"{level:.4f}")
+
+    def use_current_skill_looters(self):
+        self.load_analysis_looters_from_current_skills()
+        self.refresh_mob_analysis()
+
+    def create_mob_analysis_tab(self):
+        inputs = ttk.LabelFrame(self.mob_analysis_tab, text="Current character values", padding=10)
+        inputs.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(inputs, text="Efficiency (0-100):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(inputs, textvariable=self.analysis_efficiency_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 18))
+        for column, looter_type in enumerate(("Animal", "Robot", "Mutant"), start=2):
+            ttk.Label(inputs, text=f"{looter_type} Looter (0-100):").grid(row=0, column=column * 2 - 2, sticky="w")
+            ttk.Entry(inputs, textvariable=self.analysis_looter_vars[looter_type], width=10).grid(
+                row=0, column=column * 2 - 1, sticky="w", padx=(6, 18)
+            )
+        ttk.Button(inputs, text="Calculate", command=self.refresh_mob_analysis).grid(row=0, column=8, padx=6)
+        ttk.Button(inputs, text="Use current skill levels", command=self.use_current_skill_looters).grid(row=0, column=9, padx=6)
+        ttk.Button(inputs, text="Reload valid sessions", command=self.reload_analysis_sessions).grid(row=0, column=10, padx=6)
+        ttk.Label(
+            inputs,
+            text=(
+                "Expected TT return = 86% + 7 × Efficiency / 100 + 7 × matching Looter / 100. "
+                "Expected return after MU = expected TT return × historical loot MU multiplier."
+            ),
+        ).grid(row=1, column=0, columnspan=11, sticky="w", pady=(8, 0))
+
+        status = ttk.LabelFrame(self.mob_analysis_tab, text="Analysis status", padding=8)
+        status.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(status, textvariable=self.mob_analysis_status_var, justify="left").pack(anchor="w")
+
+        columns = (
+            "mob", "type", "looter", "sessions", "ped", "tt_loot", "observed_tt",
+            "historical_mu", "expected_tt", "expected_after_mu", "sample_items",
+        )
+        self.mob_analysis_tree = ttk.Treeview(
+            self.mob_analysis_tab, columns=columns, show="headings", height=23
+        )
+        setup = [
+            ("mob", "Mob", 230), ("type", "Type", 75), ("looter", "Looter", 75),
+            ("sessions", "Sessions", 75), ("ped", "PED cycled", 100),
+            ("tt_loot", "TT loot", 90), ("observed_tt", "Observed TT %", 105),
+            ("historical_mu", "Historical MU %", 115), ("expected_tt", "Expected TT %", 105),
+            ("expected_after_mu", "Expected after MU %", 140), ("sample_items", "Loot items", 90),
+        ]
+        for column, title, width in setup:
+            self.mob_analysis_tree.heading(column, text=title)
+            self.mob_analysis_tree.column(column, width=width, anchor="w" if column == "mob" else "center")
+        self.make_tree_sortable(self.mob_analysis_tree, {column: title for column, title, _ in setup})
+        xscroll = ttk.Scrollbar(self.mob_analysis_tab, orient="horizontal", command=self.mob_analysis_tree.xview)
+        yscroll = ttk.Scrollbar(self.mob_analysis_tab, orient="vertical", command=self.mob_analysis_tree.yview)
+        self.mob_analysis_tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        self.mob_analysis_tree.pack(fill="both", expand=True, padx=10)
+        xscroll.pack(fill="x", padx=10)
+        yscroll.place_forget()
+        self.mob_analysis_tree.bind("<Double-1>", self.open_mob_analysis_details)
+
+    def reload_analysis_sessions(self):
+        loaded = load_json(ANALYSIS_SESSIONS_FILE, [])
+        self.analysis_sessions = loaded if isinstance(loaded, list) else []
+        self.refresh_mob_analysis()
+
+    def analysis_number(self, variable, label):
+        value = parse_float(variable.get(), None)
+        if value is None or not 0.0 <= value <= 100.0:
+            raise ValueError(f"{label} must be a number from 0 to 100.")
+        return float(value)
+
+    def mob_type_for_name(self, mob_name: str) -> str:
+        mob = MOBS.get(mob_name) or {}
+        raw_type = str(mob.get("type", "") or "").strip().casefold()
+        if "robot" in raw_type:
+            return "Robot"
+        if "mutant" in raw_type:
+            return "Mutant"
+        return "Animal"
+
+    def build_mob_analysis_results(self, efficiency: float, looter_levels: dict):
+        self.reload_market_data_if_changed()
+        grouped = {}
+        for session in self.analysis_sessions:
+            if not isinstance(session, dict):
+                continue
+            mob_name = str(session.get("mob", "") or "").strip()
+            if not mob_name or mob_name not in MOBS:
+                continue
+            ped_cycled = max(0.0, parse_float(session.get("ped_cycled"), 0.0))
+            if ped_cycled <= 0:
+                continue
+            loot_events = self.loot_events_for_session(session)
+            item_totals = self.loot_item_value_totals(loot_events)
+            tt_loot = sum(float(row.get("value_ped", 0.0) or 0.0) for row in item_totals.values())
+            after_mu = sum(
+                self.loot_value_after_markup(
+                    item_name,
+                    float(row.get("value_ped", 0.0) or 0.0),
+                    int(row.get("quantity", 0) or 0),
+                )
+                for item_name, row in item_totals.items()
+            )
+            row = grouped.setdefault(mob_name, {
+                "mob": mob_name,
+                "type": self.mob_type_for_name(mob_name),
+                "sessions": 0,
+                "ped_cycled": 0.0,
+                "tt_loot": 0.0,
+                "after_mu": 0.0,
+                "loot_events": 0,
+                "items": {},
+                "maturities": set(),
+                "session_rows": [],
+            })
+            row["sessions"] += 1
+            row["ped_cycled"] += ped_cycled
+            row["tt_loot"] += tt_loot
+            row["after_mu"] += after_mu
+            row["loot_events"] += len(loot_events)
+            maturity = str(session.get("maturity", "") or "").strip()
+            if maturity:
+                row["maturities"].add(maturity)
+            for item_name, item_row in item_totals.items():
+                total = row["items"].setdefault(item_name, {"quantity": 0, "value_ped": 0.0, "after_mu": 0.0})
+                quantity = int(item_row.get("quantity", 0) or 0)
+                value_ped = float(item_row.get("value_ped", 0.0) or 0.0)
+                total["quantity"] += quantity
+                total["value_ped"] += value_ped
+                total["after_mu"] += self.loot_value_after_markup(item_name, value_ped, quantity)
+            weapon = str(session.get("weapon", "") or "").strip()
+            amplifier = str(session.get("amplifier", "") or "").strip()
+            attachments = [
+                str(name).strip()
+                for name in list(session.get("attachments", []) or [])
+                if str(name).strip()
+            ]
+            row["session_rows"].append({
+                "id": session.get("id", ""),
+                "started_at": session.get("started_at", ""),
+                "maturity": maturity,
+                "weapon": weapon,
+                "amplifier": amplifier,
+                "attachments": attachments,
+                "ped_cycled": ped_cycled,
+                "tt_loot": tt_loot,
+                "after_mu": after_mu,
+                "loot_events": len(loot_events),
+            })
+
+        results = []
+        for row in grouped.values():
+            mob_type = row["type"]
+            looter = float(looter_levels.get(mob_type, 0.0))
+            expected_tt = 86.0 + (7.0 * efficiency / 100.0) + (7.0 * looter / 100.0)
+            historical_mu = percent(row["after_mu"], row["tt_loot"]) if row["tt_loot"] else 100.0
+            expected_after_mu = expected_tt * historical_mu / 100.0
+            row.update({
+                "looter": looter,
+                "expected_tt": expected_tt,
+                "historical_mu": historical_mu,
+                "expected_after_mu": expected_after_mu,
+                "observed_tt": percent(row["tt_loot"], row["ped_cycled"]),
+                "observed_after_mu": percent(row["after_mu"], row["ped_cycled"]),
+            })
+            results.append(row)
+        return sorted(results, key=lambda row: (-row["expected_after_mu"], -row["ped_cycled"], row["mob"].casefold()))
+
+    def refresh_mob_analysis(self):
+        if not hasattr(self, "mob_analysis_tree"):
+            return
+        try:
+            efficiency = self.analysis_number(self.analysis_efficiency_var, "Efficiency")
+            looter_levels = {
+                name: self.analysis_number(variable, f"{name} Looter")
+                for name, variable in self.analysis_looter_vars.items()
+            }
+        except ValueError as exc:
+            messagebox.showerror("Invalid analysis value", str(exc))
+            return
+
+        self.mob_analysis_results = self.build_mob_analysis_results(efficiency, looter_levels)
+        self.mob_analysis_tree.delete(*self.mob_analysis_tree.get_children())
+        self.mob_analysis_iid_to_result = {}
+        for index, result in enumerate(self.mob_analysis_results):
+            iid = f"mob_analysis_{index}"
+            self.mob_analysis_iid_to_result[iid] = result
+            self.mob_analysis_tree.insert("", "end", iid=iid, values=(
+                result["mob"], result["type"], f'{result["looter"]:.2f}', result["sessions"],
+                f'{result["ped_cycled"]:.2f}', f'{result["tt_loot"]:.2f}', f'{result["observed_tt"]:.2f}%',
+                f'{result["historical_mu"]:.2f}%', f'{result["expected_tt"]:.2f}%',
+                f'{result["expected_after_mu"]:.2f}%', len(result["items"]),
+            ))
+        self.apply_tree_sort(self.mob_analysis_tree)
+        self.mob_analysis_status_var.set(
+            f"Valid sessions: {len(self.analysis_sessions)} | mobs with usable data: {len(self.mob_analysis_results)} | "
+            f"manual loot MU overrides weekly market MU; missing MU defaults to 100%."
+        )
+        self.save_state()
+
+    def open_mob_analysis_details(self, event=None):
+        tree = self.mob_analysis_tree
+        iid = tree.identify_row(event.y) if event is not None else ""
+        if not iid:
+            selected = tree.selection()
+            iid = selected[0] if selected else ""
+        result = self.mob_analysis_iid_to_result.get(iid)
+        if not result:
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title(f'{result["mob"]} analysis details')
+        window.geometry("1100x700")
+        window.minsize(850, 520)
+        window.transient(self.root)
+
+        summary = ttk.LabelFrame(window, text="Mob summary", padding=10)
+        summary.pack(fill="x", padx=10, pady=10)
+        ttk.Label(summary, text=(
+            f'Mob: {result["mob"]} | Type: {result["type"]} | Matching looter: {result["looter"]:.2f}\n'
+            f'Sessions: {result["sessions"]} | Maturities: {", ".join(sorted(result["maturities"])) or "-"} | '
+            f'PED cycled: {result["ped_cycled"]:.4f} | Loot events: {result["loot_events"]}\n'
+            f'Observed TT return: {result["observed_tt"]:.2f}% | Observed after MU: {result["observed_after_mu"]:.2f}% | '
+            f'Historical loot MU: {result["historical_mu"]:.2f}%\n'
+            f'Expected TT return: {result["expected_tt"]:.2f}% | Expected return after MU: {result["expected_after_mu"]:.2f}%'
+        ), justify="left").pack(anchor="w")
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        items_tab = ttk.Frame(notebook)
+        sessions_tab = ttk.Frame(notebook)
+        notebook.add(items_tab, text="Loot items")
+        notebook.add(sessions_tab, text="Included sessions")
+
+        item_columns = ("item", "quantity", "tt", "mu", "after_mu", "share")
+        item_tree = ttk.Treeview(items_tab, columns=item_columns, show="headings")
+        for column, title, width in [
+            ("item", "Item", 330), ("quantity", "Quantity", 90), ("tt", "TT value", 110),
+            ("mu", "MU source/value", 170), ("after_mu", "After MU", 110), ("share", "% of TT loot", 110),
+        ]:
+            item_tree.heading(column, text=title)
+            item_tree.column(column, width=width, anchor="w" if column in ("item", "mu") else "center")
+        item_tree.pack(fill="both", expand=True)
+        for item_name, row in sorted(result["items"].items(), key=lambda pair: -pair[1]["value_ped"]):
+            info = self.loot_markup_info_for_item(item_name)
+            mu_text = self.loot_markup_display(item_name)
+            item_tree.insert("", "end", values=(
+                item_name, row["quantity"], f'{row["value_ped"]:.4f}', mu_text,
+                f'{row["after_mu"]:.4f}', f'{percent(row["value_ped"], result["tt_loot"]):.2f}%'
+            ))
+
+        session_columns = (
+            "started", "maturity", "weapon", "amplifier", "attachments",
+            "ped", "tt", "after_mu", "tt_return", "mu_return", "events",
+        )
+        session_tree = ttk.Treeview(sessions_tab, columns=session_columns, show="headings")
+        for column, title, width in [
+            ("started", "Started", 165),
+            ("maturity", "Maturity", 120),
+            ("weapon", "Weapon", 220),
+            ("amplifier", "Amplifier", 170),
+            ("attachments", "Attachments", 260),
+            ("ped", "PED cycled", 105),
+            ("tt", "TT loot", 95),
+            ("after_mu", "After MU", 95),
+            ("tt_return", "TT return", 90),
+            ("mu_return", "After MU return", 115),
+            ("events", "Loot events", 90),
+        ]:
+            session_tree.heading(column, text=title)
+            session_tree.column(
+                column,
+                width=width,
+                anchor="w" if column in ("weapon", "amplifier", "attachments") else "center",
+            )
+        session_xscroll = ttk.Scrollbar(sessions_tab, orient="horizontal", command=session_tree.xview)
+        session_tree.configure(xscrollcommand=session_xscroll.set)
+        session_tree.pack(fill="both", expand=True)
+        session_xscroll.pack(fill="x")
+        for row in result["session_rows"]:
+            session_tree.insert("", "end", values=(
+                row["started_at"],
+                row["maturity"],
+                row.get("weapon", "") or "-",
+                row.get("amplifier", "") or "-",
+                ", ".join(row.get("attachments", []) or []) or "-",
+                f'{row["ped_cycled"]:.4f}',
+                f'{row["tt_loot"]:.4f}',
+                f'{row["after_mu"]:.4f}',
+                f'{percent(row["tt_loot"], row["ped_cycled"]):.2f}%',
+                f'{percent(row["after_mu"], row["ped_cycled"]):.2f}%',
+                row["loot_events"],
+            ))
 
     def create_session_details_tab(self):
         top = ttk.Frame(self.session_details_tab, padding=10)
@@ -3117,6 +3535,7 @@ class SkillTrackerApp:
     def reload_saved_skills(self):
         self.current_skills = load_current_skills()
         self.load_profession()
+        self.load_analysis_looters_from_current_skills()
         self.refresh_session_skill_tree()
         messagebox.showinfo("Reloaded", f"Loaded skills from {CURRENT_SKILLS_FILE}")
 
@@ -4158,6 +4577,11 @@ class SkillTrackerApp:
 
     def refresh_sessions_table(self):
         self.sessions_tree.delete(*self.sessions_tree.get_children())
+        valid_analysis_ids = {
+            str(session.get("id", "") or "")
+            for session in self.analysis_sessions
+            if isinstance(session, dict) and session.get("id")
+        }
         start_index = max(0, len(self.sessions) - 200)
         for index in range(len(self.sessions) - 1, start_index - 1, -1):
             session = self.sessions[index]
@@ -4205,7 +4629,8 @@ class SkillTrackerApp:
             skill_tt_minus_avg_loss = skill_tt_percent - avg_loss if avg_loss is not None else None
             defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
             missed_attacks = int(session.get("missed_attacks", 0) or 0)
-            self.sessions_tree.insert("", "end", iid=f"session_{index}", values=(
+            session_tags = ("analysis_valid",) if str(session.get("id", "") or "") in valid_analysis_ids else ()
+            self.sessions_tree.insert("", "end", iid=f"session_{index}", tags=session_tags, values=(
                 session.get("started_at", ""),
                 session.get("ended_at", ""),
                 weapon_display,
@@ -4326,6 +4751,10 @@ class SkillTrackerApp:
             "count_hunting": bool(self.count_hunting_var.get()),
             "selected_hunting_setup": self.hunting_setup_name_var.get().strip(),
             "sync_start_mode": self.sync_start_mode_var.get(),
+            "analysis_efficiency": self.analysis_efficiency_var.get(),
+            "analysis_animal_looter": self.analysis_looter_vars["Animal"].get(),
+            "analysis_robot_looter": self.analysis_looter_vars["Robot"].get(),
+            "analysis_mutant_looter": self.analysis_looter_vars["Mutant"].get(),
         }
         save_json(TRACKER_STATE_FILE, self.state)
 

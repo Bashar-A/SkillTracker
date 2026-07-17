@@ -19,6 +19,9 @@ current_skills.json
 skill_tracker_state.json
 skill_tracker_sessions.json
 market_data.json
+hunting_setups.json
+loot_markups.json
+mob_analysis_sessions.json
 
 # Logs
 *.log
