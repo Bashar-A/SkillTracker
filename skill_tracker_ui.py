@@ -656,7 +656,7 @@ class SkillTrackerApp:
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
         self.loot_summary_var = tk.StringVar(value="No loot session selected")
-        self.loot_markup_status_var = tk.StringVar(value="Double-click an MU cell to edit it. Default MU is 100%.")
+        self.loot_markup_status_var = tk.StringVar(value="Double-click an item row for its drop history; double-click the MU cell to edit markup. Default MU is 100%.")
         self.loot_item_summary_iid_to_name = {}
         self.loot_markup_editor = None
         self.loot_event_iid_to_event = {}
@@ -921,7 +921,7 @@ class SkillTrackerApp:
         self.loot_item_summary_tree.configure(yscrollcommand=item_summary_scroll.set)
         self.loot_item_summary_tree.pack(side="left", fill="x", expand=True)
         item_summary_scroll.pack(side="right", fill="y")
-        self.loot_item_summary_tree.bind("<Double-1>", self.begin_loot_markup_edit)
+        self.loot_item_summary_tree.bind("<Double-1>", self.on_loot_item_summary_double_click)
 
         selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
         selection.pack(fill="x", padx=10, pady=(0, 6))
@@ -1174,6 +1174,31 @@ class SkillTrackerApp:
                 add(item_name, quantity, allocated_value)
 
         return dict(sorted(totals.items(), key=lambda item: (-item[1]["value_ped"], item[0].lower())))
+
+    def loot_item_drop_details(self, item_name: str, loot_events):
+        """Return every loot-event occurrence of one grouped item.
+
+        Values are exact when the original loot messages are available. Older
+        sessions use the same best-effort value allocation as the event and
+        grouped-item summaries, so all three views stay consistent.
+        """
+        rows = []
+        for loot_event in list(loot_events or []):
+            item_details = self.loot_event_item_details(loot_event)
+            item_row = item_details.get(item_name)
+            if not item_row:
+                continue
+            rows.append({
+                "event_index": loot_event.get("index", len(rows) + 1),
+                "started_at": loot_event.get("started_at", ""),
+                "ended_at": loot_event.get("ended_at", loot_event.get("started_at", "")),
+                "quantity": int(item_row.get("quantity", 0) or 0),
+                "value_ped": float(item_row.get("value_ped", 0.0) or 0.0),
+                "event_value_ped": float(loot_event.get("value_ped", 0.0) or 0.0),
+                "event_cost_ped": float(loot_event.get("cost_ped", 0.0) or 0.0),
+                "messages": list(item_row.get("messages", []) or []),
+            })
+        return rows
 
     def loot_event_item_details(self, loot_event):
         """Return exact per-item quantity and value details for one loot event.
@@ -1493,6 +1518,112 @@ class SkillTrackerApp:
             )
         self.apply_tree_sort(self.loot_item_summary_tree)
         return total_after_mu
+
+    def on_loot_item_summary_double_click(self, event):
+        """Edit MU when its cell is clicked; otherwise open item drop history."""
+        tree = self.loot_item_summary_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        if tree.identify_column(event.x) == "#5":
+            self.begin_loot_markup_edit(event)
+        else:
+            self.open_loot_item_details(event)
+
+    def open_loot_item_details(self, event=None):
+        tree = self.loot_item_summary_tree
+        iid = tree.identify_row(event.y) if event is not None else ""
+        if not iid:
+            selected = tree.selection()
+            iid = selected[0] if selected else ""
+        item_name = self.loot_item_summary_iid_to_name.get(iid)
+        if not iid or not item_name:
+            return
+        tree.selection_set(iid)
+        tree.focus(iid)
+
+        session = self.loot_source_session()
+        loot_events = self.loot_events_for_session(session)
+        drops = self.loot_item_drop_details(item_name, loot_events)
+        total_loot = sum(float(row.get("value_ped", 0.0) or 0.0) for row in loot_events)
+        ped_cycled = float((session or {}).get("ped_cycled", 0.0) or 0.0)
+        total_quantity = sum(int(row.get("quantity", 0) or 0) for row in drops)
+        total_value = sum(float(row.get("value_ped", 0.0) or 0.0) for row in drops)
+        markup = self.loot_markup_for_item(item_name)
+        total_after_mu = total_value * markup / 100.0
+
+        window = tk.Toplevel(self.root)
+        window.title(f"{item_name} loot details")
+        window.geometry("1120x600")
+        window.minsize(840, 430)
+        window.transient(self.root)
+
+        summary = ttk.LabelFrame(window, text="Item summary", padding=10)
+        summary.pack(fill="x", padx=10, pady=10)
+        ttk.Label(
+            summary,
+            text=(
+                f"Item: {item_name} | Loot events containing item: {len(drops)} | Total quantity: {total_quantity}\n"
+                f"TT value: {total_value:.4f} PED ({percent(total_value, total_loot):.2f}% of total loot) | "
+                f"MU: {markup:.2f}% | After MU: {total_after_mu:.4f} PED "
+                f"({percent(total_after_mu, ped_cycled):.2f}% of PED cycled)"
+            ),
+            justify="left",
+        ).pack(anchor="w")
+
+        table_frame = ttk.LabelFrame(window, text="Every drop", padding=6)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("event", "start", "end", "quantity", "value", "item_percent", "event_percent", "markup", "after_mu", "message")
+        detail_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=17)
+        setup = [
+            ("event", "Event #", 65),
+            ("start", "Start time", 145),
+            ("end", "End time", 145),
+            ("quantity", "Quantity", 75),
+            ("value", "TT value PED", 95),
+            ("item_percent", "% of item total", 105),
+            ("event_percent", "% of event", 90),
+            ("markup", "MU %", 70),
+            ("after_mu", "After MU", 90),
+            ("message", "Original message(s)", 360),
+        ]
+        for column, title, width in setup:
+            detail_tree.heading(column, text=title)
+            detail_tree.column(column, width=width, anchor="w" if column == "message" else "center")
+        detail_y = ttk.Scrollbar(table_frame, orient="vertical", command=detail_tree.yview)
+        detail_x = ttk.Scrollbar(table_frame, orient="horizontal", command=detail_tree.xview)
+        detail_tree.configure(yscrollcommand=detail_y.set, xscrollcommand=detail_x.set)
+        detail_tree.grid(row=0, column=0, sticky="nsew")
+        detail_y.grid(row=0, column=1, sticky="ns")
+        detail_x.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        for row in drops:
+            value_ped = float(row.get("value_ped", 0.0) or 0.0)
+            event_value = float(row.get("event_value_ped", 0.0) or 0.0)
+            item_after_mu = value_ped * markup / 100.0
+            messages = " | ".join(str(message) for message in row.get("messages", []) if message)
+            if not messages:
+                messages = "Original message unavailable for this older saved event."
+            detail_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("event_index", ""),
+                    row.get("started_at", ""),
+                    row.get("ended_at", ""),
+                    int(row.get("quantity", 0) or 0),
+                    f"{value_ped:.4f}",
+                    f"{percent(value_ped, total_value):.2f}%",
+                    f"{percent(value_ped, event_value):.2f}%",
+                    f"{markup:.2f}%",
+                    f"{item_after_mu:.4f}",
+                    messages,
+                ),
+            )
+
+        if not drops:
+            detail_tree.insert("", "end", values=("", "", "", "", "", "", "", "", "", "No saved drops found for this item."))
 
     def begin_loot_markup_edit(self, event):
         tree = self.loot_item_summary_tree
