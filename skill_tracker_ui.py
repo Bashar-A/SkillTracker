@@ -4621,6 +4621,52 @@ class SkillTrackerApp:
         rows.sort(key=lambda row: (-row["weight"], row["skill"].casefold()))
         return rows, total
 
+    def calculate_session_projected_hp_details(self, session, ped_cycle: float | None = None):
+        """Project HP gain from every HP-granting skill gained in the session."""
+        if isinstance(session, MonitorSession):
+            session = asdict(session)
+
+        skill_tt = session.get("skill_gains_tt", {}) or {}
+        skill_points = session.get("skill_gains_points", {}) or {}
+        ped_cycled = float(session.get("ped_cycled", 0.0) or 0.0)
+        skill_names = set(skill_tt) | set(skill_points)
+        rows = []
+
+        for skill in skill_names:
+            hp_increase = parse_float(SKILL_HP_INCREASES.get(skill), 0.0)
+            if hp_increase <= 0:
+                continue
+
+            session_tt = float(skill_tt.get(skill, 0.0) or 0.0)
+            if ped_cycle is None:
+                projected_tt = session_tt
+            elif ped_cycled <= 0:
+                projected_tt = 0.0
+            else:
+                projected_tt = session_tt / ped_cycled * float(ped_cycle)
+
+            current_points = float(self.current_skills.get(skill, 0.0) or 0.0)
+            try:
+                projected_final = find_skill_after_tt_delta(current_points, projected_tt)
+                projected_point_gain = max(0.0, projected_final - current_points)
+            except Exception:
+                projected_final = current_points
+                projected_point_gain = 0.0
+
+            rows.append({
+                "skill": skill,
+                "current_points": current_points,
+                "session_tt": session_tt,
+                "projected_tt": projected_tt,
+                "projected_point_gain": projected_point_gain,
+                "projected_final_points": projected_final,
+                "hp_increase": hp_increase,
+                "projected_hp_gain": projected_point_gain / hp_increase,
+            })
+
+        rows.sort(key=lambda row: (-row["projected_hp_gain"], row["skill"].casefold()))
+        return rows, sum(row["projected_hp_gain"] for row in rows)
+
     def calculate_profession_projection(self, session, profession_name: str, ped_cycle: float | None = None) -> float:
         _rows, total = self.calculate_profession_projection_details(
             session,
@@ -4657,13 +4703,13 @@ class SkillTrackerApp:
             profession_name,
             ped_cycle,
         )
-        projected_hp = sum(
-            float(row.get("projected_hp_gain", 0.0) or 0.0)
-            for row in rows
+        _all_hp_rows, projected_hp = self.calculate_session_projected_hp_details(
+            session,
+            ped_cycle,
         )
         return (
             f"{profession_name} projected gain at {self.format_ped_cycle(ped_cycle)} PED: "
-            f"{projected:.4f} | Projected HP gain: {projected_hp:.6f}"
+            f"{projected:.4f} | Projected HP gain from all session skills: {projected_hp:.6f}"
         )
 
     def refresh_session_skill_tree(self):
