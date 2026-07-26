@@ -57,6 +57,8 @@ ANALYSIS_SESSIONS_FILE = Path("mob_analysis_sessions.json")
 HUNTING_SETUPS_FILE = Path("hunting_setups.json")
 LOOT_MARKUPS_FILE = Path("loot_markups.json")
 MARKET_DATA_FILE = Path("market_data.json")
+SKILLS_DATA_FILE = Path("skills.json")
+PROFESSIONS_DATA_FILE = Path("professions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
@@ -100,32 +102,50 @@ Y = np.array([
 Z = np.log(Y + 1.0)
 _log_interpolator = PchipInterpolator(X, Z)
 
+# The known Entropia skill-value table ends at 14,750 points / 6,952.25 TT.
+# Above that point, continue with the slope of the final known table segment
+# instead of allowing PCHIP to extrapolate and eventually behave unpredictably.
+SKILL_TT_LINEAR_START_POINTS = float(X[-1])
+SKILL_TT_LINEAR_START_VALUE = float(Y[-1])
+SKILL_TT_LINEAR_SLOPE = float((Y[-1] - Y[-2]) / (X[-1] - X[-2]))
+
 
 def skill_tt_value(skill_points: float) -> float:
-    z = _log_interpolator(float(skill_points))
+    skill_points = float(skill_points)
+    if skill_points < X[0]:
+        raise ValueError(f"Skill points cannot be below {X[0]:g}.")
+    if skill_points > SKILL_TT_LINEAR_START_POINTS:
+        extra_points = skill_points - SKILL_TT_LINEAR_START_POINTS
+        return SKILL_TT_LINEAR_START_VALUE + extra_points * SKILL_TT_LINEAR_SLOPE
+    z = _log_interpolator(skill_points)
     return float(np.exp(z) - 1.0)
 
 
 def find_skill_after_tt_delta(current_points: float, delta_tt: float) -> float:
     current_points = float(current_points)
     delta_tt = float(delta_tt)
+    if current_points < X[0]:
+        raise ValueError(f"Current skill points cannot be below {X[0]:g}.")
     if delta_tt == 0:
         return current_points
 
     target_y = skill_tt_value(current_points) + delta_tt
-    min_y = skill_tt_value(X[0])
-    max_y = skill_tt_value(X[-1])
-
-    if target_y < min_y or target_y > max_y:
+    min_y = float(Y[0])
+    if target_y < min_y:
         raise ValueError(
-            f"Target TT value {target_y:.6f} is outside supported range "
-            f"[{min_y:.6f}, {max_y:.6f}]"
+            f"Target TT value {target_y:.6f} is below the minimum supported value {min_y:.6f}."
         )
+
+    # The extension after 14,750 points is linear, so its inverse is exact and
+    # does not need a finite upper root-search limit.
+    if target_y > SKILL_TT_LINEAR_START_VALUE:
+        extra_tt = target_y - SKILL_TT_LINEAR_START_VALUE
+        return SKILL_TT_LINEAR_START_POINTS + extra_tt / SKILL_TT_LINEAR_SLOPE
 
     def equation(x):
         return skill_tt_value(x) - target_y
 
-    return float(brentq(equation, X[0], X[-1]))
+    return float(brentq(equation, X[0], SKILL_TT_LINEAR_START_POINTS))
 
 
 def load_json(path: Path, default):
@@ -229,6 +249,46 @@ def load_current_skills():
 
 def save_current_skills(skills):
     save_json(CURRENT_SKILLS_FILE, {k: float(v) for k, v in sorted(skills.items())})
+
+
+def load_skill_hp_increases() -> dict:
+    """Load positive HpIncrease values keyed by exact skill name."""
+    result = {}
+
+    skills_data = load_json(SKILLS_DATA_FILE, [])
+    if isinstance(skills_data, list):
+        for entry in skills_data:
+            if not isinstance(entry, dict):
+                continue
+            skill_name = str(entry.get("Name", "") or "").strip()
+            properties = entry.get("Properties", {}) or {}
+            hp_increase = parse_float(properties.get("HpIncrease"), 0.0)
+            if skill_name and hp_increase > 0:
+                result[skill_name] = hp_increase
+
+    professions_data = load_json(PROFESSIONS_DATA_FILE, [])
+    if isinstance(professions_data, list):
+        for profession in professions_data:
+            if not isinstance(profession, dict):
+                continue
+            for row in profession.get("Skills", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                skill = row.get("Skill", {}) or {}
+                skill_name = str(skill.get("Name", "") or "").strip()
+                properties = skill.get("Properties", {}) or {}
+                hp_increase = parse_float(properties.get("HpIncrease"), 0.0)
+                if skill_name and hp_increase > 0 and skill_name not in result:
+                    result[skill_name] = hp_increase
+
+    return result
+
+
+def skill_hp_gain(skill_name: str, point_gain: float) -> float:
+    hp_increase = parse_float(SKILL_HP_INCREASES.get(str(skill_name).strip()), 0.0)
+    if hp_increase <= 0:
+        return 0.0
+    return max(0.0, parse_float(point_gain, 0.0)) / hp_increase
 
 
 
@@ -351,6 +411,10 @@ def parse_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# Initialize HP metadata only after parse_float() is available.
+SKILL_HP_INCREASES = load_skill_hp_increases()
 
 
 def percent(numerator, denominator) -> float:
@@ -3288,6 +3352,66 @@ class SkillTrackerApp:
         summary.pack(fill="x", padx=10, pady=6)
         ttk.Label(summary, textvariable=self.session_detail_summary_var, justify="left").pack(anchor="w")
 
+        projection_skill_frame = ttk.LabelFrame(
+            self.session_details_tab,
+            text="Projected profession skill points",
+            padding=6,
+        )
+        projection_skill_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        projection_columns = (
+            "skill", "weight", "current", "session_tt", "projected_tt",
+            "projected_gain", "projected_final", "hp_increase",
+            "projected_hp", "profession_gain",
+        )
+        self.session_projection_skill_tree = ttk.Treeview(
+            projection_skill_frame,
+            columns=projection_columns,
+            show="headings",
+            height=9,
+        )
+        projection_setup = [
+            ("skill", "Skill", 240),
+            ("weight", "Weight %", 85),
+            ("current", "Current points", 110),
+            ("session_tt", "Session TT", 105),
+            ("projected_tt", "Projected TT", 110),
+            ("projected_gain", "Projected point gain", 135),
+            ("projected_final", "Projected final points", 140),
+            ("hp_increase", "Points / 1 HP", 105),
+            ("projected_hp", "Projected HP gain", 120),
+            ("profession_gain", "Profession gain", 120),
+        ]
+        for col, title, width in projection_setup:
+            self.session_projection_skill_tree.heading(col, text=title)
+            self.session_projection_skill_tree.column(
+                col,
+                width=width,
+                anchor="w" if col == "skill" else "center",
+            )
+        self.make_tree_sortable(
+            self.session_projection_skill_tree,
+            {col: title for col, title, _ in projection_setup},
+        )
+        projection_y = ttk.Scrollbar(
+            projection_skill_frame,
+            orient="vertical",
+            command=self.session_projection_skill_tree.yview,
+        )
+        projection_x = ttk.Scrollbar(
+            projection_skill_frame,
+            orient="horizontal",
+            command=self.session_projection_skill_tree.xview,
+        )
+        self.session_projection_skill_tree.configure(
+            yscrollcommand=projection_y.set,
+            xscrollcommand=projection_x.set,
+        )
+        self.session_projection_skill_tree.grid(row=0, column=0, sticky="nsew")
+        projection_y.grid(row=0, column=1, sticky="ns")
+        projection_x.grid(row=1, column=0, sticky="ew")
+        projection_skill_frame.rowconfigure(0, weight=1)
+        projection_skill_frame.columnconfigure(0, weight=1)
+
         skill_frame = ttk.LabelFrame(self.session_details_tab, text="Skill gains in selected session", padding=6)
         skill_frame.pack(fill="both", expand=True, padx=10, pady=6)
         columns = ("skill", "points", "tt", "tt_percent", "count", "message_percent", "avg_points", "avg_tt")
@@ -3348,6 +3472,7 @@ class SkillTrackerApp:
 
     def show_session_details(self, session):
         self.session_detail_skill_tree.delete(*self.session_detail_skill_tree.get_children())
+        self.session_projection_skill_tree.delete(*self.session_projection_skill_tree.get_children())
         self.session_detail_events_text.delete("1.0", "end")
         if not session:
             self.session_detail_summary_var.set("No session selected")
@@ -3369,8 +3494,39 @@ class SkillTrackerApp:
         cost_per_kill = ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(skill_tt_total, ped_cycled)
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
+        session_hp_gain = sum(
+            skill_hp_gain(skill_name, point_gain)
+            for skill_name, point_gain in skill_points.items()
+        )
         attachments = ", ".join(session.get("attachments", []) or []) or "-"
         profession_projection_text = self.profession_projection_text(session)
+        projection_profession = self.selected_projection_profession()
+        projection_ped_cycle = self.selected_projection_ped_cycle()
+        projection_rows = []
+        if projection_ped_cycle is not None:
+            projection_rows, _projection_total = self.calculate_profession_projection_details(
+                session,
+                projection_profession,
+                projection_ped_cycle,
+            )
+        for row in projection_rows:
+            self.session_projection_skill_tree.insert(
+                "",
+                "end",
+                values=(
+                    row["skill"],
+                    f'{row["weight"]:g}',
+                    f'{row["current_points"]:.4f}',
+                    f'{row["session_tt"]:.8f}',
+                    f'{row["projected_tt"]:.8f}',
+                    f'{row["projected_point_gain"]:.4f}',
+                    f'{row["projected_final_points"]:.4f}',
+                    f'{row["hp_increase"]:g}' if row["hp_increase"] > 0 else "-",
+                    f'{row["projected_hp_gain"]:.6f}',
+                    f'{row["profession_gain"]:.4f}',
+                ),
+            )
+        self.apply_tree_sort(self.session_projection_skill_tree)
         saved_skill_snapshot_count = len(self.session_skill_snapshot(session))
 
         defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
@@ -3391,7 +3547,8 @@ class SkillTrackerApp:
             f"Skill gain messages: {skill_events_total} | Point total: {skill_points_total:.4f} | "
             f"TT-equivalent total: {skill_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
             f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
-            f"Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT\n"
+            f"Avg/message: {avg_points:.6f} points / {avg_tt:.6f} TT | "
+            f"HP gained from skills: {session_hp_gain:.6f}\n"
             f"{profession_projection_text}"
         )
 
@@ -4410,32 +4567,66 @@ class SkillTrackerApp:
                 gains[profession_name] = total
         return gains
 
-    def calculate_profession_projection(self, session, profession_name: str, ped_cycle: float | None = None) -> float:
+    def calculate_profession_projection_details(self, session, profession_name: str, ped_cycle: float | None = None):
+        """Return per-skill projection rows and the total profession gain."""
         profession = PROFESSIONS.get(profession_name)
         if not profession:
-            return 0.0
+            return [], 0.0
         if isinstance(session, MonitorSession):
             session = asdict(session)
 
         skill_tt = session.get("skill_gains_tt", {}) or {}
-        ped_cycled = float(session.get("ped_cycled", 0.0))
+        ped_cycled = float(session.get("ped_cycled", 0.0) or 0.0)
+        rows = []
         total = 0.0
 
         for skill, weight in profession["skills"].items():
+            session_tt = float(skill_tt.get(skill, 0.0) or 0.0)
             if ped_cycle is None:
-                tt_delta = float(skill_tt.get(skill, 0.0))
+                projected_tt = session_tt
+            elif ped_cycled <= 0:
+                projected_tt = 0.0
             else:
-                if ped_cycled <= 0:
-                    tt_delta = 0.0
-                else:
-                    tt_delta = float(skill_tt.get(skill, 0.0)) / ped_cycled * float(ped_cycle)
-            current_points = float(self.current_skills.get(skill, 0.0))
-            try:
-                point_gain = find_skill_after_tt_delta(current_points, tt_delta) - current_points
-            except Exception:
-                point_gain = 0.0
-            total += profession_weighted_value(skill, point_gain) * float(weight) / 100.0
+                projected_tt = session_tt / ped_cycled * float(ped_cycle)
 
+            current_points = float(self.current_skills.get(skill, 0.0) or 0.0)
+            try:
+                projected_final = find_skill_after_tt_delta(current_points, projected_tt)
+                point_gain = projected_final - current_points
+            except Exception:
+                projected_final = current_points
+                point_gain = 0.0
+
+            profession_gain = (
+                profession_weighted_value(skill, point_gain)
+                * float(weight)
+                / 100.0
+            )
+            hp_increase = parse_float(SKILL_HP_INCREASES.get(skill), 0.0)
+            projected_hp_gain = skill_hp_gain(skill, point_gain)
+            total += profession_gain
+            rows.append({
+                "skill": skill,
+                "weight": float(weight),
+                "current_points": current_points,
+                "session_tt": session_tt,
+                "projected_tt": projected_tt,
+                "projected_point_gain": point_gain,
+                "projected_final_points": projected_final,
+                "hp_increase": hp_increase,
+                "projected_hp_gain": projected_hp_gain,
+                "profession_gain": profession_gain,
+            })
+
+        rows.sort(key=lambda row: (-row["weight"], row["skill"].casefold()))
+        return rows, total
+
+    def calculate_profession_projection(self, session, profession_name: str, ped_cycle: float | None = None) -> float:
+        _rows, total = self.calculate_profession_projection_details(
+            session,
+            profession_name,
+            ped_cycle,
+        )
         return total
 
     def selected_projection_profession(self) -> str:
@@ -4461,8 +4652,19 @@ class SkillTrackerApp:
         if ped_cycle is None:
             return f"{profession_name} projected gain: invalid PED cycle"
 
-        projected = self.calculate_profession_projection(session, profession_name, ped_cycle)
-        return f"{profession_name} projected gain at {self.format_ped_cycle(ped_cycle)} PED: {projected:.4f}"
+        rows, projected = self.calculate_profession_projection_details(
+            session,
+            profession_name,
+            ped_cycle,
+        )
+        projected_hp = sum(
+            float(row.get("projected_hp_gain", 0.0) or 0.0)
+            for row in rows
+        )
+        return (
+            f"{profession_name} projected gain at {self.format_ped_cycle(ped_cycle)} PED: "
+            f"{projected:.4f} | Projected HP gain: {projected_hp:.6f}"
+        )
 
     def refresh_session_skill_tree(self):
         self.session_skill_tree.delete(*self.session_skill_tree.get_children())
@@ -4502,6 +4704,10 @@ class SkillTrackerApp:
         cost_per_kill = s.ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(s.skill_gain_tt_total, s.ped_cycled)
         skill_messages_per_attack = percent(total_skill_gain_events, s.attacks_total)
+        session_hp_gain = sum(
+            skill_hp_gain(skill_name, point_gain)
+            for skill_name, point_gain in s.skill_gains_points.items()
+        )
         top_skills = []
         for skill, tt_gain in sorted(s.skill_gains_tt.items(), key=lambda item: item[1], reverse=True)[:5]:
             gain_count = int(s.skill_gain_events_by_skill.get(skill, 0))
@@ -4521,7 +4727,8 @@ class SkillTrackerApp:
             f"Loot events/kills: {loot_event_count} | Cost/kill: {cost_per_kill:.6f} PED\n"
             f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
             f"TT-equivalent total: {s.skill_gain_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
-            f"Skill messages/attack: {skill_messages_per_attack:.2f}%\n"
+            f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
+            f"HP gained from skills: {session_hp_gain:.6f}\n"
             f"Top skills: {top_skills_text}\n"
             f"Top profession gains: {top_text}\n"
             f"{profession_projection_text}"
