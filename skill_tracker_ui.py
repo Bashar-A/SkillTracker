@@ -605,7 +605,10 @@ class ChatLogParser:
     gain_direct_re = re.compile(r"^You have gained ([0-9]+(?:\.[0-9]+)?) ([A-Za-z][A-Za-z '\-]+)$")
     gain_experience_re = re.compile(r"^You have gained ([0-9]+(?:\.[0-9]+)?) experience in your (.+?) skill$")
     improved_re = re.compile(r"^Your (.+?) has improved by ([0-9]+(?:\.[0-9]+)?)$")
-    normal_damage_re = re.compile(r"^You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
+    normal_damage_re = re.compile(
+        r"^You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage(?:\. Target resisted some additional damage)?$"
+    )
+    resisted_all_damage_re = re.compile(r"^The target resisted all damage$")
     crit_damage_re = re.compile(r"^Critical hit - Additional damage! You inflicted ([0-9]+(?:\.[0-9]+)?) points of damage$")
     target_defense_re = re.compile(r"^The target (Jammed|Evaded|Dodged) your attack$")
     loot_re = re.compile(r"^You received (.+?) Value: ([0-9]+(?:\.[0-9]+)?) PED$")
@@ -635,6 +638,9 @@ class ChatLogParser:
         normal = cls.normal_damage_re.match(message)
         if normal:
             return {"type": "normal_hit", "timestamp": timestamp, "damage": float(normal.group(1)), "message": message}
+
+        if cls.resisted_all_damage_re.match(message):
+            return {"type": "normal_hit", "timestamp": timestamp, "damage": 0.0, "message": message}
 
         target_defense = cls.target_defense_re.match(message)
         if target_defense:
