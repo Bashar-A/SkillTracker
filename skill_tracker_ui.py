@@ -62,8 +62,8 @@ PROFESSIONS_DATA_FILE = Path("professions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-item-mu-summary-v12"
-LOOT_EVENT_CONTINUE_SECONDS = 8
+LOOT_TRACKER_GRAPH_VERSION = "loot-item-mu-summary-v12-syncfix1"
+LOOT_EVENT_GROUPING_VERSION = 2
 
 # Entropia attributes contribute to professions at 20 times their displayed
 # value. For example, 10 Psyche is treated as 200 profession skill points
@@ -595,6 +595,7 @@ class MonitorSession:
     damage_total: float = 0.0
     loot_ped_total: float = 0.0
     loot_event_count: int = 0
+    loot_event_grouping_version: int = LOOT_EVENT_GROUPING_VERSION
     loot_events: list = field(default_factory=list)
     ped_cycled: float = 0.0
     events: list = field(default_factory=list)
@@ -754,6 +755,17 @@ class SkillTrackerApp:
         self.reader_error = ""
         self.reader_last_progress_at = 0.0
         self.reader_processed_batches = 0
+
+        # Live tail polling is intentionally throttled. Older versions checked
+        # chat.log every 100 ms and called save_state() even when there were no
+        # new lines. save_state() fingerprints the log and fsyncs JSON files, so
+        # during hunting that could repeatedly block Tkinter and make sync look
+        # frozen.
+        self.log_poll_interval = 0.25
+        self.next_log_poll_at = 0.0
+        self.log_fingerprint_check_interval = 3.0
+        self.last_log_fingerprint_check_at = 0.0
+        self.monitor_tick_errors = 0
 
         # Keep log parsing and the Tkinter UI decoupled. Parsed data is applied
         # immediately, while expensive widget redraws and disk writes are
@@ -1214,58 +1226,108 @@ class SkillTrackerApp:
             return self.sessions[-1]
         return None
 
-    def loot_events_for_session(self, session):
-        if not session:
-            return []
-        events = list(session.get("loot_events", []) or [])
-        if events:
-            return self.sanitize_loot_events(events)
-        # Backward compatibility for old saved sessions before loot_events existed.
+    def reconstruct_loot_events_from_events(self, session):
+        """Rebuild loot events from parsed events using the current grouping rules.
+
+        Loot messages belong to one loot event only when they have the exact same
+        chat.log timestamp (second precision) and there was no player attack
+        between them. Any hit/crit/defense/miss starts the shot counter for the
+        next kill, even when the next loot line has the same timestamp.
+        """
         reconstructed = []
-        previous_type = ""
-        cost_per_attack = hunting_setup_cost_per_shot_ped(
+        shots_since_loot = 0
+        count_hunting = bool(session.get("count_hunting", False))
+        cost_per_shot = hunting_setup_cost_per_shot_ped(
             session.get("weapon", ""),
             session.get("amplifier", ""),
             session.get("attachments", []) or [],
         )
-        running_cost = 0.0
-        previous_event_cost = 0.0
+
         for event in session.get("events", []) or []:
             etype = event.get("type", "")
-            if etype in ("normal_hit", "crit", "defended_attack", "miss", "jammed") and session.get("count_hunting", False):
-                running_cost += cost_per_attack
-            elif etype == "loot":
-                if reconstructed and previous_type == "loot":
-                    loot_event = reconstructed[-1]
-                else:
-                    cost_ped = max(0.0, running_cost - previous_event_cost)
-                    previous_event_cost = running_cost
-                    loot_event = {
-                        "index": len(reconstructed) + 1,
-                        "started_at": event.get("timestamp", ""),
-                        "ended_at": event.get("timestamp", ""),
-                        "value_ped": 0.0,
-                        "cost_ped": cost_ped,
-                        "items": {},
-                        "messages": [],
-                    }
-                    reconstructed.append(loot_event)
-                item = event.get("item") or normalize_loot_item_name(str(event.get("message", "")).replace("You received", "").split("Value:")[0])
-                if ignored_loot_item_name(item):
-                    previous_type = etype
-                    continue
-                value_ped = float(event.get("value_ped", 0.0) or 0.0)
-                quantity = int(event.get("quantity", 0) or 0)
-                if quantity <= 1 and item in STACKABLE_ITEM_PED_VALUE:
-                    quantity = parse_loot_item_quantity(item, item, value_ped)
-                if quantity <= 0:
-                    quantity = 1
-                loot_event["ended_at"] = event.get("timestamp", loot_event.get("ended_at", ""))
-                loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0)) + value_ped
-                loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0)) + quantity
-                loot_event.setdefault("messages", []).append(event.get("message", ""))
-            previous_type = etype
+            if etype in ("normal_hit", "crit", "defended_attack", "miss", "jammed"):
+                shots_since_loot += 1
+                continue
+            if etype != "loot":
+                continue
+
+            item = event.get("item") or normalize_loot_item_name(
+                str(event.get("message", "")).replace("You received", "").split("Value:")[0]
+            )
+            if ignored_loot_item_name(item):
+                continue
+
+            timestamp = str(event.get("timestamp", "") or "")
+            continue_previous = bool(
+                reconstructed
+                and shots_since_loot == 0
+                and timestamp
+                and timestamp == str(reconstructed[-1].get("ended_at", "") or "")
+            )
+
+            if continue_previous:
+                loot_event = reconstructed[-1]
+            else:
+                loot_event = {
+                    "index": len(reconstructed) + 1,
+                    "started_at": timestamp,
+                    "ended_at": timestamp,
+                    "value_ped": 0.0,
+                    "cost_ped": (shots_since_loot * cost_per_shot) if count_hunting else 0.0,
+                    "shots": shots_since_loot,
+                    "items": {},
+                    "messages": [],
+                }
+                reconstructed.append(loot_event)
+                shots_since_loot = 0
+
+            value_ped = float(event.get("value_ped", 0.0) or 0.0)
+            quantity = int(event.get("quantity", 0) or 0)
+            if quantity <= 1 and item in STACKABLE_ITEM_PED_VALUE:
+                quantity = parse_loot_item_quantity(item, item, value_ped)
+            if quantity <= 0:
+                quantity = 1
+            loot_event["ended_at"] = timestamp or loot_event.get("ended_at", "")
+            loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0) or 0.0) + value_ped
+            loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0) or 0) + quantity
+            loot_event.setdefault("messages", []).append(event.get("message", ""))
+
         return reconstructed
+
+    def loot_events_for_session(self, session):
+        if not session:
+            return []
+
+        saved_events = list(session.get("loot_events", []) or [])
+        try:
+            grouping_version = int(session.get("loot_event_grouping_version", 0) or 0)
+        except (TypeError, ValueError):
+            grouping_version = 0
+
+        # New sessions already store the corrected grouping/cost directly.
+        if saved_events and grouping_version >= LOOT_EVENT_GROUPING_VERSION:
+            return self.sanitize_loot_events(saved_events)
+
+        # Older versions could merge loot lines across different seconds and
+        # therefore assign several kills' shots to one later loot event. Rebuild
+        # from the complete parsed-event history when it is available. To avoid
+        # damaging very old sessions whose event history was truncated, only use
+        # the rebuild when its total loot matches the saved loot-event total.
+        reconstructed = self.reconstruct_loot_events_from_events(session)
+        if reconstructed:
+            if not saved_events:
+                return reconstructed
+            saved_sanitized = self.sanitize_loot_events(saved_events)
+            saved_total = sum(float(row.get("value_ped", 0.0) or 0.0) for row in saved_sanitized)
+            rebuilt_total = sum(float(row.get("value_ped", 0.0) or 0.0) for row in reconstructed)
+            tolerance = max(1e-9, abs(saved_total) * 1e-9)
+            if abs(saved_total - rebuilt_total) <= tolerance:
+                return reconstructed
+            return saved_sanitized
+
+        if saved_events:
+            return self.sanitize_loot_events(saved_events)
+        return []
 
     def sanitize_loot_events(self, loot_events):
         """Apply ignored loot filtering and stackable quantity fixes to saved events.
@@ -4057,6 +4119,8 @@ class SkillTrackerApp:
         self.reader_done_pending = False
         self.reader_active = False
         self.reader_stop_event.clear()
+        self.next_log_poll_at = 0.0
+        self.last_log_fingerprint_check_at = 0.0
 
         self.current_session = MonitorSession(
             id=datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -4167,6 +4231,7 @@ class SkillTrackerApp:
 
         self.sync_paused = False
         self.reader_stop_event.clear()
+        self.next_log_poll_at = 0.0
         if hasattr(self, "pause_sync_button"):
             self.pause_sync_button.configure(text="Pause Sync")
         self.monitor_status_var.set("Syncing")
@@ -4175,16 +4240,59 @@ class SkillTrackerApp:
         self.start_log_reader_until_current_eof()
 
     def monitor_tick(self):
-        if self.monitoring:
-            self.process_reader_queue(max_batches=8, time_budget_ms=45)
-            self.refresh_live_ui()
-            self.maybe_persist_live_state()
-            if self.sync_paused:
-                if not self.reader_active:
-                    self.monitor_status_var.set("Paused")
-            elif not self.reader_active and not self.reader_done_pending:
-                self.start_log_reader_until_current_eof()
-        self.root.after(100, self.monitor_tick)
+        """Drive live sync without allowing one callback error to kill it.
+
+        Tkinter does not automatically repeat an ``after`` callback when that
+        callback raises. A single unexpected parsing/UI exception could
+        therefore stop the live monitor forever while the window still showed
+        "Syncing". Always schedule the next tick in ``finally`` and let the
+        reader recover automatically.
+        """
+        try:
+            if self.monitoring:
+                self.process_reader_queue(max_batches=8, time_budget_ms=45)
+                self.refresh_live_ui()
+                self.maybe_persist_live_state()
+
+                if self.sync_paused:
+                    if not self.reader_active:
+                        self.monitor_status_var.set("Paused")
+                elif not self.reader_active and not self.reader_done_pending:
+                    now = time.monotonic()
+                    if now >= self.next_log_poll_at:
+                        self.next_log_poll_at = now + self.log_poll_interval
+                        self.start_log_reader_until_current_eof()
+
+                # Self-heal a worker that exited without its terminal queue
+                # message being applied for any reason. Normally the queued
+                # 'done'/'error' message is handled above; this is only a safety
+                # net so the monitor cannot remain permanently stuck active.
+                if (
+                    self.reader_active
+                    and self.reader_thread is not None
+                    and not self.reader_thread.is_alive()
+                    and self.reader_queue.empty()
+                ):
+                    self.reader_active = False
+                    self.reader_done_pending = False
+                    self.monitor_status_var.set("Syncing")
+                    self.monitor_progress_var.set("Reader recovered; waiting for new log lines...")
+        except Exception as ex:
+            self.monitor_tick_errors += 1
+            self.monitor_status_var.set("Sync recovered after error")
+            self.monitor_progress_var.set(f"Monitor error recovered: {ex}")
+            self.append_event(f"Monitor tick error recovered: {type(ex).__name__}: {ex}")
+            # If the worker is already gone, clear stale lifecycle flags so the
+            # next tick can start a fresh reader. Do not clear reader_active for
+            # a worker that is genuinely still running.
+            if self.reader_thread is None or not self.reader_thread.is_alive():
+                self.reader_active = False
+                self.reader_done_pending = False
+        finally:
+            try:
+                self.root.after(100, self.monitor_tick)
+            except tk.TclError:
+                pass
 
     def start_log_reader_until_current_eof(self):
         """Start a background reader for everything currently present in chat.log.
@@ -4206,24 +4314,37 @@ class SkillTrackerApp:
             self.monitor_status_var.set(f"Read error: {ex}")
             return
 
-        # Detect clear/replace before launching the worker. When reset happens,
-        # scan from byte 0 but keep the last real chat timestamp cutoff.
+        # Detect clear/replace before launching the worker. A size shrink is
+        # cheap to detect and is checked on every poll. Fingerprint validation
+        # is more expensive, so only do it periodically and only when the saved
+        # fingerprint belongs to the exact offset we are validating.
         if current_size < self.log_offset:
             cutoff_text = self.state.get("last_log_read_at", "")
             self.log_time_cutoff_at = parse_iso_datetime(cutoff_text)
             self.append_event(f"chat.log became smaller than saved offset; restarting from beginning and skipping lines before {cutoff_text or 'previous read time'}")
             self.log_offset = 0
+            self.last_log_fingerprint_check_at = time.monotonic()
         elif self.log_offset > 0:
-            saved_fingerprint = self.state.get("last_log_fingerprint", "")
-            current_fingerprint = log_resume_fingerprint(path, self.log_offset)
-            if saved_fingerprint and current_fingerprint and saved_fingerprint != current_fingerprint:
-                cutoff_text = self.state.get("last_log_read_at", "")
-                self.log_time_cutoff_at = parse_iso_datetime(cutoff_text)
-                self.append_event(f"chat.log content changed before saved offset; restarting from beginning and skipping lines before {cutoff_text or 'previous read time'}")
-                self.log_offset = 0
+            now = time.monotonic()
+            saved_offset = int(self.state.get("last_log_offset", -1) or -1)
+            should_validate = (
+                saved_offset == int(self.log_offset)
+                and now - self.last_log_fingerprint_check_at >= self.log_fingerprint_check_interval
+            )
+            if should_validate:
+                self.last_log_fingerprint_check_at = now
+                saved_fingerprint = self.state.get("last_log_fingerprint", "")
+                current_fingerprint = log_resume_fingerprint(path, self.log_offset)
+                if saved_fingerprint and current_fingerprint and saved_fingerprint != current_fingerprint:
+                    cutoff_text = self.state.get("last_log_read_at", "")
+                    self.log_time_cutoff_at = parse_iso_datetime(cutoff_text)
+                    self.append_event(f"chat.log content changed before saved offset; restarting from beginning and skipping lines before {cutoff_text or 'previous read time'}")
+                    self.log_offset = 0
 
         if current_size <= self.log_offset:
-            self.save_state()
+            # Do NOT call save_state() here. This path runs while simply waiting
+            # for new chat lines; saving every poll caused repeated fsync/hash
+            # work on Tkinter's thread and was a major source of sync stalls.
             self.monitor_status_var.set("Syncing")
             self.monitor_progress_var.set("Waiting for new log lines...")
             return
@@ -4269,7 +4390,7 @@ class SkillTrackerApp:
                             else:
                                 batch.append(event)
 
-                        if len(batch) >= 200:
+                        if len(batch) >= 100:
                             self.reader_queue.put(("batch", batch, skipped_by_time, newest_line_at.isoformat(timespec="seconds") if newest_line_at else "", last_offset))
                             batch = []
                             skipped_by_time = 0
@@ -4289,11 +4410,14 @@ class SkillTrackerApp:
         self.reader_thread.start()
 
     def process_reader_queue(self, max_batches=3, time_budget_ms=45, force_refresh=False):
-        """Apply parsed batches without monopolizing Tkinter's event loop.
+        """Apply worker messages in small UI-friendly slices.
 
-        The worker may parse a large historical log much faster than Tkinter can
-        redraw widgets. Data application therefore has a small time budget per
-        tick, while visual refreshes and persistence are handled separately.
+        A worker always puts ``done`` after all of its batch/progress messages.
+        Because Queue is FIFO, seeing ``done`` already guarantees that all
+        earlier messages from that worker were consumed. Older code used
+        ``qsize()`` to decide whether done could be finalized; qsize is only an
+        approximation and could leave ``reader_done_pending`` stuck forever,
+        preventing the next reader from starting.
         """
         processed_batches = 0
         refresh_needed = False
@@ -4313,7 +4437,7 @@ class SkillTrackerApp:
                 progress_percent = (current_offset / end_offset * 100.0) if end_offset else 100.0
                 self.monitor_progress_var.set(
                     f"Scanning log: {progress_percent:.1f}% | lines checked: {lines_seen:,} | "
-                    f"offset {current_offset:,}/{end_offset:,} | queued batches: {self.reader_queue.qsize():,}"
+                    f"offset {current_offset:,}/{end_offset:,}"
                 )
                 continue
 
@@ -4321,8 +4445,21 @@ class SkillTrackerApp:
                 _, events, skipped_by_time, newest_iso, batch_end_offset = item
                 if skipped_by_time:
                     self.append_event(f"Skipped {skipped_by_time} old parsed events before last_log_read_at")
+
+                apply_errors = 0
                 for event in events:
-                    self.apply_event(event)
+                    try:
+                        self.apply_event(event)
+                    except Exception as ex:
+                        apply_errors += 1
+                        self.append_event(
+                            f"Skipped one parsed event after {type(ex).__name__}: {ex} | "
+                            f"{event.get('timestamp', '')} {event.get('message', event)}"
+                        )
+
+                # Advance to the batch boundary even if one malformed event was
+                # skipped. Otherwise the same broken line would be replayed on
+                # every restart and could repeatedly wedge live sync.
                 self.log_offset = int(batch_end_offset)
                 if self.current_session is not None:
                     self.current_session.end_offset = self.log_offset
@@ -4332,56 +4469,60 @@ class SkillTrackerApp:
                 self.reader_processed_batches += 1
                 refresh_needed = True
                 self.live_ui_dirty = True
+                error_text = f" | skipped errors: {apply_errors}" if apply_errors else ""
                 self.monitor_progress_var.set(
-                    f"Applied {len(events):,} parsed events | offset {self.log_offset:,} | "
-                    f"queued batches: {self.reader_queue.qsize():,}"
+                    f"Applied {len(events):,} parsed events | offset {self.log_offset:,}" + error_text
                 )
                 continue
 
             if kind == "done":
-                final_offset = item[1]
-                final_last_read_at = item[2] if len(item) > 2 else ""
+                final_offset = int(item[1])
+                final_last_read_at = str(item[2] if len(item) > 2 else "" or "")
                 self.reader_active = False
-                self.reader_done_pending = True
-                self.reader_final_offset = int(final_offset)
-                self.reader_final_last_read_at = str(final_last_read_at or "")
+                self.reader_done_pending = False
+                self.reader_final_offset = final_offset
+                self.reader_final_last_read_at = final_last_read_at
+                self.log_offset = final_offset
+                if self.current_session is not None:
+                    self.current_session.end_offset = self.log_offset
+                if final_last_read_at:
+                    self.pending_last_log_read_at = final_last_read_at
+                if self.log_time_cutoff_at is not None:
+                    self.log_time_cutoff_at = None
+                    if self.current_session is not None:
+                        self.current_session.log_cutoff_at = ""
+
+                # Do not force disk writes or a full UI rebuild for every tiny
+                # live-log read. Hunting can produce several reader completions
+                # per second. Normal throttles below persist/refresh frequently
+                # enough without freezing Tkinter.
+                refresh_needed = True
+                self.live_ui_dirty = True
+                self.monitor_status_var.set("Syncing")
+                self.monitor_progress_var.set(
+                    f"Caught up. Current offset: {self.log_offset:,}. Waiting for new lines..."
+                )
+                self.next_log_poll_at = min(
+                    self.next_log_poll_at or time.monotonic(),
+                    time.monotonic() + self.log_poll_interval,
+                )
                 continue
 
             if kind == "error":
                 _, message = item
                 self.reader_active = False
                 self.reader_done_pending = False
-                self.monitor_status_var.set(f"Read error: {message}")
-                self.append_event(f"Read error: {message}")
+                self.reader_error = str(message)
+                self.monitor_status_var.set("Syncing")
+                self.monitor_progress_var.set(f"Reader error recovered: {message}. Retrying...")
+                self.append_event(f"Reader error recovered: {message}")
                 self.live_ui_dirty = True
+                self.next_log_poll_at = time.monotonic() + 0.5
                 continue
 
         if refresh_needed or force_refresh:
             self.refresh_live_ui(force=force_refresh)
             self.maybe_persist_live_state(force=force_refresh)
-
-        if self.reader_done_pending and not self.reader_active:
-            try:
-                has_pending_items = self.reader_queue.qsize() > 0
-            except NotImplementedError:
-                has_pending_items = False
-            if not has_pending_items:
-                if self.reader_final_offset is not None:
-                    self.log_offset = int(self.reader_final_offset)
-                if self.current_session is not None:
-                    self.current_session.end_offset = self.log_offset
-                if self.reader_final_last_read_at:
-                    self.pending_last_log_read_at = self.reader_final_last_read_at
-                self.reader_done_pending = False
-                self.reader_final_last_read_at = ""
-                self.maybe_persist_live_state(force=True)
-                self.refresh_live_ui(force=True)
-                self.monitor_status_var.set("Syncing")
-                self.monitor_progress_var.set(f"Caught up. Current offset: {self.log_offset:,}. Waiting for new lines...")
-                if self.log_time_cutoff_at is not None:
-                    self.log_time_cutoff_at = None
-                    if self.current_session is not None:
-                        self.current_session.log_cutoff_at = ""
 
     def read_new_log_lines(self):
         path = Path(self.chat_log_path_var.get()).expanduser()
@@ -4443,8 +4584,8 @@ class SkillTrackerApp:
         if last_read_at:
             self.pending_last_log_read_at = last_read_at
         self.live_ui_dirty = True
-        self.maybe_persist_live_state(force=True)
-        self.refresh_live_ui(force=True)
+        self.maybe_persist_live_state()
+        self.refresh_live_ui()
 
     def apply_event(self, event):
         if self.current_session is None:
@@ -4481,6 +4622,11 @@ class SkillTrackerApp:
             self.append_event(f"{event['timestamp']} skill +{point_gain:.4f} pts: {skill} ({old_points:.4f} -> {new_points:.4f})")
         elif event_type in ("normal_hit", "crit", "defended_attack", "miss", "jammed"):
             session.attacks_total += 1
+            setattr(
+                session,
+                "_shots_since_loot_event",
+                int(getattr(session, "_shots_since_loot_event", 0) or 0) + 1,
+            )
             if event_type == "normal_hit":
                 session.normal_hits += 1
                 session.damage_total += float(event["damage"])
@@ -4517,6 +4663,17 @@ class SkillTrackerApp:
         self.live_ui_dirty = True
 
     def add_loot_to_session(self, session: MonitorSession, event, previous_event_type: str):
+        """Add one loot chat line to the correct kill/loot event.
+
+        Grouping rule:
+        - loot lines with the same chat.log second belong to the same event;
+        - any player attack between loot lines forces a new event, even when both
+          loot lines have the same second;
+        - loot lines from different seconds are always separate events.
+
+        Event cost is exactly the number of attack messages seen since the
+        previous loot event multiplied by the selected setup's cost per shot.
+        """
         item = event.get("item") or "Unknown item"
         if ignored_loot_item_name(item):
             return
@@ -4529,31 +4686,40 @@ class SkillTrackerApp:
         event["quantity"] = quantity
         loot_events = session.loot_events
 
-        continue_previous = bool(loot_events and previous_event_type == "loot")
-        if not continue_previous and loot_events and previous_event_type == "skill_gain":
-            previous_time = parse_chat_timestamp(str(loot_events[-1].get("ended_at", "")))
-            current_time = parse_chat_timestamp(str(event.get("timestamp", "")))
-            if previous_time is not None and current_time is not None:
-                continue_previous = abs((current_time - previous_time).total_seconds()) <= LOOT_EVENT_CONTINUE_SECONDS
+        shots_since_loot = int(getattr(session, "_shots_since_loot_event", 0) or 0)
+        timestamp = str(event.get("timestamp", "") or "")
+        continue_previous = bool(
+            loot_events
+            and shots_since_loot == 0
+            and timestamp
+            and timestamp == str(loot_events[-1].get("ended_at", "") or "")
+        )
 
         if continue_previous:
             loot_event = loot_events[-1]
         else:
-            previous_cost = float(getattr(session, "_loot_cost_accounted", 0.0) or 0.0)
-            event_cost = max(0.0, float(session.ped_cycled) - previous_cost)
-            setattr(session, "_loot_cost_accounted", previous_cost + event_cost)
+            cost_per_shot = hunting_setup_cost_per_shot_ped(
+                session.weapon,
+                session.amplifier,
+                session.attachments,
+            )
+            event_cost = shots_since_loot * cost_per_shot if session.count_hunting else 0.0
             loot_event = {
                 "index": len(loot_events) + 1,
-                "started_at": event.get("timestamp", ""),
-                "ended_at": event.get("timestamp", ""),
+                "started_at": timestamp,
+                "ended_at": timestamp,
                 "value_ped": 0.0,
                 "cost_ped": event_cost,
+                "shots": shots_since_loot,
                 "items": {},
                 "messages": [],
             }
             loot_events.append(loot_event)
+            # The first loot line closes the current kill. Extra item lines in
+            # the same second keep this at zero and are merged into this event.
+            setattr(session, "_shots_since_loot_event", 0)
 
-        loot_event["ended_at"] = event.get("timestamp", loot_event.get("ended_at", ""))
+        loot_event["ended_at"] = timestamp or loot_event.get("ended_at", "")
         loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0) or 0.0) + loot_value
         loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0) or 0) + quantity
         loot_event.setdefault("messages", []).append(event.get("message", ""))
