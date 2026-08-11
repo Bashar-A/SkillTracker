@@ -598,6 +598,7 @@ class MonitorSession:
     loot_event_grouping_version: int = LOOT_EVENT_GROUPING_VERSION
     loot_events: list = field(default_factory=list)
     ped_cycled: float = 0.0
+    notes: str = ""
     events: list = field(default_factory=list)
 
 
@@ -831,6 +832,8 @@ class SkillTrackerApp:
         self.mob_filter_var = tk.StringVar()
         self.tree_sort_state = {}
         self.tree_heading_titles = {}
+        self.session_cell_editor = None
+        self.session_cell_editor_meta = None
         self.loot_summary_var = tk.StringVar(value="No loot session selected")
         self.loot_markup_status_var = tk.StringVar(value="Double-click an item row for its drop history; double-click the MU cell to set a manual percentage. Otherwise weekly market_data.json markup is used, then 100%.")
         self.loot_item_summary_iid_to_name = {}
@@ -2947,9 +2950,10 @@ class SkillTrackerApp:
         ttk.Button(top, text="Remove Selected from Mob Analysis", command=self.remove_selected_sessions_from_analysis).pack(side="left", padx=6)
         ttk.Button(top, text="Delete Selected Sessions", command=self.delete_selected_sessions).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
+        ttk.Label(top, text="Double-click PED cycled or Notes to edit.").pack(side="right", padx=8)
 
         columns = (
-            "started", "ended", "weapon", "mob", "attacks", "defended", "misses", "damage", "ped",
+            "started", "ended", "weapon", "mob", "notes", "attacks", "defended", "misses", "damage", "ped",
             "dpp", "efficiency", "ped_h", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
             "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
             "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
@@ -2963,7 +2967,7 @@ class SkillTrackerApp:
         )
         setup = [
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
-            ("mob", "Mob", 170), ("attacks", "Attacks", 75),
+            ("mob", "Mob", 170), ("notes", "Notes", 240), ("attacks", "Attacks", 75),
             ("defended", "J/E/D", 70), ("misses", "Misses", 70), ("damage", "Damage", 85),
             ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
             ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
@@ -2979,7 +2983,7 @@ class SkillTrackerApp:
         ]
         for col, title, width in setup:
             self.sessions_tree.heading(col, text=title)
-            self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "skills") else "w")
+            self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes", "skills") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
         sessions_xscroll = ttk.Scrollbar(self.sessions_tab, orient="horizontal", command=self.sessions_tree.xview)
         self.sessions_tree.configure(xscrollcommand=sessions_xscroll.set)
@@ -2987,6 +2991,109 @@ class SkillTrackerApp:
         sessions_xscroll.pack(fill="x", padx=10, pady=(0, 10))
         self.sessions_tree.tag_configure("analysis_valid", background="#dff3df")
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
+        self.sessions_tree.bind("<Double-1>", self.on_sessions_tree_double_click)
+
+    def on_sessions_tree_double_click(self, event):
+        """Inline-edit saved session PED cycled or notes."""
+        tree = self.sessions_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        iid = tree.identify_row(event.y)
+        column_token = tree.identify_column(event.x)
+        if not iid or not column_token.startswith("#"):
+            return
+        try:
+            column_index = int(column_token[1:]) - 1
+            column_name = tree["columns"][column_index]
+            session_index = int(str(iid).replace("session_", ""))
+        except (ValueError, IndexError, tk.TclError):
+            return
+        if column_name not in ("ped", "notes") or not (0 <= session_index < len(self.sessions)):
+            return
+
+        bbox = tree.bbox(iid, column_name)
+        if not bbox:
+            return
+        self.cancel_session_cell_edit()
+        session = self.sessions[session_index]
+        if column_name == "ped":
+            initial_value = f"{parse_float(session.get('ped_cycled'), 0.0):.6f}"
+        else:
+            initial_value = str(session.get("notes", "") or "")
+
+        x, y, width, height = bbox
+        editor = ttk.Entry(tree)
+        editor.insert(0, initial_value)
+        editor.select_range(0, "end")
+        editor.place(x=x, y=y, width=width, height=height)
+        self.session_cell_editor = editor
+        self.session_cell_editor_meta = (session_index, column_name, iid)
+        editor.bind("<Return>", self.commit_session_cell_edit)
+        editor.bind("<Escape>", self.cancel_session_cell_edit)
+        editor.bind("<FocusOut>", self.commit_session_cell_edit)
+        editor.focus_set()
+
+    def commit_session_cell_edit(self, event=None):
+        editor = self.session_cell_editor
+        meta = self.session_cell_editor_meta
+        if editor is None or not meta:
+            return
+        session_index, column_name, iid = meta
+        raw_value = editor.get().strip()
+        self.session_cell_editor = None
+        self.session_cell_editor_meta = None
+        try:
+            editor.destroy()
+        except tk.TclError:
+            pass
+
+        if not (0 <= session_index < len(self.sessions)):
+            return
+        session = self.sessions[session_index]
+        if column_name == "ped":
+            ped_cycled = parse_float(raw_value.replace(",", "."), None)
+            if ped_cycled is None or ped_cycled < 0:
+                messagebox.showerror("Invalid PED cycled", "PED cycled must be a number greater than or equal to 0.")
+                return
+            session["ped_cycled"] = float(ped_cycled)
+        elif column_name == "notes":
+            session["notes"] = raw_value
+        else:
+            return
+
+        # Keep an already-exported valid analysis session in sync with edits.
+        session_id = str(session.get("id", "") or "")
+        analysis_changed = False
+        if session_id:
+            for analysis_index, analysis_session in enumerate(self.analysis_sessions):
+                if isinstance(analysis_session, dict) and str(analysis_session.get("id", "") or "") == session_id:
+                    self.analysis_sessions[analysis_index] = json.loads(json.dumps(session, ensure_ascii=False))
+                    analysis_changed = True
+
+        save_json(SESSIONS_FILE, self.sessions)
+        if analysis_changed:
+            save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
+
+        self.refresh_sessions_table()
+        if self.sessions_tree.exists(iid):
+            self.sessions_tree.selection_set(iid)
+            self.sessions_tree.focus(iid)
+            self.sessions_tree.see(iid)
+        self.show_session_details(session)
+        if self.is_tab_active(getattr(self, "loot_tab", None)):
+            self.refresh_loot_tab()
+        if analysis_changed:
+            self.refresh_mob_analysis()
+
+    def cancel_session_cell_edit(self, event=None):
+        editor = self.session_cell_editor
+        self.session_cell_editor = None
+        self.session_cell_editor_meta = None
+        if editor is not None:
+            try:
+                editor.destroy()
+            except tk.TclError:
+                pass
 
     def add_selected_sessions_to_analysis(self):
         indices = self.selected_session_indices_from_table()
@@ -3606,6 +3713,7 @@ class SkillTrackerApp:
             f"Saved current-skills snapshot: {saved_skill_snapshot_count} skills\n"
             f"Weapon: {session.get('weapon', '-') or '-'} | Amp: {session.get('amplifier', '') or '-'} | Attachments: {attachments}\n"
             f"Mob: {mob} | Count hunting: {bool(session.get('count_hunting', False))}\n"
+            f"Notes: {str(session.get('notes', '') or '-')}\n"
             f"Attacks: {session.get('attacks_total', 0)} "
             f"(hits {session.get('normal_hits', 0)}, crits {session.get('critical_hits', 0)}, "
             f"defended {defended_attacks}, misses {missed_attacks}) | "
@@ -5072,6 +5180,8 @@ class SkillTrackerApp:
                 skills_text += f" ... +{len(skill_rows) - 4} more"
 
             mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
+            notes = str(session.get("notes", "") or "").replace("\r", " ").replace("\n", " ")
+            damage_total = float(session.get('damage_total', 0.0) or 0.0)
             ped_cycled = float(session.get('ped_cycled', 0.0))
             loot_ped = float(session.get('loot_ped_total', 0.0))
             loot_event_count = len(self.loot_events_for_session(session))
@@ -5083,7 +5193,9 @@ class SkillTrackerApp:
             if amplifier:
                 weapon_display = f"{weapon or '-'} + {amplifier}"
             has_weapon_stats = weapon in WEAPONS
-            dpp = hunting_setup_dpp(weapon, amplifier, attachments) if has_weapon_stats else 0.0
+            # Session DPP is based on what actually happened in the session:
+            # damage per PEC = total damage / (PED cycled * 100 PEC/PED).
+            dpp = damage_total / ped_cycled / 100.0 if ped_cycled > 0 else 0.0
             efficiency = hunting_setup_efficiency(weapon)
             ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
             skill_tt_percent = percent(skill_tt_total, ped_cycled)
@@ -5098,10 +5210,11 @@ class SkillTrackerApp:
                 session.get("ended_at", ""),
                 weapon_display,
                 mob,
+                notes,
                 session.get("attacks_total", 0),
                 defended_attacks,
                 missed_attacks,
-                f"{float(session.get('damage_total', 0.0)):.1f}",
+                f"{damage_total:.1f}",
                 f"{ped_cycled:.4f}",
                 f"{dpp:.3f}" if dpp else "",
                 f"{efficiency:.1f}" if efficiency is not None else "",
