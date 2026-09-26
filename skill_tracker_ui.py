@@ -12,9 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
-import numpy as np
-from scipy.interpolate import PchipInterpolator
-from scipy.optimize import brentq
+import base64
 
 try:
     from profession_data import PROFESSIONS
@@ -77,76 +75,157 @@ PROFESSION_ATTRIBUTES_X20 = {
 }
 
 
-X = np.array([
-    0, 100, 200, 300, 400, 500, 600, 700, 800, 900,
-    1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900,
-    2000, 2100, 2200, 2300, 2400, 2500, 2750, 3000, 3250, 3500,
-    3750, 4000, 4250, 4500, 4750, 5000, 5250, 5500, 5750, 6000,
-    6250, 6500, 6750, 7000, 7250, 7500, 7750, 8000, 8250, 8500,
-    8750, 9000, 9250, 9500, 9750, 10000, 10250, 10500, 10750, 11000,
-    11250, 11500, 11750, 12000, 12250, 12500, 12750, 13000, 13250, 13500,
-    13750, 14000, 14250, 14500, 14750
-], dtype=float)
+# Cumulative raw skill TT/PES curve, 0..20,000 skill points.
+#
+# Source model: the official-wiki chip-in curve as tracked by EntropiaOrme.
+# The curve matches Entropia Central's visible calculator anchor at 5,000
+# points (149.86 PED) and its 100 PED worked example.  The historical table
+# previously used by this tracker was effectively filled-implant/post-
+# extraction value and therefore understated raw skill value.
+#
+# The 20,001 integer-point anchors are stored losslessly as second differences
+# of TT cents. Most second differences are -1/0/+1, so a compact 2-bit stream
+# plus a tiny escape stream keeps this tracker self-contained.
+SKILL_TT_CURVE_MAX_POINTS = 20_000
+SKILL_TT_CURVE_VERSION = "official-wiki-raw-tt-0-20000-v1"
+_SKILL_TT_CURVE_POINT_COUNT = SKILL_TT_CURVE_MAX_POINTS + 1
+_SKILL_TT_CURVE_CODE_BYTES = (_SKILL_TT_CURVE_POINT_COUNT + 3) // 4
+_SKILL_TT_CURVE_PAYLOAD_B64 = (
+    'BgGAABgABgAAYAAYABgABgAGAAYABgAGABgAGABgAYAGABgAYAGAGABgBgAYAYAYAYAYAYAYBgBgBgGAGAYABgGAYGAYGAYGAYGBgGBgYGBgYGGBgYGGBhgYYYGGGGGGGGGGGGYYZhhmGYZhmGZhmYZmYZmZhmZmZmYZmZmZmZmZmZhmZmZmZmZmZhmZmYZmZhmZmGZhmYZhmGYZhmGYYZhhmGGGGYYYYYYYYYYYYYYGGGGGGGGBhhhhhgYYYYYGGGGGGGGGGGGYYYYZhhhmGYZhmGYZmGZmGZmZhmZmZmSZmZkmZkmSZJkmSZJJJJJJJJJJJCSSQkkJJJCQkJJCSQkJJCSQkkkJJCSSSSSSSSSSSSZJJkkmSZkmSZkmZmSZmZmSZmZmZmZmZmZhmZmZmGZmZmYZmZmGZmZmYZmZmZmZmZmZmZmZmSZmZJmSZkmSZJkkkkkkkkkJJCQkJAkJAJAJAJAAkAACQAAAAAAAAAAAAAAAGAAAABgAAAGAAAAYAAAAGAAAAAAAAAAAAAACQAAAJAAJAAkAJAJAJAkJAkCQkJCQkkJCSQkkJJJCSSSQkkkkJJJJJCSSQkkJJCSQkJCQkCQkCQJAJAJAAkAAJAAAAAAAAAAGAABgAYBgGBgYGBhhhmGGYZhmZmGZmZkmZmSZmSZJmSZJkmZJkmZJmSZkmZmZmZmZmZhmYZmGYYYYYYYYGBhgGBgGAYAYAGAAYAABgAAAYAAAAAAAGAAAAAAAAAAAAAGAAAAAGAAAYAAYAYAYBgGBgYGGGGGGGYZmZmZmZkmSSSSSQkCQJAAkAAAAAAABgAGAGAYBgYGGBhhhhhhhhhmGGGGGGGGYGGGBgYYBgYBgBgABgAAAAAAAAACQAJAJAkCQkkJJJJCZJJkmSZkmZkmZmZmSZmZmZmZmZmSZmZkmZJmSZJkkkkkkJJAkJAJAAkAAAAAAYABgGBhgYZhmZmZkkkkkJAkACQAAABgABgGBgYYYYYZhmGZmYZmZmZmZmZmGZmYZhmGGYYGGBgYBgAYAAAAAAACQAkCQkJJJJkkmZmZmZmGYZhhmGGBhhgYGBhgGBgYGBgYBgYYGGBhhhhhmGYZmZmZmSSZJJCQkAJAAAAAYAGBgZhmZmSZCSQCQAAAGAGBhhmGZkmSQkkCQAkAAAAAYAABgBgAYAYAYAYABgAAAAAAAACQCQkJJJJmZmZhmBgYYABgAAAAkAJAkJJJJJkmZmZmZhmGYZhhhhhhhgYYYYYcDAYGBgYYGGGYZmZmZkmSQkCQAAAAAYBhhmZmZCQkAAAAGBhhmZkkkJAAAABgYGYZmSZJCQJAAAAAABgBgGBhhgYZhhhhmGGGGGGBhgGAYABgAACQAJCSSSZmZhmBgGAAAACQJJJJmYZhhgGAAGAkAAJAkJJJJJJkmZJmZkmZkmSZJJJJCQJAAAAAAGBhhmZkkJACWABgZmZJCQAAGBhmSSQAAAGGGZJJAkAYAYZhJkkJAAAAABgYYZhmZmZJkmSSSSSSSZJkmSZmYZhhgYBgAAAJAkkmZhhgYAAAkJJmZhhgAAAAkkmSGYYBgAAAAJCQkkmZkmGZmYZhmYZmZhJmZJJJAkAAAAYGGZmSQJAYBhmZCQABhhkkAAAYZkkAAGGZJAAAGGSSQABgZmSQkABgYYZJkJAkAAAGAGBgYGGGGBhhgYBgAYAACQJCSZmGGAB0AJJmYYGAJCSZmBgAJCZIYGAAJCSYZgGAAkCSSZmGYGBgAYAAAAAAAYAABgGBhmGSSQkAAGGGSSQAYGZkAAGGSQAGGSQBhmQlgZmQAYZCQGGZAAAZkkAGGZkAAAZhJJAAAGBmGSZJJAkCQAkACQJAkkkmZmGAYAAkJmZgBpAkmGAACZmGACSZgAACZgYAkmZgAAkmZgAAAnBgAGABgYGGZmSSQAAYGZJAAAZkkABmZAAwAAYZmQAAGZkJBhmZABhkkAYZJAYZkAAZkAAZmQAYZJAGGZJABhmSQABhmZJAkAYAYYZmZmSZJkmSZmZmYYYBgACQkmZgYAJCZhgACSZgAAJmGACSYYAAmZgAAkhhgAkmZgYAJCSZhgYAAAAAJAkJAkCQAAlgAGGYSSQABhmQkGBkkAGZJBhkkYZkBmSWGSRhJAZkAGQAGZBhkABkkYZkAGZAABkkABhmQkAYGGZkkJACQAAAACQAkJJJhmAAACSYYACSYYCSZgAJmAAmGAkhgCZgAkgaQmAAJmAAmYYJCZgGkCZmGAAAAkJJkmSZkmSSQCQBgYZJAABmSQYZJBhJBhJBmQBkAZLhkBkuGQZJZkBkASRhAGQASRmQBkAGQAZkAZkLgZkAAGEkkAAAYGGGGYYYYYAAAAmZmAAJmYAkmAAmAAmGkmAJgAmAJgAmAmYJmAmAAhiSGJIYCZgAkgYkJhgAJJIZgGAAAAAAAYAYZmSQAYZJAZmQYSRhJYSWEAEAEAZBkGQGQSWQBAZBJZAZGQBAZBkGQBAGQGQZkGZBmQBmQAZkAAYZJAJBgAGABgAAkJJmAACZgAJgAJgCYAmAJgJgmaSAmAgAgCAJghpIJgCHSAJgIYmYJmAmGkIYCSGAAJJmGAYAABgAYYZkJBhmQAZAAZBmQZAZAQBkZBAGWQZZAQZEAQQEBAQQEBAwQAZBkAGSWBkkAGBmGZmGYGAAJmYAkgAJpJkJCQkJCSZmGBgJJIYAJmAAmGJIACYCZiSACGkgCYCYCYAgAmCYdIaSAJmkmAJh0JgAJmAAmYYAAJJJmZmGZmZkkAABhkJGGZBhkBmQZkZkGQGRmRkGQZBAGWQGWQEBlkBuEBAZZlkBlhBkBABAGQZABAAZAGZABmQkGBhmSSSQkkkmYYAAJIYAkgdCB0mAmAmAIAmJgCAICYIAmmAIJgmCAJpmmaZpmJgCACACYCYaSYACYYAJJmGGAGABgGGZkJGBkkGZABJYQAQBAGRkGRkZBlkG4RkQBGRAFkBEuRkQG5ARkEGRkZYRkGQZGQBABABJGEJYZkABhmZJJJJJJhhgAmYYkmAmYkgJgJiYCAICAnSCAgICCaYmmCAggICCAgIJpgIJpmmCYJgmAmAmAJhpJmACSZmGGBgYZmSQBhkAGQBkAQBkZAQEBlkZEARAQQEQEEEEZZQEEQEbkQEQFkZQEEBEARLkEBlkGQS4QBkGEAYQlgYSZAkCQJJmGAJIYJmAhiYCYmCYmIAggIIICCCCCCdpppoCCICIIICmmmIJ2CCAggIJiHZpgIdIAIaSYACZhgAAAAAYGEkAGZBmRmWEGRkG4RLkbkEEEEEFkRuWUEFlBBEbuREEERBBEEEQQRlARlAbkEMGEJBgGYYZgGAkmB0mAIaSCYCAmmCaYICDYCYCAJiYmCaYCJgggJ2CCAgggmgICICCAiaYmmJiAmmJggCAmCACYmYCYACZgAAkkmZmZJCQGGZAZkASWEBLhBkZBAQQEBEBBBBAWW5BEBZQEQQRuWW5G5ZEZZZZZEBBBlkEBAZElmRkAZAGZABhmQkCQJCZmGAkhiSHSYIaYCaYJpggmgCmJ2J2J2IImggggppoCmInYgKaaYggmgJ2CAnSJgIAgCYCZiQhgACQmSZJAkYGZAYQBkGQG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'
+)
 
-Y = np.array([
-    0, 0.12, 0.25, 0.42, 0.68, 1.08, 1.5, 1.83, 2.12, 2.51,
-    3.09, 3.72, 4.2, 4.64, 5.21, 6.07, 6.99, 7.71, 8.35, 9.21,
-    10.48, 11.85, 12.92, 13.87, 15.13, 17.02, 21.31, 26.69, 33.07, 41.03,
-    50.51, 61.96, 75.71, 92.18, 111.9, 135.46, 163.58, 197.06, 236.93, 280.42,
-    334.76, 396.85, 467.43, 547.32, 637.31, 738.28, 873.75, 1004.9, 1142.96, 1289.66,
-    1442.97, 1604.53, 1772.41, 1948.16, 2129.93, 2319.2, 2514.19, 2716.29, 2923.82, 3138.08,
-    3357.48, 3583.23, 3813.81, 4050.37, 4291.47, 4538.16, 4789.1, 5045.25, 5305.34, 5570.27,
-    5838.85, 6111.88, 6388.27, 6668.74, 6952.25
-], dtype=float)
 
-Z = np.log(Y + 1.0)
-_log_interpolator = PchipInterpolator(X, Z)
+def _decode_skill_tt_curve() -> tuple[float, ...]:
+    packed = base64.b64decode(_SKILL_TT_CURVE_PAYLOAD_B64)
+    codes = packed[:_SKILL_TT_CURVE_CODE_BYTES]
+    extras = packed[_SKILL_TT_CURVE_CODE_BYTES:]
+    extra_index = 0
+    first_difference_cents = 0
+    value_cents = 0
+    values = []
 
-# The known Entropia skill-value table ends at 14,750 points / 6,952.25 TT.
-# Above that point, continue with the slope of the final known table segment
-# instead of allowing PCHIP to extrapolate and eventually behave unpredictably.
-SKILL_TT_LINEAR_START_POINTS = float(X[-1])
-SKILL_TT_LINEAR_START_VALUE = float(Y[-1])
-SKILL_TT_LINEAR_SLOPE = float((Y[-1] - Y[-2]) / (X[-1] - X[-2]))
+    for index in range(_SKILL_TT_CURVE_POINT_COUNT):
+        byte = codes[index // 4]
+        shift = 6 - 2 * (index % 4)
+        code = (byte >> shift) & 0b11
+        if code == 0:
+            second_difference = 0
+        elif code == 1:
+            second_difference = 1
+        elif code == 2:
+            second_difference = -1
+        else:
+            if extra_index >= len(extras):
+                raise RuntimeError("Corrupt embedded skill TT curve (missing escape value).")
+            second_difference = int(extras[extra_index]) - 128
+            extra_index += 1
+
+        first_difference_cents += second_difference
+        value_cents += first_difference_cents
+        values.append(value_cents / 100.0)
+
+    if extra_index != len(extras):
+        raise RuntimeError("Corrupt embedded skill TT curve (unused escape values).")
+
+    # Pinned anchors make accidental edits/corruption fail immediately.
+    expected = {
+        0: 0.0,
+        100: 0.12,
+        1_000: 3.42,
+        5_000: 149.86,
+        10_000: 2597.01,
+        14_750: 7944.19,
+        20_000: 13381.54,
+    }
+    for point, tt_value in expected.items():
+        if abs(values[point] - tt_value) > 1e-9:
+            raise RuntimeError(
+                f"Corrupt embedded skill TT curve at {point:,}: "
+                f"{values[point]:.6f} != {tt_value:.6f}"
+            )
+    return tuple(values)
+
+
+_SKILL_TT_CURVE = _decode_skill_tt_curve()
 
 
 def skill_tt_value(skill_points: float) -> float:
+    """Return cumulative raw skill TT-equivalent (PED) at ``skill_points``.
+
+    The embedded official-wiki curve contains every integer point from 0 to
+    20,000. Fractional skill points are linearly interpolated between adjacent
+    anchors, matching the reference calculator's interpolation approach.
+
+    Entropia Central has a newer private extension through 100,318 points, but
+    its >20,000 anchors/formula are not publicly exposed.  Refuse to silently
+    invent values beyond the verified range instead of using the old linear
+    extrapolation.
+    """
     skill_points = float(skill_points)
-    if skill_points < X[0]:
-        raise ValueError(f"Skill points cannot be below {X[0]:g}.")
-    if skill_points > SKILL_TT_LINEAR_START_POINTS:
-        extra_points = skill_points - SKILL_TT_LINEAR_START_POINTS
-        return SKILL_TT_LINEAR_START_VALUE + extra_points * SKILL_TT_LINEAR_SLOPE
-    z = _log_interpolator(skill_points)
-    return float(np.exp(z) - 1.0)
+    if not (skill_points >= 0.0):
+        raise ValueError("Skill points must be a non-negative finite number.")
+    if skill_points == float("inf"):
+        raise ValueError("Skill points must be a non-negative finite number.")
+    if skill_points > SKILL_TT_CURVE_MAX_POINTS:
+        raise ValueError(
+            f"Verified skill TT curve currently supports 0..{SKILL_TT_CURVE_MAX_POINTS:,} points; "
+            f"got {skill_points:,.4f}. Entropia Central extends beyond this range, "
+            "but its >20,000 curve is not publicly available for an exact offline calculation."
+        )
+
+    lower = int(skill_points)
+    if lower >= SKILL_TT_CURVE_MAX_POINTS:
+        return _SKILL_TT_CURVE[SKILL_TT_CURVE_MAX_POINTS]
+    fraction = skill_points - lower
+    lower_value = _SKILL_TT_CURVE[lower]
+    upper_value = _SKILL_TT_CURVE[lower + 1]
+    return lower_value + fraction * (upper_value - lower_value)
 
 
 def find_skill_after_tt_delta(current_points: float, delta_tt: float) -> float:
+    """Apply a raw TT-equivalent delta and return the resulting skill points.
+
+    Supports both positive and negative deltas. The inverse is solved against
+    the same cumulative curve used by ``skill_tt_value`` so forward/inverse
+    calculations stay consistent.
+    """
     current_points = float(current_points)
     delta_tt = float(delta_tt)
-    if current_points < X[0]:
-        raise ValueError(f"Current skill points cannot be below {X[0]:g}.")
-    if delta_tt == 0:
+    if not (current_points >= 0.0) or current_points == float("inf"):
+        raise ValueError("Current skill points must be a non-negative finite number.")
+    if current_points > SKILL_TT_CURVE_MAX_POINTS:
+        raise ValueError(
+            f"Verified skill TT curve currently supports up to {SKILL_TT_CURVE_MAX_POINTS:,} points."
+        )
+    if delta_tt != delta_tt or abs(delta_tt) == float("inf"):
+        raise ValueError("TT delta must be a finite number.")
+    if delta_tt == 0.0:
         return current_points
 
-    target_y = skill_tt_value(current_points) + delta_tt
-    min_y = float(Y[0])
-    if target_y < min_y:
+    target_tt = skill_tt_value(current_points) + delta_tt
+    min_tt = _SKILL_TT_CURVE[0]
+    max_tt = _SKILL_TT_CURVE[-1]
+    tolerance = 1e-12
+    if target_tt < min_tt - tolerance:
         raise ValueError(
-            f"Target TT value {target_y:.6f} is below the minimum supported value {min_y:.6f}."
+            f"Target TT value {target_tt:.6f} is below the minimum supported value {min_tt:.6f}."
         )
+    if target_tt > max_tt + tolerance:
+        raise ValueError(
+            f"Target TT value {target_tt:.6f} exceeds the verified 20,000-point curve "
+            f"({max_tt:.2f} PED)."
+        )
+    target_tt = min(max(target_tt, min_tt), max_tt)
 
-    # The extension after 14,750 points is linear, so its inverse is exact and
-    # does not need a finite upper root-search limit.
-    if target_y > SKILL_TT_LINEAR_START_VALUE:
-        extra_tt = target_y - SKILL_TT_LINEAR_START_VALUE
-        return SKILL_TT_LINEAR_START_POINTS + extra_tt / SKILL_TT_LINEAR_SLOPE
-
-    def equation(x):
-        return skill_tt_value(x) - target_y
-
-    return float(brentq(equation, X[0], SKILL_TT_LINEAR_START_POINTS))
-
+    lo = 0.0
+    hi = float(SKILL_TT_CURVE_MAX_POINTS)
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        if skill_tt_value(mid) < target_tt:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
 
 def load_json(path: Path, default):
     for candidate in (path, path.with_suffix(path.suffix + ".bak")):
@@ -413,6 +492,92 @@ def parse_float(value, default=0.0):
         return default
 
 
+def _session_skill_start_points(session: dict, skill_name: str):
+    """Best-effort starting point for a saved session skill.
+
+    Newer sessions store a full start snapshot. Older sessions may still carry
+    per-event before/after points, which are sufficient for migration too.
+    """
+    start_snapshot = session.get("current_skills_at_start", {}) or {}
+    if skill_name in start_snapshot:
+        return parse_float(start_snapshot.get(skill_name), None)
+
+    for event in list(session.get("events", []) or []):
+        if event.get("type") != "skill_gain" or str(event.get("skill", "")) != str(skill_name):
+            continue
+        before = parse_float(event.get("skill_points_before"), None)
+        if before is not None:
+            return before
+    return None
+
+
+def recalculate_saved_session_skill_tt(session: dict) -> bool:
+    """Recalculate an old saved session with the verified raw-TT curve.
+
+    The migration is deliberately all-or-nothing per session. If any gained
+    skill lacks a reliable starting point or lies outside the verified curve,
+    nothing in that session is changed, avoiding a mixture of old and new TT
+    models in one row. Returns True when the session was updated.
+    """
+    if not isinstance(session, dict):
+        return False
+    if session.get("skill_tt_curve_version") == SKILL_TT_CURVE_VERSION:
+        return False
+
+    point_gains = session.get("skill_gains_points", {}) or {}
+    if not isinstance(point_gains, dict):
+        return False
+    if not point_gains:
+        # No skill TT values to migrate, but mark the empty session so startup
+        # does not revisit it forever.
+        session["skill_gains_tt"] = {}
+        session["skill_gain_tt_total"] = 0.0
+        session["skill_tt_curve_version"] = SKILL_TT_CURVE_VERSION
+        return True
+
+    recalculated = {}
+    for skill_name, raw_gain in point_gains.items():
+        point_gain = parse_float(raw_gain, None)
+        start_points = _session_skill_start_points(session, str(skill_name))
+        if point_gain is None or start_points is None:
+            return False
+        end_points = start_points + point_gain
+        try:
+            tt_gain = skill_tt_value(end_points) - skill_tt_value(start_points)
+        except (TypeError, ValueError):
+            return False
+        recalculated[str(skill_name)] = float(tt_gain)
+
+    # Update per-message TT values too when their before/after points are saved.
+    for event in list(session.get("events", []) or []):
+        if event.get("type") != "skill_gain":
+            continue
+        before = parse_float(event.get("skill_points_before"), None)
+        after = parse_float(event.get("skill_points_after"), None)
+        if before is None or after is None:
+            continue
+        try:
+            event["tt_gain"] = float(skill_tt_value(after) - skill_tt_value(before))
+        except (TypeError, ValueError):
+            # Session totals remain valid; leave this legacy event detail alone
+            # when it cannot be represented by the verified range.
+            pass
+
+    session["skill_gains_tt"] = recalculated
+    session["skill_gain_tt_total"] = float(sum(recalculated.values()))
+    session["skill_gain_mode"] = "chat_points_plus_raw_tt_equivalent"
+    session["skill_tt_curve_version"] = SKILL_TT_CURVE_VERSION
+    return True
+
+
+def migrate_saved_session_skill_tt(sessions) -> int:
+    changed = 0
+    for session in list(sessions or []):
+        if recalculate_saved_session_skill_tt(session):
+            changed += 1
+    return changed
+
+
 # Initialize HP metadata only after parse_float() is available.
 SKILL_HP_INCREASES = load_skill_hp_increases()
 
@@ -582,7 +747,8 @@ class MonitorSession:
     skill_gain_events_by_skill: dict = field(default_factory=dict)
     skill_gain_tt_total: float = 0.0
     skill_gain_points_total: float = 0.0
-    skill_gain_mode: str = "chat_points_plus_tt_equivalent"
+    skill_gain_mode: str = "chat_points_plus_raw_tt_equivalent"
+    skill_tt_curve_version: str = SKILL_TT_CURVE_VERSION
     total_profession_gain_by_profession: dict = field(default_factory=dict)
     normal_hits: int = 0
     critical_hits: int = 0
@@ -714,9 +880,22 @@ class SkillTrackerApp:
         self.current_skills = load_current_skills()
         self.state = load_json(TRACKER_STATE_FILE, {})
         self.sessions = load_json(SESSIONS_FILE, [])
+        if not isinstance(self.sessions, list):
+            self.sessions = []
         self.analysis_sessions = load_json(ANALYSIS_SESSIONS_FILE, [])
         if not isinstance(self.analysis_sessions, list):
             self.analysis_sessions = []
+
+        # Historical sessions contain TT-equivalent totals calculated with the
+        # old post-extraction/approximate curve. Rebuild them from saved raw
+        # point gains when the stored start snapshot makes that exact.
+        migrated_sessions = migrate_saved_session_skill_tt(self.sessions)
+        migrated_analysis_sessions = migrate_saved_session_skill_tt(self.analysis_sessions)
+        if migrated_sessions:
+            save_json(SESSIONS_FILE, self.sessions)
+        if migrated_analysis_sessions:
+            save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
+
         self.hunting_setups = load_json(HUNTING_SETUPS_FILE, {})
         if not isinstance(self.hunting_setups, dict):
             self.hunting_setups = {}
