@@ -1067,6 +1067,7 @@ class SkillTrackerApp:
         self.root.after(500, self.monitor_tick)
 
     def create_ui(self):
+        self.configure_ui_styles()
         notebook = ttk.Notebook(self.root)
         self.notebook = notebook
         notebook.pack(fill="both", expand=True)
@@ -1094,6 +1095,7 @@ class SkillTrackerApp:
         self.create_mob_analysis_tab()
         self.create_session_details_tab()
         self.create_profession_tab()
+        self.style_tracker_widgets(self.root)
         notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
 
     def is_tab_active(self, tab):
@@ -1177,10 +1179,10 @@ class SkillTrackerApp:
             tree.move(item_id, "", index)
 
     def create_profession_tab(self):
-        top_frame = ttk.Frame(self.profession_tab, padding=10)
-        top_frame.pack(fill="x")
+        top_frame = ttk.LabelFrame(self.profession_tab, text="Profession", padding=10)
+        top_frame.pack(fill="x", padx=10, pady=10)
 
-        ttk.Label(top_frame, text="Profession:").pack(side="left")
+        ttk.Label(top_frame, text="Profession:").grid(row=0, column=0, sticky="w")
         self.profession_combo = ttk.Combobox(
             top_frame,
             textvariable=self.profession_var,
@@ -1188,19 +1190,22 @@ class SkillTrackerApp:
             width=45,
             state="readonly",
         )
-        self.profession_combo.pack(side="left", padx=8)
+        self.profession_combo.grid(row=0, column=1, sticky="ew", padx=8)
         self.profession_var.set("Animal Looter" if "Animal Looter" in PROFESSIONS else list(PROFESSIONS.keys())[0])
         self.profession_combo.bind("<<ComboboxSelected>>", lambda e: self.load_profession())
 
-        ttk.Button(top_frame, text="Calculate", command=self.calculate_profession_gain).pack(side="left", padx=5)
-        ttk.Button(top_frame, text="Save Current Skills", command=self.save_current_skills_from_table).pack(side="left", padx=5)
-        ttk.Button(top_frame, text="Reload Saved Skills", command=self.reload_saved_skills).pack(side="left", padx=5)
+        ttk.Button(top_frame, text="Calculate", command=self.calculate_profession_gain).grid(row=0, column=2, padx=5)
+        ttk.Label(top_frame, textvariable=self.total_gain_var, style="Tracker.Emphasis.TLabel").grid(row=0, column=3, sticky="e", padx=10)
+        actions = ttk.Frame(top_frame)
+        actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="Save Current Skills", command=self.save_current_skills_from_table).pack(side="left", padx=(0, 5))
+        ttk.Button(actions, text="Reload Saved Skills", command=self.reload_saved_skills).pack(side="left", padx=5)
         ttk.Checkbutton(
-            top_frame,
+            actions,
             text="After calculate, set current skills = new x2",
             variable=self.auto_update_current_skills_var,
         ).pack(side="left", padx=10)
-        ttk.Label(top_frame, textvariable=self.total_gain_var, font=("Arial", 12, "bold")).pack(side="right", padx=10)
+        top_frame.columnconfigure(1, weight=1)
 
         columns = ("skill", "weight", "current", "delta", "new", "skill_gain", "profession_gain")
         self.skill_tree = ttk.Treeview(self.profession_tab, columns=columns, show="headings", height=24)
@@ -1212,22 +1217,23 @@ class SkillTrackerApp:
         for col in columns:
             self.skill_tree.heading(col, text=headings[col])
             self.skill_tree.column(col, width=widths[col], anchor="center" if col != "skill" else "w")
-        self.skill_tree.pack(fill="both", expand=True, padx=10, pady=10)
+        table_holder = self.pack_table(self.skill_tree, self.profession_tab, padx=10, pady=(0, 6))
 
         input_frame = ttk.LabelFrame(self.profession_tab, text="Edit selected skill", padding=10)
-        input_frame.pack(fill="x", padx=10, pady=10)
+        input_frame.pack(side="bottom", fill="x", padx=10, pady=10)
+        # Reserve the editor before the expanding table at smaller heights.
+        table_holder.pack_configure(after=input_frame)
         ttk.Label(input_frame, text="Selected skill:").grid(row=0, column=0, sticky="w")
-        ttk.Label(input_frame, textvariable=self.selected_skill_var, width=28).grid(row=0, column=1, sticky="w")
-        ttk.Label(input_frame, text="Current x1:").grid(row=0, column=2, sticky="w", padx=(20, 4))
-        ttk.Entry(input_frame, textvariable=self.current_var, width=15).grid(row=0, column=3, sticky="w")
-        ttk.Label(input_frame, text="TT delta:").grid(row=0, column=4, sticky="w", padx=(20, 4))
-        ttk.Entry(input_frame, textvariable=self.delta_var, width=15).grid(row=0, column=5, sticky="w")
-        ttk.Button(input_frame, text="Apply to selected skill", command=self.apply_selected_skill).grid(row=0, column=6, padx=20)
-        ttk.Button(input_frame, text="Save selected current skill", command=self.save_selected_current_skill).grid(row=0, column=7, padx=5)
+        ttk.Label(input_frame, textvariable=self.selected_skill_var).grid(row=0, column=1, columnspan=5, sticky="w", padx=8)
+        ttk.Label(input_frame, text="Current x1:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(input_frame, textvariable=self.current_var, width=14).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(input_frame, text="TT delta:").grid(row=1, column=2, sticky="w", padx=(12, 4), pady=(8, 0))
+        ttk.Entry(input_frame, textvariable=self.delta_var, width=14).grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+        ttk.Button(input_frame, text="Apply to selected skill", command=self.apply_selected_skill).grid(row=1, column=4, padx=8, pady=(8, 0))
+        ttk.Button(input_frame, text="Save selected current skill", command=self.save_selected_current_skill).grid(row=1, column=5, padx=5, pady=(8, 0))
         self.skill_tree.bind("<<TreeviewSelect>>", self.on_skill_selected)
 
     def create_monitor_tab(self):
-        self.configure_monitor_styles()
         top = ttk.Frame(self.monitor_tab, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="chat.log:").grid(row=0, column=0, sticky="w")
@@ -1258,7 +1264,7 @@ class SkillTrackerApp:
 
         summary = ttk.LabelFrame(self.monitor_tab, text="Current session", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
-        self.add_monitor_wrapped_label(summary, self.session_summary_var)
+        self.add_wrapped_label(summary, self.session_summary_var)
         metrics = ttk.Frame(summary)
         metrics.pack(fill="x", pady=(8, 6))
         for index, (key, title) in enumerate((
@@ -1271,10 +1277,10 @@ class SkillTrackerApp:
             card = ttk.Frame(metrics, padding=(10, 6))
             card.grid(row=row, column=column, sticky="nsew")
             metrics.columnconfigure(column, weight=1, uniform="monitor_metrics")
-            ttk.Label(card, text=title, style="Monitor.Caption.TLabel", wraplength=220).pack(anchor="w")
-            ttk.Label(card, textvariable=self.monitor_metric_vars[key], style="Monitor.Value.TLabel").pack(anchor="w", pady=(3, 0))
-        self.add_monitor_wrapped_label(summary, self.monitor_combat_var)
-        self.add_monitor_wrapped_label(summary, self.monitor_skills_var)
+            ttk.Label(card, text=title, style="Tracker.Caption.TLabel", wraplength=220).pack(anchor="w")
+            ttk.Label(card, textvariable=self.monitor_metric_vars[key], style="Tracker.Value.TLabel").pack(anchor="w", pady=(3, 0))
+        self.add_wrapped_label(summary, self.monitor_combat_var)
+        self.add_wrapped_label(summary, self.monitor_skills_var)
 
         projection = ttk.LabelFrame(self.monitor_tab, text="Profession projection", padding=10)
         projection.pack(fill="x", padx=10, pady=(0, 6))
@@ -1292,7 +1298,7 @@ class SkillTrackerApp:
         projection.columnconfigure(1, weight=1)
         projection_result = ttk.Frame(projection)
         projection_result.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        self.add_monitor_wrapped_label(projection_result, self.monitor_projection_var)
+        self.add_wrapped_label(projection_result, self.monitor_projection_var)
 
         body = ttk.Panedwindow(self.monitor_tab, orient="vertical")
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1343,42 +1349,129 @@ class SkillTrackerApp:
         event_x.grid(row=1, column=0, sticky="ew")
         event_frame.columnconfigure(0, weight=1)
         event_frame.rowconfigure(0, weight=1)
-        self.style_monitor_widgets(self.monitor_tab)
-
-    def configure_monitor_styles(self):
-        """Scope the visual refresh to Live Monitor; other tabs keep their theme."""
+    def configure_ui_styles(self):
+        """One theme for all tabs, dynamically created controls and dialogs."""
         style = ttk.Style(self.root)
-        font = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
-        self.monitor_font = (font, 9)
-        background, surface, ink = "#f3f5f7", "#ffffff", "#192b3a"
-        style.configure("Monitor.TFrame", background=background)
-        style.configure("Monitor.Surface.TFrame", background=surface)
-        style.configure("Monitor.TLabelframe", background=surface, borderwidth=1, relief="solid")
-        style.configure("Monitor.TLabelframe.Label", background=surface, foreground=ink, font=(font, 10, "bold"))
-        style.configure("Monitor.TLabel", background=background, foreground=ink, font=self.monitor_font)
-        style.configure("Monitor.Surface.TLabel", background=surface, foreground=ink, font=self.monitor_font)
-        style.configure("Monitor.Caption.TLabel", background=surface, foreground="#536779", font=(font, 8))
-        style.configure("Monitor.Value.TLabel", background=surface, foreground="#126579", font=(font, 14, "bold"))
-        style.configure("Monitor.TButton", font=self.monitor_font, padding=(8, 4))
-        style.configure("Monitor.Treeview", font=self.monitor_font, rowheight=24, background=surface, fieldbackground=surface)
-        style.configure("Monitor.Treeview.Heading", font=(font, 9, "bold"), padding=(4, 5))
+        # Native themes can ignore custom backgrounds on Windows. Clam makes
+        # the same palette and controls available on every supported platform.
+        style.theme_use("clam")
+        self.ui_font_family = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+        self.ui_font = (self.ui_font_family, 9)
+        self.ui_log_font = ("Consolas" if os.name == "nt" else "DejaVu Sans Mono", 9)
+        self.ui_colors = {"background": "#f3f5f7", "surface": "#ffffff", "ink": "#192b3a", "muted": "#536779", "accent": "#126579", "border": "#d7dce2"}
+        background, surface, ink, accent, border = (self.ui_colors[key] for key in ("background", "surface", "ink", "accent", "border"))
+        font = self.ui_font_family
+        self.root.configure(background=background)
+        self.root.option_add("*Font", self.ui_font)
+        self.root.option_add("*TCombobox*Listbox.font", self.ui_font)
+        style.configure(".", font=self.ui_font, background=background, foreground=ink)
+        style.configure("TFrame", background=background)
+        style.configure("Tracker.Surface.TFrame", background=surface)
+        style.configure("TLabelframe", background=surface, bordercolor=border, borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=surface, foreground=ink, font=(font, 10, "bold"))
+        style.configure("TLabel", background=background, foreground=ink, font=self.ui_font)
+        style.configure("Tracker.Surface.TLabel", background=surface, foreground=ink, font=self.ui_font)
+        style.configure("Tracker.Caption.TLabel", background=surface, foreground=self.ui_colors["muted"], font=(font, 8))
+        style.configure("Tracker.Value.TLabel", background=surface, foreground=accent, font=(font, 14, "bold"))
+        style.configure("Tracker.Emphasis.TLabel", background=surface, foreground=accent, font=(font, 11, "bold"))
+        style.configure("TButton", font=self.ui_font, padding=(8, 4), background=surface, foreground=ink, bordercolor=border, focusthickness=1, focuscolor=accent)
+        style.map("TButton", background=[("disabled", background), ("pressed", "#dcebed"), ("active", "#e9f1f3")], foreground=[("disabled", "#8793a0")])
+        for widget_style in ("TEntry", "TCombobox"):
+            style.configure(widget_style, font=self.ui_font, padding=4, fieldbackground=surface, foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border)
+            style.map(widget_style, fieldbackground=[("disabled", background), ("readonly", surface)], bordercolor=[("focus", accent)])
+        for widget_style in ("TCheckbutton", "Tracker.Surface.TCheckbutton"):
+            widget_background = surface if "Surface" in widget_style else background
+            style.configure(widget_style, background=widget_background, foreground=ink, font=self.ui_font)
+            style.map(widget_style, background=[("active", widget_background)], foreground=[("disabled", "#8793a0")])
+        style.configure("Treeview", font=self.ui_font, rowheight=26, background=surface, fieldbackground=surface, foreground=ink, bordercolor=border)
+        style.configure("Treeview.Heading", font=(font, 9, "bold"), padding=(6, 5), background="#eaf0f3", foreground=ink, bordercolor=border)
+        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", surface)])
+        style.configure("TNotebook", background=background, borderwidth=0)
+        style.configure("TNotebook.Tab", font=self.ui_font, padding=(12, 7), background=background, foreground=self.ui_colors["muted"])
+        style.map("TNotebook.Tab", background=[("selected", surface), ("active", "#e9f1f3")], foreground=[("selected", accent)])
+        for widget_style in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(widget_style, background="#dce3e8", troughcolor=background, bordercolor=background, arrowcolor=self.ui_colors["muted"])
 
-    def style_monitor_widgets(self, parent, surface=False):
-        for widget in (parent, *parent.winfo_children()):
-            widget_class = widget.winfo_class()
-            on_surface = surface or widget_class == "TLabelframe"
-            styles = {
-                "TFrame": "Monitor.Surface.TFrame" if on_surface else "Monitor.TFrame",
-                "TLabel": "Monitor.Surface.TLabel" if on_surface else "Monitor.TLabel",
-                "TLabelframe": "Monitor.TLabelframe", "TButton": "Monitor.TButton",
-                "Treeview": "Monitor.Treeview",
-            }
-            if widget_class in styles and not widget.cget("style"):
-                widget.configure(style=styles[widget_class])
-            if widget is not parent:
-                self.style_monitor_widgets(widget, on_surface)
+    def style_tracker_widgets(self, parent, surface=False):
+        widget = parent
+        widget_class = widget.winfo_class()
+        on_surface = surface or widget_class == "TLabelframe"
+        styles = {
+            "TFrame": "Tracker.Surface.TFrame" if on_surface else "TFrame",
+            "TLabel": "Tracker.Surface.TLabel" if on_surface else "TLabel",
+            "TCheckbutton": "Tracker.Surface.TCheckbutton" if on_surface else "TCheckbutton",
+        }
+        if widget_class in styles and not widget.cget("style"):
+            widget.configure(style=styles[widget_class])
+        if widget_class in ("Tk", "Toplevel"):
+            widget.configure(background=self.ui_colors["background"])
+        elif widget_class == "Text":
+            widget.configure(font=self.ui_log_font, background=self.ui_colors["surface"], foreground=self.ui_colors["ink"], selectbackground=self.ui_colors["accent"], selectforeground="white", highlightbackground=self.ui_colors["border"], highlightthickness=1, borderwidth=0, padx=6, pady=4)
+        elif widget_class == "Canvas":
+            # Plot canvases already request white; scroll containers follow
+            # their enclosing card instead of using Tk's default grey.
+            if widget.winfo_rgb(widget.cget("background")) != widget.winfo_rgb(self.ui_colors["surface"]):
+                widget.configure(background=self.ui_colors["surface" if on_surface else "background"])
+        elif widget_class == "Treeview":
+            for column in widget["columns"]:
+                widget.column(column, minwidth=int(widget.column(column, "width")))
+        elif widget_class == "TLabel" and widget.winfo_manager() == "pack":
+            if widget.pack_info().get("side") == "top" and not widget.bind("<Configure>"):
+                widget.pack_configure(fill="x")
+                widget.configure(wraplength=600)
+                widget.bind("<Configure>", lambda event, label=widget: label.configure(wraplength=max(1, event.width)))
+        for child in widget.winfo_children():
+            self.style_tracker_widgets(child, on_surface)
 
-    def add_monitor_wrapped_label(self, parent, variable):
+    def pack_table(self, tree, parent, *, padx=0, pady=0):
+        """Mount a table with the same scrolling and spacing in every tab."""
+        holder = ttk.Frame(parent)
+        holder.pack(fill="both", expand=True, padx=padx, pady=pady)
+        tree.grid(in_=holder, row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        horizontal = ttk.Scrollbar(holder, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        # The table retains its original parent for existing callbacks. Keep it
+        # above the sibling holder when grid manages it inside that holder.
+        tree.lift()
+        return holder
+
+    def scrollable_tab_content(self, tab):
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        canvas.tracker_scroll_container = True
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        if not getattr(self, "tab_scroll_bindings_installed", False):
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.root.bind(sequence, self.scroll_tab_content, add="+")
+            self.tab_scroll_bindings_installed = True
+        return content
+
+    def scroll_tab_content(self, event):
+        widget = event.widget
+        # Tables, logs and dropdowns keep their own wheel behavior.
+        if widget.winfo_class() in ("Treeview", "Text", "TCombobox"):
+            return
+        while widget is not None:
+            if getattr(widget, "tracker_scroll_container", False):
+                if widget.yview() != (0.0, 1.0):
+                    direction = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+                    widget.yview_scroll(direction * 3, "units")
+                    return "break"
+                return
+            widget = widget.master
+
+    def add_wrapped_label(self, parent, variable):
         label = ttk.Label(parent, textvariable=variable, justify="left", anchor="w")
         label.pack(fill="x", anchor="w")
         label.bind("<Configure>", lambda event: label.configure(wraplength=max(1, event.width)))
@@ -1407,11 +1500,11 @@ class SkillTrackerApp:
 
         summary = ttk.LabelFrame(self.loot_tab, text="Loot summary", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
-        self.add_monitor_wrapped_label(summary, self.loot_summary_var)
+        self.add_wrapped_label(summary, self.loot_summary_var)
 
         item_summary_frame = ttk.LabelFrame(self.loot_tab, text="Looted items grouped by name", padding=6)
         item_summary_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.add_monitor_wrapped_label(item_summary_frame, self.loot_markup_status_var)
+        self.add_wrapped_label(item_summary_frame, self.loot_markup_status_var)
         item_columns = ("item", "quantity", "value", "loot_percent", "markup", "after_mu")
         self.loot_item_summary_tree = ttk.Treeview(
             item_summary_frame,
@@ -1439,7 +1532,7 @@ class SkillTrackerApp:
 
         selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
         selection.pack(fill="x", padx=10, pady=(0, 6))
-        self.add_monitor_wrapped_label(selection, self.loot_selection_var)
+        self.add_wrapped_label(selection, self.loot_selection_var)
 
         body = ttk.Panedwindow(self.loot_tab, orient="horizontal")
         body.pack(fill="both", expand=True, padx=10, pady=6)
@@ -1888,7 +1981,7 @@ class SkillTrackerApp:
         table_frame = ttk.LabelFrame(window, text="Items", padding=6)
         table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         columns = ("item", "quantity", "value", "event_percent", "markup", "after_mu")
-        detail_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        detail_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
         setup = [
             ("item", "Item", 300),
             ("quantity", "Quantity", 90),
@@ -1900,10 +1993,7 @@ class SkillTrackerApp:
         for column, title, width in setup:
             detail_tree.heading(column, text=title)
             detail_tree.column(column, width=width, anchor="w" if column == "item" else "center")
-        detail_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=detail_tree.yview)
-        detail_tree.configure(yscrollcommand=detail_scroll.set)
-        detail_tree.pack(side="left", fill="both", expand=True)
-        detail_scroll.pack(side="right", fill="y")
+        self.pack_table(detail_tree, table_frame)
 
         for item_name, row in item_details.items():
             quantity = int(row.get("quantity", 0) or 0)
@@ -1941,6 +2031,7 @@ class SkillTrackerApp:
         else:
             message_text.insert("end", "Original messages are unavailable for this older saved event.\n")
         message_text.configure(state="disabled")
+        self.style_tracker_widgets(window)
 
     def skill_gain_message_details(self, session, skill_name: str):
         """Build chronological per-message skill details for current and old sessions."""
@@ -2066,6 +2157,7 @@ class SkillTrackerApp:
 
         if not details:
             detail_tree.insert("", "end", values=("", "", "", "", "", "", "No saved gain messages for this skill."))
+        self.style_tracker_widgets(window)
 
     def reload_market_data_if_changed(self):
         """Reload market_data.json after the clipboard collector updates it."""
@@ -2274,6 +2366,7 @@ class SkillTrackerApp:
 
         if not drops:
             detail_tree.insert("", "end", values=("", "", "", "", "", "", "", "", "", "No saved drops found for this item."))
+        self.style_tracker_widgets(window)
 
     def begin_loot_markup_edit(self, event):
         tree = self.loot_item_summary_tree
@@ -2366,6 +2459,7 @@ class SkillTrackerApp:
                 self.loot_items_scrollable,
                 text=f"{item} ({quantity})",
                 variable=self.loot_item_vars[item],
+                style="Tracker.Surface.TCheckbutton",
                 command=self.refresh_loot_tab,
             ).pack(anchor="w")
         self.loot_item_check_signature = signature
@@ -2835,7 +2929,7 @@ class SkillTrackerApp:
         text_color = "#111827"
         muted_color = "#475467"
 
-        canvas.create_text(width / 2, 14, text=title, fill=text_color, font=("Arial", 11, "bold"))
+        canvas.create_text(width / 2, 14, text=title, fill=text_color, font=(self.ui_font_family, 11, "bold"))
         canvas.create_line(left, bottom, right, bottom, fill=axis_color)
         canvas.create_line(left, top, left, bottom, fill=axis_color)
 
@@ -2847,7 +2941,7 @@ class SkillTrackerApp:
             y = bottom - (bottom - top) * frac
             y_value = min_y + y_range * frac
             canvas.create_line(left, y, right, y, fill=grid_color)
-            canvas.create_text(left - 6, y, anchor="e", text=self._format_axis_value(y_value, y_suffix), fill=muted_color, font=("Arial", 8))
+            canvas.create_text(left - 6, y, anchor="e", text=self._format_axis_value(y_value, y_suffix), fill=muted_color, font=(self.ui_font_family, 8))
 
         include_date = x_is_time and self.chart_range_crosses_date(time_origin, min_x, max_x)
         tick_count = 4 if include_date and right - left < 800 else 6
@@ -2859,10 +2953,10 @@ class SkillTrackerApp:
             label = self._time_axis_label(x_value, time_origin=time_origin, include_date=include_date) if x_is_time else self._format_axis_value(x_value)
             # Long dated labels stay within the canvas at the two edge ticks.
             anchor = "nw" if i == 0 else "ne" if i == tick_count - 1 else "n"
-            canvas.create_text(x, bottom + 14, anchor=anchor, text=label, fill=muted_color, font=("Arial", 8))
+            canvas.create_text(x, bottom + 14, anchor=anchor, text=label, fill=muted_color, font=(self.ui_font_family, 8))
 
-        canvas.create_text((left + right) / 2, height - 8, text=x_label, fill=text_color, font=("Arial", 9))
-        canvas.create_text(14, (top + bottom) / 2, text=y_label, fill=text_color, font=("Arial", 9), angle=90)
+        canvas.create_text((left + right) / 2, height - 8, text=x_label, fill=text_color, font=(self.ui_font_family, 9))
+        canvas.create_text(14, (top + bottom) / 2, text=y_label, fill=text_color, font=(self.ui_font_family, 9), angle=90)
         return width, height, left, top, right, bottom
 
     def _project_point(self, x, y, left, top, right, bottom, min_x, max_x, min_y, max_y):
@@ -2937,7 +3031,7 @@ class SkillTrackerApp:
                 canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=2)
                 label_x = max(left + 36, min(right - 6, x2 - 6))
                 label_y = max(top + 10, min(bottom - 10, y2 - 8))
-                canvas.create_text(label_x, label_y, anchor="e", text=str(reference_label), fill="#15803d", font=("Arial", 9, "bold"))
+                canvas.create_text(label_x, label_y, anchor="e", text=str(reference_label), fill="#15803d", font=(self.ui_font_family, 9, "bold"))
         coords = []
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
@@ -3033,7 +3127,7 @@ class SkillTrackerApp:
                 canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=width)
                 label = "1.0x" if multiplier == 1.0 else f"x{multiplier:g}"
                 label_y = max(top + 10, min(bottom - 10, y2 - 7))
-                canvas.create_text(right - 6, label_y, anchor="e", text=label, fill="#15803d", font=("Arial", 9, "bold"))
+                canvas.create_text(right - 6, label_y, anchor="e", text=label, fill="#15803d", font=(self.ui_font_family, 9, "bold"))
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
             canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#2563eb", outline="")
@@ -3062,7 +3156,7 @@ class SkillTrackerApp:
                 break
             text = str(name)[:24]
             canvas.create_line(box_left + 8, y, box_left + 22, y, fill=color, width=3)
-            canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=("Arial", 9, "bold"))
+            canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=(self.ui_font_family, 9, "bold"))
             y += line_height
 
     def render_multi_line_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, time_origin=None):
@@ -3199,7 +3293,8 @@ class SkillTrackerApp:
         self._draw_chart_legend(canvas, legend_entries, right=right, top=top, bottom=bottom)
 
     def create_hunting_tab(self):
-        profiles = ttk.LabelFrame(self.hunting_tab, text="Saved hunting setups", padding=10)
+        content = self.scrollable_tab_content(self.hunting_tab)
+        profiles = ttk.LabelFrame(content, text="Saved hunting setups", padding=10)
         profiles.pack(fill="x", padx=12, pady=(12, 0))
 
         ttk.Label(profiles, text="Setup name:").grid(row=0, column=0, sticky="w")
@@ -3217,8 +3312,8 @@ class SkillTrackerApp:
         ttk.Label(profiles, textvariable=self.hunting_setup_status_var).grid(row=1, column=1, columnspan=4, sticky="w", padx=8, pady=(5, 0))
         profiles.columnconfigure(1, weight=1)
 
-        frame = ttk.Frame(self.hunting_tab, padding=12)
-        frame.pack(fill="x")
+        frame = ttk.LabelFrame(content, text="Hunting equipment and target", padding=10)
+        frame.pack(fill="x", padx=12, pady=10)
 
         ttk.Checkbutton(frame, text="Count hunting / PED cycled during sync", variable=self.count_hunting_var, command=self.on_hunting_changed).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
@@ -3229,12 +3324,12 @@ class SkillTrackerApp:
         ttk.Button(frame, text="Clear", command=self.clear_weapon_filter).grid(row=1, column=2, sticky="w", padx=4)
 
         ttk.Label(frame, text="Weapon:").grid(row=2, column=0, sticky="w")
-        self.weapon_combo = ttk.Combobox(frame, textvariable=self.weapon_var, values=self.all_weapon_names, width=70)
+        self.weapon_combo = ttk.Combobox(frame, textvariable=self.weapon_var, values=self.all_weapon_names, width=45)
         self.weapon_combo.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
         self.weapon_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.weapon_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
         self.weapon_combo.bind("<KeyRelease>", lambda e: self.filter_weapon_values(self.weapon_var.get()))
-        ttk.Label(frame, textvariable=self.weapon_cost_var).grid(row=2, column=2, sticky="w")
+        ttk.Label(frame, textvariable=self.weapon_cost_var, style="Tracker.Emphasis.TLabel").grid(row=12, column=0, columnspan=3, sticky="w", pady=(10, 4))
 
         ttk.Label(frame, text="Amplifier search:").grid(row=3, column=0, sticky="w")
         amplifier_search = ttk.Entry(frame, textvariable=self.amplifier_filter_var, width=35)
@@ -3243,7 +3338,7 @@ class SkillTrackerApp:
         ttk.Button(frame, text="Clear", command=self.clear_amplifier_filter).grid(row=3, column=2, sticky="w", padx=4)
 
         ttk.Label(frame, text="Amplifier:").grid(row=4, column=0, sticky="w")
-        self.amplifier_combo = ttk.Combobox(frame, textvariable=self.amplifier_var, values=[""] + self.all_amplifier_names, width=70)
+        self.amplifier_combo = ttk.Combobox(frame, textvariable=self.amplifier_var, values=[""] + self.all_amplifier_names, width=45)
         self.amplifier_combo.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
         self.amplifier_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.amplifier_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
@@ -3259,7 +3354,7 @@ class SkillTrackerApp:
         for index, attachment_var in enumerate(self.attachment_vars, start=1):
             row = 5 + index
             ttk.Label(frame, text=f"Attachment {index}:").grid(row=row, column=0, sticky="w")
-            combo = ttk.Combobox(frame, textvariable=attachment_var, values=[""] + self.all_attachment_names, width=70)
+            combo = ttk.Combobox(frame, textvariable=attachment_var, values=[""] + self.all_attachment_names, width=45)
             combo.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
             combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
             combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
@@ -3273,24 +3368,26 @@ class SkillTrackerApp:
         ttk.Button(frame, text="Clear", command=self.clear_mob_filter).grid(row=9, column=2, sticky="w", padx=4)
 
         ttk.Label(frame, text="Mob:").grid(row=10, column=0, sticky="w")
-        self.mob_combo = ttk.Combobox(frame, textvariable=self.mob_var, values=self.all_mob_names, width=70)
+        self.mob_combo = ttk.Combobox(frame, textvariable=self.mob_var, values=self.all_mob_names, width=45)
         self.mob_combo.grid(row=10, column=1, sticky="ew", padx=8, pady=4)
         self.mob_combo.bind("<<ComboboxSelected>>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<FocusOut>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<KeyRelease>", lambda e: self.filter_mob_values(self.mob_var.get()))
 
         ttk.Label(frame, text="Maturity:").grid(row=11, column=0, sticky="w")
-        self.maturity_combo = ttk.Combobox(frame, textvariable=self.maturity_var, values=[], width=70)
+        self.maturity_combo = ttk.Combobox(frame, textvariable=self.maturity_var, values=[], width=45)
         self.maturity_combo.grid(row=11, column=1, sticky="ew", padx=8, pady=4)
         self.maturity_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.maturity_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
-        ttk.Label(frame, textvariable=self.mob_info_var).grid(row=11, column=2, sticky="w")
+        ttk.Label(frame, textvariable=self.mob_info_var).grid(row=13, column=0, columnspan=3, sticky="w", pady=4)
 
-        ttk.Label(frame, text="The current selection is saved automatically. Use Saved hunting setups above for named profiles.").grid(row=12, column=1, sticky="w", padx=8, pady=12)
+        hint = ttk.Label(frame, text="The current selection is saved automatically. Use Saved hunting setups above for named profiles.", wraplength=600)
+        hint.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        hint.bind("<Configure>", lambda event: hint.configure(wraplength=max(1, event.width)))
         frame.columnconfigure(1, weight=1)
         self.update_maturity_values()
 
-        help_box = ttk.LabelFrame(self.hunting_tab, text="Counting rule", padding=10)
+        help_box = ttk.LabelFrame(content, text="Counting rule", padding=10)
         help_box.pack(fill="x", padx=12, pady=10)
         ttk.Label(
             help_box,
@@ -3306,13 +3403,13 @@ class SkillTrackerApp:
     def create_sessions_tab(self):
         top = ttk.Frame(self.sessions_tab, padding=10)
         top.pack(fill="x")
-        ttk.Button(top, text="Refresh", command=self.refresh_sessions_table).pack(side="left")
-        ttk.Button(top, text="Load Current Skills from Selected Session", command=self.load_current_skills_from_selected_session).pack(side="left", padx=6)
-        ttk.Button(top, text="Add Selected to Mob Analysis", command=self.add_selected_sessions_to_analysis).pack(side="left", padx=6)
-        ttk.Button(top, text="Remove Selected from Mob Analysis", command=self.remove_selected_sessions_from_analysis).pack(side="left", padx=6)
-        ttk.Button(top, text="Delete Selected Sessions", command=self.delete_selected_sessions).pack(side="left", padx=6)
-        ttk.Button(top, text="Clear Sessions", command=self.clear_sessions).pack(side="left", padx=6)
-        ttk.Label(top, text="Double-click PED cycled or Notes to edit.").pack(side="right", padx=8)
+        for row, actions in enumerate((
+            (("Refresh", self.refresh_sessions_table), ("Load Current Skills from Selected Session", self.load_current_skills_from_selected_session), ("Add Selected to Mob Analysis", self.add_selected_sessions_to_analysis)),
+            (("Remove Selected from Mob Analysis", self.remove_selected_sessions_from_analysis), ("Delete Selected Sessions", self.delete_selected_sessions), ("Clear Sessions", self.clear_sessions)),
+        )):
+            for column, (text, command) in enumerate(actions):
+                ttk.Button(top, text=text, command=command).grid(row=row, column=column, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(top, text="Double-click PED cycled or Notes to edit.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         columns = (
             "started", "ended", "weapon", "mob", "notes", "attacks", "defended", "misses", "damage", "ped",
@@ -3347,10 +3444,7 @@ class SkillTrackerApp:
             self.sessions_tree.heading(col, text=title)
             self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes", "skills") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
-        sessions_xscroll = ttk.Scrollbar(self.sessions_tab, orient="horizontal", command=self.sessions_tree.xview)
-        self.sessions_tree.configure(xscrollcommand=sessions_xscroll.set)
-        self.sessions_tree.pack(fill="both", expand=True, padx=10, pady=(10, 0))
-        sessions_xscroll.pack(fill="x", padx=10, pady=(0, 10))
+        self.pack_table(self.sessions_tree, self.sessions_tab, padx=10, pady=(0, 10))
         self.sessions_tree.tag_configure("analysis_valid", background="#dff3df")
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
         self.sessions_tree.bind("<Double-1>", self.on_sessions_tree_double_click)
@@ -3574,23 +3668,30 @@ class SkillTrackerApp:
         inputs = ttk.LabelFrame(self.mob_analysis_tab, text="Current character values", padding=10)
         inputs.pack(fill="x", padx=10, pady=10)
 
-        ttk.Label(inputs, text="Efficiency (0-100):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(inputs, textvariable=self.analysis_efficiency_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 18))
-        for column, looter_type in enumerate(("Animal", "Robot", "Mutant"), start=2):
-            ttk.Label(inputs, text=f"{looter_type} Looter (0-100):").grid(row=0, column=column * 2 - 2, sticky="w")
-            ttk.Entry(inputs, textvariable=self.analysis_looter_vars[looter_type], width=10).grid(
-                row=0, column=column * 2 - 1, sticky="w", padx=(6, 18)
-            )
-        ttk.Button(inputs, text="Calculate", command=self.refresh_mob_analysis).grid(row=0, column=8, padx=6)
-        ttk.Button(inputs, text="Use current skill levels", command=self.use_current_skill_looters).grid(row=0, column=9, padx=6)
-        ttk.Button(inputs, text="Reload valid sessions", command=self.reload_analysis_sessions).grid(row=0, column=10, padx=6)
-        ttk.Label(
+        fields = [("Efficiency (0-100):", self.analysis_efficiency_var)] + [
+            (f"{looter_type} Looter (0-100):", self.analysis_looter_vars[looter_type])
+            for looter_type in ("Animal", "Robot", "Mutant")
+        ]
+        for index, (label, variable) in enumerate(fields):
+            row, pair = divmod(index, 2)
+            ttk.Label(inputs, text=label).grid(row=row, column=pair * 2, sticky="w", pady=4)
+            ttk.Entry(inputs, textvariable=variable, width=10).grid(row=row, column=pair * 2 + 1, sticky="w", padx=(8, 24), pady=4)
+        actions = ttk.Frame(inputs)
+        actions.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(actions, text="Calculate", command=self.refresh_mob_analysis).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Use current skill levels", command=self.use_current_skill_looters).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Reload valid sessions", command=self.reload_analysis_sessions).pack(side="left")
+        formula_hint = ttk.Label(
             inputs,
             text=(
                 "Expected TT return = 86% + 7 × Efficiency / 100 + 7 × matching Looter / 100. "
                 "Expected return after MU = expected TT return × historical loot MU multiplier."
             ),
-        ).grid(row=1, column=0, columnspan=11, sticky="w", pady=(8, 0))
+            justify="left", wraplength=600,
+        )
+        formula_hint.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        formula_hint.bind("<Configure>", lambda event: formula_hint.configure(wraplength=max(1, event.width)))
+        inputs.columnconfigure(3, weight=1)
 
         status = ttk.LabelFrame(self.mob_analysis_tab, text="Analysis status", padding=8)
         status.pack(fill="x", padx=10, pady=(0, 8))
@@ -3614,12 +3715,7 @@ class SkillTrackerApp:
             self.mob_analysis_tree.heading(column, text=title)
             self.mob_analysis_tree.column(column, width=width, anchor="w" if column == "mob" else "center")
         self.make_tree_sortable(self.mob_analysis_tree, {column: title for column, title, _ in setup})
-        xscroll = ttk.Scrollbar(self.mob_analysis_tab, orient="horizontal", command=self.mob_analysis_tree.xview)
-        yscroll = ttk.Scrollbar(self.mob_analysis_tab, orient="vertical", command=self.mob_analysis_tree.yview)
-        self.mob_analysis_tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        self.mob_analysis_tree.pack(fill="both", expand=True, padx=10)
-        xscroll.pack(fill="x", padx=10)
-        yscroll.place_forget()
+        self.pack_table(self.mob_analysis_tree, self.mob_analysis_tab, padx=10, pady=(0, 10))
         self.mob_analysis_tree.bind("<Double-1>", self.open_mob_analysis_details)
 
     def reload_analysis_sessions(self):
@@ -3804,7 +3900,7 @@ class SkillTrackerApp:
         ]:
             item_tree.heading(column, text=title)
             item_tree.column(column, width=width, anchor="w" if column in ("item", "mu") else "center")
-        item_tree.pack(fill="both", expand=True)
+        self.pack_table(item_tree, items_tab)
         for item_name, row in sorted(result["items"].items(), key=lambda pair: -pair[1]["value_ped"]):
             info = self.loot_markup_info_for_item(item_name)
             mu_text = self.loot_markup_display(item_name)
@@ -3837,10 +3933,7 @@ class SkillTrackerApp:
                 width=width,
                 anchor="w" if column in ("weapon", "amplifier", "attachments") else "center",
             )
-        session_xscroll = ttk.Scrollbar(sessions_tab, orient="horizontal", command=session_tree.xview)
-        session_tree.configure(xscrollcommand=session_xscroll.set)
-        session_tree.pack(fill="both", expand=True)
-        session_xscroll.pack(fill="x")
+        self.pack_table(session_tree, sessions_tab)
         for row in result["session_rows"]:
             session_tree.insert("", "end", values=(
                 row["started_at"],
@@ -3855,16 +3948,18 @@ class SkillTrackerApp:
                 f'{percent(row["after_mu"], row["ped_cycled"]):.2f}%',
                 row["loot_events"],
             ))
+        self.style_tracker_widgets(window)
 
     def create_session_details_tab(self):
-        top = ttk.Frame(self.session_details_tab, padding=10)
+        content = self.scrollable_tab_content(self.session_details_tab)
+        top = ttk.Frame(content, padding=10)
         top.pack(fill="x")
         ttk.Label(
             top,
             text="Select a session in Previous Sessions to inspect exact skill gains, averages, hunting totals, and saved parsed events.",
         ).pack(anchor="w")
 
-        projection = ttk.LabelFrame(self.session_details_tab, text="Profession projection", padding=10)
+        projection = ttk.LabelFrame(content, text="Profession projection", padding=10)
         projection.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(projection, text="Profession:").grid(row=0, column=0, sticky="w")
         profession_combo = ttk.Combobox(
@@ -3874,7 +3969,7 @@ class SkillTrackerApp:
             state="readonly",
             width=45,
         )
-        profession_combo.grid(row=0, column=1, sticky="w", padx=8)
+        profession_combo.grid(row=0, column=1, sticky="ew", padx=8)
         profession_combo.bind("<<ComboboxSelected>>", self.refresh_selected_session_details)
         ttk.Label(projection, text="PED cycle:").grid(row=0, column=2, sticky="w", padx=(16, 0))
         ped_entry = ttk.Entry(projection, textvariable=self.session_projection_ped_var, width=14)
@@ -3885,12 +3980,12 @@ class SkillTrackerApp:
         projection.columnconfigure(1, weight=1)
 
         self.session_detail_summary_var = tk.StringVar(value="No session selected")
-        summary = ttk.LabelFrame(self.session_details_tab, text="Selected session summary", padding=10)
+        summary = ttk.LabelFrame(content, text="Selected session summary", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
         ttk.Label(summary, textvariable=self.session_detail_summary_var, justify="left").pack(anchor="w")
 
         projection_skill_frame = ttk.LabelFrame(
-            self.session_details_tab,
+            content,
             text="Projected profession skill points",
             padding=6,
         )
@@ -3949,7 +4044,7 @@ class SkillTrackerApp:
         projection_skill_frame.rowconfigure(0, weight=1)
         projection_skill_frame.columnconfigure(0, weight=1)
 
-        skill_frame = ttk.LabelFrame(self.session_details_tab, text="Skill gains in selected session", padding=6)
+        skill_frame = ttk.LabelFrame(content, text="Skill gains in selected session", padding=6)
         skill_frame.pack(fill="both", expand=True, padx=10, pady=6)
         columns = ("skill", "points", "tt", "tt_percent", "count", "message_percent", "avg_points", "avg_tt")
         self.session_detail_skill_tree = ttk.Treeview(skill_frame, columns=columns, show="headings", height=12)
@@ -3967,16 +4062,23 @@ class SkillTrackerApp:
             self.session_detail_skill_tree.heading(col, text=title)
             self.session_detail_skill_tree.column(col, width=width, anchor="center" if col != "skill" else "w")
         self.make_tree_sortable(self.session_detail_skill_tree, {col: title for col, title, _ in setup})
-        self.session_detail_skill_tree.pack(fill="both", expand=True)
+        self.pack_table(self.session_detail_skill_tree, skill_frame)
         self.session_detail_skill_tree.bind(
             "<Double-1>",
             lambda event: self.open_skill_gain_details_from_tree(event, self.session_detail_skill_tree, "saved"),
         )
 
-        events_frame = ttk.LabelFrame(self.session_details_tab, text="Saved parsed events (display limited, file saves all)", padding=6)
+        events_frame = ttk.LabelFrame(content, text="Saved parsed events (display limited, file saves all)", padding=6)
         events_frame.pack(fill="both", expand=True, padx=10, pady=6)
         self.session_detail_events_text = tk.Text(events_frame, height=10, wrap="none")
-        self.session_detail_events_text.pack(fill="both", expand=True)
+        events_y = ttk.Scrollbar(events_frame, orient="vertical", command=self.session_detail_events_text.yview)
+        events_x = ttk.Scrollbar(events_frame, orient="horizontal", command=self.session_detail_events_text.xview)
+        self.session_detail_events_text.configure(yscrollcommand=events_y.set, xscrollcommand=events_x.set)
+        self.session_detail_events_text.grid(row=0, column=0, sticky="nsew")
+        events_y.grid(row=0, column=1, sticky="ns")
+        events_x.grid(row=1, column=0, sticky="ew")
+        events_frame.rowconfigure(0, weight=1)
+        events_frame.columnconfigure(0, weight=1)
 
     def selected_session_indices_from_table(self):
         indices = []
