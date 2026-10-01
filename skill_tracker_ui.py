@@ -54,6 +54,7 @@ TRACKER_STATE_FILE = Path("skill_tracker_state.json")
 SESSIONS_FILE = Path("skill_tracker_sessions.json")
 ANALYSIS_SESSIONS_FILE = Path("mob_analysis_sessions.json")
 HUNTING_SETUPS_FILE = Path("hunting_setups.json")
+FAVORITE_MOBS_FILE = Path("favorite_mobs.json")
 LOOT_MARKUPS_FILE = Path("loot_markups.json")
 MARKET_DATA_FILE = Path("market_data.json")
 SKILLS_DATA_FILE = Path("skills.json")
@@ -900,6 +901,24 @@ class SkillTrackerApp:
         self.hunting_setups = load_json(HUNTING_SETUPS_FILE, {})
         if not isinstance(self.hunting_setups, dict):
             self.hunting_setups = {}
+        self.favorite_mobs = load_json(FAVORITE_MOBS_FILE, [])
+        if not isinstance(self.favorite_mobs, list):
+            self.favorite_mobs = []
+        # Import old setup targets once, without rewriting their source file.
+        # A marker prevents removed favorites from reappearing on restart.
+        if not self.state.get("hunting_targets_imported"):
+            for setup in self.hunting_setups.values():
+                if not isinstance(setup, dict):
+                    continue
+                mob = str(setup.get("mob", "") or "").strip()
+                maturity = str(setup.get("maturity", "") or "").strip()
+                if mob and not any(isinstance(row, dict) and row.get("mob") == mob and row.get("maturity", "") == maturity for row in self.favorite_mobs):
+                    self.favorite_mobs.append({"mob": mob, "maturity": maturity})
+            # Save favorites before the marker so an interrupted import can
+            # safely retry without losing the old targets or adding duplicates.
+            save_json(FAVORITE_MOBS_FILE, self.favorite_mobs)
+            self.state["hunting_targets_imported"] = True
+            save_json(TRACKER_STATE_FILE, self.state)
         raw_loot_markups = load_json(LOOT_MARKUPS_FILE, {})
         self.loot_markups = {}
         self.market_weekly_markups = load_weekly_market_markups(MARKET_DATA_FILE)
@@ -1010,7 +1029,8 @@ class SkillTrackerApp:
         self.maturity_var = tk.StringVar(value=self.state.get("maturity", ""))
         self.count_hunting_var = tk.BooleanVar(value=bool(self.state.get("count_hunting", False)))
         self.hunting_setup_name_var = tk.StringVar(value=str(self.state.get("selected_hunting_setup", "") or ""))
-        self.hunting_setup_status_var = tk.StringVar(value="")
+        self.hunting_setup_status_var = tk.StringVar(value="Name and save current equipment to add a setup.")
+        self.favorite_mob_status_var = tk.StringVar(value="Choose a target below to add it to favorites.")
         self.weapon_cost_var = tk.StringVar(value="Cost/shot: 0.000000 PED")
         self.mob_info_var = tk.StringVar(value="Mob: -")
         self.all_weapon_names = sorted(WEAPONS.keys(), key=str.lower)
@@ -3294,111 +3314,127 @@ class SkillTrackerApp:
 
     def create_hunting_tab(self):
         content = self.scrollable_tab_content(self.hunting_tab)
-        profiles = ttk.LabelFrame(content, text="Saved hunting setups", padding=10)
-        profiles.pack(fill="x", padx=12, pady=(12, 0))
+        columns = ttk.Frame(content)
+        columns.pack(fill="x", padx=10, pady=10)
+        columns.columnconfigure(0, weight=1, uniform="hunting_columns")
+        columns.columnconfigure(1, weight=1, uniform="hunting_columns")
+        equipment = ttk.Frame(columns)
+        equipment.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        targets = ttk.Frame(columns)
+        targets.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        ttk.Label(profiles, text="Setup name:").grid(row=0, column=0, sticky="w")
-        self.hunting_setup_combo = ttk.Combobox(
-            profiles,
-            textvariable=self.hunting_setup_name_var,
-            values=sorted(self.hunting_setups.keys(), key=str.lower),
-            width=48,
+        profiles = ttk.LabelFrame(equipment, text="Equipment setups", padding=10)
+        profiles.pack(fill="x")
+        ttk.Label(profiles, text="Click a setup to use its equipment. Your mob stays unchanged.", wraplength=400, justify="left").pack(fill="x")
+        self.hunting_setups_tree = ttk.Treeview(profiles, columns=("name", "weapon"), show="headings", height=6, selectmode="browse")
+        for column, title, width in (("name", "Setup", 160), ("weapon", "Weapon", 240)):
+            self.hunting_setups_tree.heading(column, text=title)
+            self.hunting_setups_tree.column(column, width=width, anchor="w")
+        self.pack_table(self.hunting_setups_tree, profiles, pady=(6, 8))
+        self.hunting_setups_tree.bind("<ButtonRelease-1>", self.use_selected_hunting_setup)
+        self.hunting_setups_tree.bind("<Return>", self.use_selected_hunting_setup)
+        self.hunting_setups_tree.bind("<space>", self.use_selected_hunting_setup)
+        editor = ttk.Frame(profiles)
+        editor.pack(fill="x")
+        ttk.Label(editor, text="Name:").pack(side="left")
+        ttk.Entry(editor, textvariable=self.hunting_setup_name_var, width=20).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        actions = ttk.Frame(profiles)
+        actions.pack(fill="x", pady=8)
+        ttk.Button(actions, text="Use selected", command=self.use_selected_hunting_setup).pack(side="left")
+        ttk.Button(actions, text="Save / Update", command=self.save_named_hunting_setup).pack(side="left", padx=8)
+        ttk.Button(actions, text="Delete", command=self.delete_named_hunting_setup).pack(side="left")
+        self.add_wrapped_label(profiles, self.hunting_setup_status_var)
+        self.refresh_hunting_setup_values()
+
+        favorites = ttk.LabelFrame(targets, text="Favorite mobs", padding=10)
+        favorites.pack(fill="x")
+        ttk.Label(favorites, text="Click a favorite to use its mob and maturity. Equipment stays unchanged.", wraplength=400, justify="left").pack(fill="x")
+        self.favorite_mobs_tree = ttk.Treeview(favorites, columns=("mob", "maturity"), show="headings", height=6, selectmode="browse")
+        for column, title, width in (("mob", "Mob", 240), ("maturity", "Maturity", 150)):
+            self.favorite_mobs_tree.heading(column, text=title)
+            self.favorite_mobs_tree.column(column, width=width, anchor="w")
+        self.pack_table(self.favorite_mobs_tree, favorites, pady=(6, 8))
+        self.favorite_mobs_tree.bind("<ButtonRelease-1>", self.use_selected_favorite_mob)
+        self.favorite_mobs_tree.bind("<Return>", self.use_selected_favorite_mob)
+        self.favorite_mobs_tree.bind("<space>", self.use_selected_favorite_mob)
+        actions = ttk.Frame(favorites)
+        actions.pack(fill="x", pady=8)
+        ttk.Button(actions, text="Use selected", command=self.use_selected_favorite_mob).pack(side="left")
+        ttk.Button(actions, text="Remove selected", command=self.remove_selected_favorite_mob).pack(side="left", padx=8)
+        self.add_wrapped_label(favorites, self.favorite_mob_status_var)
+        self.refresh_favorite_mobs()
+
+        frame = ttk.LabelFrame(equipment, text="Equipment", padding=10)
+        frame.pack(fill="x", pady=(10, 0))
+        frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(frame, text="Count hunting / PED cycled during sync", variable=self.count_hunting_var, command=self.on_hunting_changed).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        search_fields = (
+            ("Weapon", self.weapon_filter_var, self.filter_weapon_values, self.clear_weapon_filter),
+            ("Amplifier", self.amplifier_filter_var, self.filter_amplifier_values, self.clear_amplifier_filter),
+            ("Attachment", self.attachment_filter_var, self.filter_attachment_values, self.clear_attachment_filter),
         )
-        self.hunting_setup_combo.grid(row=0, column=1, sticky="ew", padx=8)
-        self.hunting_setup_combo.bind("<<ComboboxSelected>>", self.load_named_hunting_setup)
-        ttk.Button(profiles, text="Load", command=self.load_named_hunting_setup).grid(row=0, column=2, padx=4)
-        ttk.Button(profiles, text="Save / Update", command=self.save_named_hunting_setup).grid(row=0, column=3, padx=4)
-        ttk.Button(profiles, text="Delete", command=self.delete_named_hunting_setup).grid(row=0, column=4, padx=4)
-        ttk.Label(profiles, textvariable=self.hunting_setup_status_var).grid(row=1, column=1, columnspan=4, sticky="w", padx=8, pady=(5, 0))
-        profiles.columnconfigure(1, weight=1)
-
-        frame = ttk.LabelFrame(content, text="Hunting equipment and target", padding=10)
-        frame.pack(fill="x", padx=12, pady=10)
-
-        ttk.Checkbutton(frame, text="Count hunting / PED cycled during sync", variable=self.count_hunting_var, command=self.on_hunting_changed).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        ttk.Label(frame, text="Weapon search:").grid(row=1, column=0, sticky="w")
-        weapon_search = ttk.Entry(frame, textvariable=self.weapon_filter_var, width=35)
-        weapon_search.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        weapon_search.bind("<KeyRelease>", lambda e: self.filter_weapon_values())
-        ttk.Button(frame, text="Clear", command=self.clear_weapon_filter).grid(row=1, column=2, sticky="w", padx=4)
-
+        for row, (label, variable, callback, clear) in zip((1, 3, 5), search_fields):
+            ttk.Label(frame, text=f"{label} search:").grid(row=row, column=0, sticky="w")
+            search = ttk.Entry(frame, textvariable=variable, width=20)
+            search.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
+            search.bind("<KeyRelease>", lambda event, var=variable, callback=callback: callback(var.get()))
+            ttk.Button(frame, text="Clear", command=clear).grid(row=row, column=2, padx=4)
         ttk.Label(frame, text="Weapon:").grid(row=2, column=0, sticky="w")
-        self.weapon_combo = ttk.Combobox(frame, textvariable=self.weapon_var, values=self.all_weapon_names, width=45)
-        self.weapon_combo.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.weapon_combo = ttk.Combobox(frame, textvariable=self.weapon_var, values=self.all_weapon_names, width=25)
+        self.weapon_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
         self.weapon_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.weapon_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
         self.weapon_combo.bind("<KeyRelease>", lambda e: self.filter_weapon_values(self.weapon_var.get()))
-        ttk.Label(frame, textvariable=self.weapon_cost_var, style="Tracker.Emphasis.TLabel").grid(row=12, column=0, columnspan=3, sticky="w", pady=(10, 4))
-
-        ttk.Label(frame, text="Amplifier search:").grid(row=3, column=0, sticky="w")
-        amplifier_search = ttk.Entry(frame, textvariable=self.amplifier_filter_var, width=35)
-        amplifier_search.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
-        amplifier_search.bind("<KeyRelease>", lambda e: self.filter_amplifier_values())
-        ttk.Button(frame, text="Clear", command=self.clear_amplifier_filter).grid(row=3, column=2, sticky="w", padx=4)
-
         ttk.Label(frame, text="Amplifier:").grid(row=4, column=0, sticky="w")
-        self.amplifier_combo = ttk.Combobox(frame, textvariable=self.amplifier_var, values=[""] + self.all_amplifier_names, width=45)
-        self.amplifier_combo.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
+        self.amplifier_combo = ttk.Combobox(frame, textvariable=self.amplifier_var, values=[""] + self.all_amplifier_names, width=25)
+        self.amplifier_combo.grid(row=4, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
         self.amplifier_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.amplifier_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
         self.amplifier_combo.bind("<KeyRelease>", lambda e: self.filter_amplifier_values(self.amplifier_var.get()))
-
-        ttk.Label(frame, text="Attachment search:").grid(row=5, column=0, sticky="w")
-        attachment_search = ttk.Entry(frame, textvariable=self.attachment_filter_var, width=35)
-        attachment_search.grid(row=5, column=1, sticky="ew", padx=8, pady=4)
-        attachment_search.bind("<KeyRelease>", lambda e: self.filter_attachment_values())
-        ttk.Button(frame, text="Clear", command=self.clear_attachment_filter).grid(row=5, column=2, sticky="w", padx=4)
-
         self.attachment_combos = []
         for index, attachment_var in enumerate(self.attachment_vars, start=1):
-            row = 5 + index
-            ttk.Label(frame, text=f"Attachment {index}:").grid(row=row, column=0, sticky="w")
-            combo = ttk.Combobox(frame, textvariable=attachment_var, values=[""] + self.all_attachment_names, width=45)
-            combo.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
+            ttk.Label(frame, text=f"Attachment {index}:").grid(row=5+index, column=0, sticky="w")
+            combo = ttk.Combobox(frame, textvariable=attachment_var, values=[""] + self.all_attachment_names, width=25)
+            combo.grid(row=5+index, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
             combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
             combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
             combo.bind("<KeyRelease>", lambda e, var=attachment_var: self.filter_attachment_values(var.get()))
             self.attachment_combos.append(combo)
+        ttk.Label(frame, textvariable=self.weapon_cost_var, style="Tracker.Emphasis.TLabel").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        ttk.Label(frame, text="Mob search:").grid(row=9, column=0, sticky="w")
-        mob_search = ttk.Entry(frame, textvariable=self.mob_filter_var, width=35)
-        mob_search.grid(row=9, column=1, sticky="ew", padx=8, pady=4)
-        mob_search.bind("<KeyRelease>", lambda e: self.filter_mob_values())
-        ttk.Button(frame, text="Clear", command=self.clear_mob_filter).grid(row=9, column=2, sticky="w", padx=4)
-
-        ttk.Label(frame, text="Mob:").grid(row=10, column=0, sticky="w")
-        self.mob_combo = ttk.Combobox(frame, textvariable=self.mob_var, values=self.all_mob_names, width=45)
-        self.mob_combo.grid(row=10, column=1, sticky="ew", padx=8, pady=4)
+        target = ttk.LabelFrame(targets, text="Hunting target", padding=10)
+        target.pack(fill="x", pady=(10, 0))
+        target.columnconfigure(1, weight=1)
+        ttk.Label(target, text="Mob search:").grid(row=0, column=0, sticky="w")
+        mob_search = ttk.Entry(target, textvariable=self.mob_filter_var, width=20)
+        mob_search.grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+        mob_search.bind("<KeyRelease>", lambda e: self.filter_mob_values(self.mob_filter_var.get()))
+        ttk.Button(target, text="Clear", command=self.clear_mob_filter).grid(row=0, column=2, padx=4)
+        ttk.Label(target, text="Mob:").grid(row=1, column=0, sticky="w")
+        self.mob_combo = ttk.Combobox(target, textvariable=self.mob_var, values=self.all_mob_names, width=25)
+        self.mob_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
         self.mob_combo.bind("<<ComboboxSelected>>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<FocusOut>", lambda e: self.on_mob_changed())
         self.mob_combo.bind("<KeyRelease>", lambda e: self.filter_mob_values(self.mob_var.get()))
-
-        ttk.Label(frame, text="Maturity:").grid(row=11, column=0, sticky="w")
-        self.maturity_combo = ttk.Combobox(frame, textvariable=self.maturity_var, values=[], width=45)
-        self.maturity_combo.grid(row=11, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Label(target, text="Maturity:").grid(row=2, column=0, sticky="w")
+        self.maturity_combo = ttk.Combobox(target, textvariable=self.maturity_var, values=[], width=25)
+        self.maturity_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
         self.maturity_combo.bind("<<ComboboxSelected>>", lambda e: self.on_hunting_changed())
         self.maturity_combo.bind("<FocusOut>", lambda e: self.on_hunting_changed())
-        ttk.Label(frame, textvariable=self.mob_info_var).grid(row=13, column=0, columnspan=3, sticky="w", pady=4)
-
-        hint = ttk.Label(frame, text="The current selection is saved automatically. Use Saved hunting setups above for named profiles.", wraplength=600)
-        hint.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        hint.bind("<Configure>", lambda event: hint.configure(wraplength=max(1, event.width)))
-        frame.columnconfigure(1, weight=1)
+        info = ttk.Label(target, textvariable=self.mob_info_var, wraplength=400, justify="left")
+        info.grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
+        info.bind("<Configure>", lambda e: info.configure(wraplength=max(1, e.width)))
+        ttk.Button(target, text="Add current mob + maturity to favorites", command=self.add_current_favorite_mob).grid(row=4, column=0, columnspan=3, sticky="ew")
         self.update_maturity_values()
-
-        help_box = ttk.LabelFrame(content, text="Counting rule", padding=10)
-        help_box.pack(fill="x", padx=12, pady=10)
-        ttk.Label(
-            help_box,
-            text=(
-                "PED cycled increments on every player attack: normal hit, critical hit, target Jammed/Evaded/Dodged, or 'You missed'.\n"
-                "Jammed, Evaded, and Dodged are one target-defense category; 'You missed' is counted separately.\n"
-                "It ignores enemy attacks like 'The attack missed you' and 'You took damage'.\n"
-                "Per attack cost is calculated from weapon, amplifier, and attachment decay / 100 + ammo_burn / 10000 PED."
-            ),
-            justify="left",
-        ).pack(anchor="w")
+        help_box = ttk.LabelFrame(targets, text="Counting rule", padding=10)
+        help_box.pack(fill="x", pady=10)
+        ttk.Label(help_box, text=(
+            "PED cycled increments on every player attack: normal hit, critical hit, target Jammed/Evaded/Dodged, or 'You missed'.\n"
+            "Jammed, Evaded, and Dodged are one target-defense category; 'You missed' is counted separately.\n"
+            "It ignores enemy attacks like 'The attack missed you' and 'You took damage'.\n"
+            "Per attack cost is calculated from weapon, amplifier, and attachment decay / 100 + ammo_burn / 10000 PED.\n\n"
+            "Current equipment and target are saved automatically. Named equipment setups and favorite mobs are independent."
+        ), justify="left").pack(anchor="w")
 
     def create_sessions_tab(self):
         top = ttk.Frame(self.sessions_tab, padding=10)
@@ -4470,16 +4506,97 @@ class SkillTrackerApp:
         return None
 
     def refresh_hunting_setup_values(self):
-        if hasattr(self, "hunting_setup_combo"):
-            self.hunting_setup_combo.configure(values=sorted(self.hunting_setups.keys(), key=str.lower))
+        tree = self.hunting_setups_tree
+        tree.delete(*tree.get_children())
+        self.hunting_setup_iid_to_name = {}
+        for index, name in enumerate(sorted(self.hunting_setups, key=str.lower)):
+            setup = self.hunting_setups[name]
+            weapon = setup.get("weapon", "") if isinstance(setup, dict) else "Invalid setup"
+            iid = f"setup_{index}"
+            self.hunting_setup_iid_to_name[iid] = name
+            tree.insert("", "end", iid=iid, values=(name, weapon))
+            if name == self.hunting_setup_name_var.get():
+                tree.selection_set(iid)
+                tree.focus(iid)
+
+    def quick_list_selection(self, tree, event=None):
+        if event is not None and getattr(event, "num", None) == 1:
+            # Clicking headings or blank space must not apply the old selection.
+            iid = tree.identify_row(event.y)
+        else:
+            selected = tree.selection()
+            iid = selected[0] if selected else ""
+        if iid:
+            tree.selection_set(iid)
+            tree.focus(iid)
+        return iid
+
+    def use_selected_hunting_setup(self, event=None):
+        iid = self.quick_list_selection(self.hunting_setups_tree, event)
+        name = self.hunting_setup_iid_to_name.get(iid)
+        if name is not None:
+            self.hunting_setup_name_var.set(name)
+            self.load_named_hunting_setup()
+
+    def refresh_favorite_mobs(self):
+        tree = self.favorite_mobs_tree
+        tree.delete(*tree.get_children())
+        self.favorite_mob_iid_to_index = {}
+        rows = [(index, row) for index, row in enumerate(self.favorite_mobs) if isinstance(row, dict) and row.get("mob")]
+        for index, row in sorted(rows, key=lambda pair: (str(pair[1]["mob"]).casefold(), str(pair[1].get("maturity", "")).casefold())):
+            iid = f"favorite_{index}"
+            self.favorite_mob_iid_to_index[iid] = index
+            tree.insert("", "end", iid=iid, values=(row["mob"], row.get("maturity", "")))
+            if row["mob"] == self.mob_var.get() and row.get("maturity", "") == self.maturity_var.get():
+                tree.selection_set(iid)
+                tree.focus(iid)
+
+    def add_current_favorite_mob(self):
+        mob, maturity = self.mob_var.get(), self.maturity_var.get()
+        if mob not in MOBS or maturity not in (MOBS[mob].get("maturities") or {}):
+            messagebox.showwarning("Choose a target", "Choose a known mob and maturity first.")
+            return
+        if not any(isinstance(row, dict) and row.get("mob") == mob and row.get("maturity", "") == maturity for row in self.favorite_mobs):
+            self.favorite_mobs.append({"mob": mob, "maturity": maturity})
+            save_json(FAVORITE_MOBS_FILE, self.favorite_mobs)
+        self.refresh_favorite_mobs()
+        self.favorite_mob_status_var.set(f"Favorite: {mob} / {maturity}")
+
+    def use_selected_favorite_mob(self, event=None):
+        iid = self.quick_list_selection(self.favorite_mobs_tree, event)
+        index = self.favorite_mob_iid_to_index.get(iid)
+        if index is None:
+            return
+        row = self.favorite_mobs[index]
+        mob, maturity = row["mob"], row.get("maturity", "")
+        if mob not in MOBS:
+            messagebox.showwarning("Mob unavailable", f"'{mob}' is not in the current mob data. The favorite has been kept.")
+            return
+        self.clear_mob_filter()
+        self.mob_var.set(mob)
+        self.maturity_var.set(maturity)
+        self.update_maturity_values()
+        self.on_hunting_changed()
+        self.favorite_mob_status_var.set(f"Target: {mob} / {self.maturity_var.get()}")
+
+    def remove_selected_favorite_mob(self):
+        iid = self.quick_list_selection(self.favorite_mobs_tree)
+        index = self.favorite_mob_iid_to_index.get(iid)
+        if index is None:
+            return
+        row = self.favorite_mobs[index]
+        if not messagebox.askyesno("Remove favorite", f"Remove '{row['mob']} / {row.get('maturity', '')}' from favorites?"):
+            return
+        del self.favorite_mobs[index]
+        save_json(FAVORITE_MOBS_FILE, self.favorite_mobs)
+        self.refresh_favorite_mobs()
+        self.favorite_mob_status_var.set("Favorite removed. Current target stays unchanged.")
 
     def current_hunting_setup_payload(self):
         return {
             "weapon": self.weapon_var.get(),
             "amplifier": self.selected_amplifier(),
             "attachments": self.selected_attachments(),
-            "mob": self.mob_var.get(),
-            "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
         }
 
@@ -4493,11 +4610,18 @@ class SkillTrackerApp:
         save_name = existing_name or typed_name
         if existing_name and not messagebox.askyesno(
             "Update hunting setup",
-            f"Replace the saved setup '{existing_name}' with the current weapon, attachments, mob, and maturity?",
+            f"Replace the saved equipment in '{existing_name}'? The selected mob and favorites stay unchanged.",
         ):
             return
 
-        self.hunting_setups[save_name] = self.current_hunting_setup_payload()
+        # Preserve extension fields in older setups. Their target was imported
+        # into favorites before it is removed from an explicitly updated setup.
+        previous = self.hunting_setups.get(save_name)
+        payload = dict(previous) if isinstance(previous, dict) else {}
+        payload.update(self.current_hunting_setup_payload())
+        payload.pop("mob", None)
+        payload.pop("maturity", None)
+        self.hunting_setups[save_name] = payload
         save_json(HUNTING_SETUPS_FILE, self.hunting_setups)
         self.hunting_setup_name_var.set(save_name)
         self.refresh_hunting_setup_values()
@@ -4520,13 +4644,10 @@ class SkillTrackerApp:
         weapon = str(setup.get("weapon", "") or "")
         amplifier = str(setup.get("amplifier", "") or "")
         attachments = list(setup.get("attachments", []) or [])[:3]
-        mob = str(setup.get("mob", "") or "")
-        maturity = str(setup.get("maturity", "") or "")
 
         self.clear_weapon_filter()
         self.clear_amplifier_filter()
         self.clear_attachment_filter()
-        self.clear_mob_filter()
 
         self.weapon_var.set(weapon if weapon in WEAPONS else "")
         self.amplifier_var.set(amplifier if amplifier in AMPLIFIERS else "")
@@ -4534,13 +4655,6 @@ class SkillTrackerApp:
             attachments.append("")
         for attachment_var, attachment_name in zip(self.attachment_vars, attachments):
             attachment_var.set(attachment_name if attachment_name in ATTACHMENTS else "")
-
-        self.mob_var.set(mob if mob in MOBS else "")
-        self.maturity_var.set("")
-        self.update_maturity_values()
-        valid_maturities = set(((MOBS.get(self.mob_var.get()) or {}).get("maturities") or {}).keys())
-        if maturity in valid_maturities:
-            self.maturity_var.set(maturity)
 
         self.count_hunting_var.set(bool(setup.get("count_hunting", False)))
         self.hunting_setup_name_var.set(setup_name)
@@ -4550,6 +4664,9 @@ class SkillTrackerApp:
 
     def delete_named_hunting_setup(self):
         requested_name = self.hunting_setup_name_var.get().strip()
+        selected = self.hunting_setups_tree.selection()
+        if selected:
+            requested_name = self.hunting_setup_iid_to_name.get(selected[0], requested_name)
         setup_name = self.resolve_hunting_setup_name(requested_name)
         if not setup_name:
             messagebox.showwarning("Setup not found", "Choose a saved hunting setup first.")
@@ -4588,6 +4705,15 @@ class SkillTrackerApp:
 
     def on_hunting_changed(self):
         self.refresh_hunting_info()
+        if hasattr(self, "favorite_mobs_tree"):
+            # Manual target edits should not leave an unrelated favorite
+            # highlighted. This changes selection without applying a target.
+            self.favorite_mobs_tree.selection_remove(*self.favorite_mobs_tree.selection())
+            for iid, index in self.favorite_mob_iid_to_index.items():
+                row = self.favorite_mobs[index]
+                if row["mob"] == self.mob_var.get() and row.get("maturity", "") == self.maturity_var.get():
+                    self.favorite_mobs_tree.selection_set(iid)
+                    break
         self.save_state()
 
     def update_maturity_values(self):
