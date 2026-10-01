@@ -9,7 +9,7 @@ import time
 from collections import deque
 import tkinter as tk
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
@@ -61,7 +61,7 @@ PROFESSIONS_DATA_FILE = Path("professions.json")
 IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
-LOOT_TRACKER_GRAPH_VERSION = "loot-item-mu-summary-v12-syncfix1"
+LOOT_TRACKER_GRAPH_VERSION = "loot-local-time-mu-dpp-v13"
 LOOT_EVENT_GROUPING_VERSION = 2
 
 # Entropia attributes contribute to professions at 20 times their displayed
@@ -1399,23 +1399,19 @@ class SkillTrackerApp:
     def create_loot_tab(self):
         top = ttk.Frame(self.loot_tab, padding=10)
         top.pack(fill="x")
-        ttk.Label(
-            top,
-            text=(
-                "Uses the active session while syncing; otherwise uses the selected previous session, or the latest saved session. "
-                f"Graph version: {LOOT_TRACKER_GRAPH_VERSION}"
-            ),
-        ).pack(side="left")
         ttk.Button(top, text="Refresh", command=self.refresh_loot_tab).pack(side="right", padx=4)
         ttk.Button(top, text="Reset zoom", command=self.reset_loot_zoom).pack(side="right", padx=4)
+        source_hint = ttk.Label(top, text="Loot from the active session or selected saved session.", justify="left")
+        source_hint.pack(side="left", fill="x", expand=True)
+        source_hint.bind("<Configure>", lambda event: source_hint.configure(wraplength=max(1, event.width)))
 
         summary = ttk.LabelFrame(self.loot_tab, text="Loot summary", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
-        ttk.Label(summary, textvariable=self.loot_summary_var, justify="left").pack(anchor="w")
+        self.add_monitor_wrapped_label(summary, self.loot_summary_var)
 
         item_summary_frame = ttk.LabelFrame(self.loot_tab, text="Looted items grouped by name", padding=6)
         item_summary_frame.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(item_summary_frame, textvariable=self.loot_markup_status_var).pack(anchor="w", pady=(0, 4))
+        self.add_monitor_wrapped_label(item_summary_frame, self.loot_markup_status_var)
         item_columns = ("item", "quantity", "value", "loot_percent", "markup", "after_mu")
         self.loot_item_summary_tree = ttk.Treeview(
             item_summary_frame,
@@ -1443,7 +1439,7 @@ class SkillTrackerApp:
 
         selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
         selection.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(selection, textvariable=self.loot_selection_var, justify="left").pack(anchor="w")
+        self.add_monitor_wrapped_label(selection, self.loot_selection_var)
 
         body = ttk.Panedwindow(self.loot_tab, orient="horizontal")
         body.pack(fill="both", expand=True, padx=10, pady=6)
@@ -1453,8 +1449,22 @@ class SkillTrackerApp:
         body.add(left, weight=1)
         body.add(right, weight=4)
 
-        items_frame = ttk.LabelFrame(left, text="Item filter", padding=6)
-        items_frame.pack(fill="both", expand=True)
+        # Keep all three charts readable rather than clipping the last chart
+        # when the summary and item table leave little vertical space.
+        self.loot_graphs_canvas = tk.Canvas(right, highlightthickness=0)
+        graphs_scroll = ttk.Scrollbar(right, orient="vertical", command=self.loot_graphs_canvas.yview)
+        self.loot_graphs_canvas.configure(yscrollcommand=graphs_scroll.set)
+        graphs_scroll.pack(side="right", fill="y")
+        self.loot_graphs_canvas.pack(side="left", fill="both", expand=True)
+        graphs = ttk.Frame(self.loot_graphs_canvas)
+        graphs_window = self.loot_graphs_canvas.create_window((0, 0), window=graphs, anchor="nw")
+        graphs.bind("<Configure>", lambda event: self.loot_graphs_canvas.configure(scrollregion=self.loot_graphs_canvas.bbox("all")))
+        self.loot_graphs_canvas.bind("<Configure>", lambda event: self.loot_graphs_canvas.itemconfigure(graphs_window, width=event.width))
+
+        left_panels = ttk.Panedwindow(left, orient="vertical")
+        left_panels.pack(fill="both", expand=True)
+        items_frame = ttk.LabelFrame(left_panels, text="Item filter", padding=6)
+        left_panels.add(items_frame, weight=1)
         ttk.Label(items_frame, text="Filter item names:").pack(anchor="w")
         item_filter = ttk.Entry(items_frame, textvariable=self.loot_item_filter_var)
         item_filter.pack(fill="x", pady=(2, 6))
@@ -1464,7 +1474,7 @@ class SkillTrackerApp:
 
         canvas_holder = ttk.Frame(items_frame)
         canvas_holder.pack(fill="both", expand=True)
-        self.loot_items_canvas = tk.Canvas(canvas_holder, highlightthickness=0, width=260)
+        self.loot_items_canvas = tk.Canvas(canvas_holder, highlightthickness=0, width=260, height=60)
         self.loot_items_scrollbar = ttk.Scrollbar(canvas_holder, orient="vertical", command=self.loot_items_canvas.yview)
         self.loot_items_scrollable = ttk.Frame(self.loot_items_canvas)
         self.loot_items_scrollable.bind(
@@ -1476,13 +1486,13 @@ class SkillTrackerApp:
         self.loot_items_canvas.pack(side="left", fill="both", expand=True)
         self.loot_items_scrollbar.pack(side="right", fill="y")
 
-        events_frame = ttk.LabelFrame(left, text="Loot events", padding=6)
-        events_frame.pack(fill="both", expand=True, pady=(8, 0))
+        events_frame = ttk.LabelFrame(left_panels, text="Loot events", padding=6)
+        left_panels.add(events_frame, weight=2)
         columns = ("idx", "time", "items", "loot", "cost", "return")
-        self.loot_events_tree = ttk.Treeview(events_frame, columns=columns, show="headings", height=10)
+        self.loot_events_tree = ttk.Treeview(events_frame, columns=columns, show="headings", height=5)
         setup = [
             ("idx", "#", 45),
-            ("time", "Time", 135),
+            ("time", "Log time", 155),
             ("items", "Items", 65),
             ("loot", "Loot PED", 80),
             ("cost", "Cost PED", 80),
@@ -1492,21 +1502,28 @@ class SkillTrackerApp:
             self.loot_events_tree.heading(col, text=title)
             self.loot_events_tree.column(col, width=width, anchor="center")
         self.make_tree_sortable(self.loot_events_tree, {col: title for col, title, _ in setup})
-        self.loot_events_tree.pack(fill="both", expand=True)
+        events_y = ttk.Scrollbar(events_frame, orient="vertical", command=self.loot_events_tree.yview)
+        events_x = ttk.Scrollbar(events_frame, orient="horizontal", command=self.loot_events_tree.xview)
+        self.loot_events_tree.configure(yscrollcommand=events_y.set, xscrollcommand=events_x.set)
+        self.loot_events_tree.grid(row=0, column=0, sticky="nsew")
+        events_y.grid(row=0, column=1, sticky="ns")
+        events_x.grid(row=1, column=0, sticky="ew")
+        events_frame.rowconfigure(0, weight=1)
+        events_frame.columnconfigure(0, weight=1)
         self.loot_events_tree.bind("<Double-1>", self.open_loot_event_details)
 
-        graph1 = ttk.LabelFrame(right, text="1. Loot value / elapsed time (% return)", padding=6)
-        graph1.pack(fill="both", expand=True, pady=(0, 6))
+        graph1 = ttk.LabelFrame(graphs, text="1. Loot value / local time (% return)", padding=6)
+        graph1.pack(fill="x", pady=(0, 6))
         self.loot_value_time_canvas = tk.Canvas(graph1, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
         self.loot_value_time_canvas.pack(fill="both", expand=True)
 
-        graph2 = ttk.LabelFrame(right, text="2. Loot value / cost per kill (PED, multiplier)", padding=6)
-        graph2.pack(fill="both", expand=True, pady=6)
+        graph2 = ttk.LabelFrame(graphs, text="2. Loot value / cost per kill (PED, multiplier)", padding=6)
+        graph2.pack(fill="x", pady=6)
         self.loot_cost_canvas = tk.Canvas(graph2, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
         self.loot_cost_canvas.pack(fill="both", expand=True)
 
-        graph3 = ttk.LabelFrame(right, text="3. Number of looted items / elapsed time (not cumulative)", padding=6)
-        graph3.pack(fill="both", expand=True, pady=(6, 0))
+        graph3 = ttk.LabelFrame(graphs, text="3. Number of looted items / local time (not cumulative)", padding=6)
+        graph3.pack(fill="x", pady=(6, 0))
         self.loot_items_time_canvas = tk.Canvas(graph3, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
         self.loot_items_time_canvas.pack(fill="both", expand=True)
 
@@ -2370,13 +2387,17 @@ class SkillTrackerApp:
             self.last_loot_live_refresh_at = time.monotonic()
 
     def first_loot_event_time(self, loot_events):
-        for loot_event in loot_events:
-            event_time = parse_any_timestamp(loot_event.get("started_at") or loot_event.get("ended_at"))
-            if event_time is not None:
-                return event_time
-            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
-            if event_time is not None:
-                return event_time
+        times = [self.loot_event_chart_time(event) for event in loot_events]
+        return min((value for value in times if value is not None), default=None)
+
+    def loot_event_chart_time(self, loot_event):
+        """Read legacy naive chat.log timestamps as UTC without changing them."""
+        for key in ("ended_at", "started_at"):
+            value = parse_any_timestamp(loot_event.get(key))
+            if value is not None:
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
         return None
 
     def downsample_points(self, points, max_points=1200):
@@ -2447,13 +2468,20 @@ class SkillTrackerApp:
         item_totals = self.loot_item_totals(loot_events)
         item_value_totals = self.loot_item_value_totals(loot_events)
         loot_after_mu = self.refresh_loot_item_summary_table(item_value_totals, loot_total)
-        top_items = "; ".join(f"{item}: {qty}" for item, qty in list(item_totals.items())[:6]) or "-"
+        known_item_tt = sum(float(row.get("value_ped", 0.0) or 0.0) for row in item_value_totals.values())
+        has_item_values = math.isclose(known_item_tt, loot_total, rel_tol=1e-9, abs_tol=1e-9)
+        average_mu = f"{percent(loot_after_mu, loot_total):.2f}%" if loot_total > 0 and has_item_values else "—"
+        combat = self.calculate_session_combat_metrics(session)
+        dpp = f'{combat["dpp"]:.3f}' if combat["dpp"] is not None else "—"
+        effective_dpp = f'{combat["effective_dpp"]:.3f}' if combat["effective_dpp"] is not None else "—"
         source = "active session" if self.current_session is not None else "saved session"
         self.loot_summary_var.set(
             f"Source: {source} | Loot events/kills: {len(loot_events)} | PED cycled: {ped_cycled:.4f} | "
             f"TT loot: {loot_total:.4f} PED ({percent(loot_total, ped_cycled):.2f}%) | "
             f"Loot after MU: {loot_after_mu:.4f} PED ({percent(loot_after_mu, ped_cycled):.2f}% of cycled)\n"
-            f"Cost per kill/event: {cost_per_kill:.6f} PED | Unique items: {len(item_value_totals)} | Top items: {top_items}"
+            f"Average overall MU (TT-weighted): {average_mu} | "
+            f"DPP: {dpp} | Effective DPP: {effective_dpp} (damage/PEC)\n"
+            f"Cost per kill/event: {cost_per_kill:.6f} PED | Unique items: {len(item_value_totals)}"
         )
 
         # Show every saved loot event. Earlier versions only displayed the last
@@ -2475,24 +2503,28 @@ class SkillTrackerApp:
         self.apply_tree_sort(self.loot_events_tree)
 
         # Use the first real loot timestamp, not the app session start time.
-        # When you resync old chat.log lines, the session start can be later
-        # than the loot timestamps, which made every elapsed-time X value clamp
-        # to 0 and caused the item graph to draw one vertical line.
-        base_time = self.first_loot_event_time(loot_events)
+        # Resyncing historical logs can give a session start later than its
+        # loot. Retain relative minutes for sampling/zoom; the display-only UTC
+        # origin converts tick labels to the PC's local clock, including DST.
+        event_times = [self.loot_event_chart_time(event) for event in loot_events]
+        base_time = min((value for value in event_times if value is not None), default=None)
         has_real_time_axis = base_time is not None
 
-        # Graph 1: cumulative loot return over elapsed loot time.
+        # Graph 1: cumulative loot return over actual loot time.
         cumulative_loot = 0.0
         cumulative_cost = 0.0
         loot_value_points = []
-        for index, loot_event in enumerate(loot_events, start=1):
+        for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
             value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
             event_cost = float(loot_event.get("cost_ped", 0.0) or 0.0)
             if event_cost <= 0 and cost_per_kill > 0:
                 event_cost = cost_per_kill
             cumulative_loot += value_ped
             cumulative_cost += event_cost
-            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+            if has_real_time_axis and event_time is None:
+                # Include unknown-time loot in totals, but do not invent a time
+                # for its plot point. Entirely undated sessions use event #.
+                continue
             x_value = self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index)
             denominator = cumulative_cost if cumulative_cost > 0 else ped_cycled
             loot_value_points.append({
@@ -2504,19 +2536,19 @@ class SkillTrackerApp:
             self.loot_value_time_canvas,
             self.downsample_time_points_by_minute(loot_value_points, bucket_minutes=1.0),
             title="Cumulative loot / cumulative cost",
-            x_label="Elapsed time" if has_real_time_axis else "Loot event #",
+            x_label="Loot time (local PC time)" if has_real_time_axis else "Loot event #",
             y_label="Loot return",
             x_is_time=has_real_time_axis,
+            time_origin=base_time,
             y_suffix="%",
             smooth=False,
             y_reference_lines=[(100.0, "100%")],
         )
 
         scatter_points = []
-        for index, loot_event in enumerate(loot_events, start=1):
+        for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
             cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
             value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
-            event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
             scatter_points.append({
                 "x": cost_ped,
                 "y": value_ped,
@@ -2539,11 +2571,12 @@ class SkillTrackerApp:
         item_series = []
         for item in selected_items[:12]:
             raw_points = []
-            for index, loot_event in enumerate(loot_events, start=1):
+            for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
                 quantity = int((loot_event.get("items", {}) or {}).get(item, 0) or 0)
                 if quantity <= 0:
                     continue
-                event_time = parse_any_timestamp(loot_event.get("ended_at") or loot_event.get("started_at"))
+                if has_real_time_axis and event_time is None:
+                    continue
                 raw_points.append({
                     "x": self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index),
                     "y": quantity,
@@ -2555,7 +2588,7 @@ class SkillTrackerApp:
                     for point in raw_points:
                         bucket = int(float(point.get("x", 0.0)) // 1.0)
                         if bucket not in buckets:
-                            buckets[bucket] = {"x": float(bucket), "y": 0, "label": self._time_axis_label(float(bucket))}
+                            buckets[bucket] = {"x": float(bucket), "y": 0, "label": self._time_axis_label(float(bucket), time_origin=base_time)}
                         buckets[bucket]["y"] += int(point.get("y", 0) or 0)
                     points = list(buckets.values())
                 else:
@@ -2565,9 +2598,10 @@ class SkillTrackerApp:
             self.loot_items_time_canvas,
             item_series,
             title="Looted item quantity by time",
-            x_label="Elapsed time" if has_real_time_axis else "Loot event #",
+            x_label="Loot time (local PC time)" if has_real_time_axis else "Loot event #",
             y_label="Items looted",
             x_is_time=has_real_time_axis,
+            time_origin=base_time,
         )
 
     def clear_chart(self, canvas, text="No data"):
@@ -2685,16 +2719,19 @@ class SkillTrackerApp:
             "kind": kind,
         }
 
-    def _selection_time_text(self, min_x, max_x, x_is_time):
+    def _selection_time_text(self, min_x, max_x, x_is_time, time_origin=None):
         if x_is_time:
-            return f"{self._time_axis_label(min_x)} - {self._time_axis_label(max_x)} ({self._time_axis_label(max_x - min_x)})"
+            include_date = self.chart_range_crosses_date(time_origin, min_x, max_x)
+            start = self._time_axis_label(min_x, time_origin=time_origin, include_date=include_date)
+            end = self._time_axis_label(max_x, time_origin=time_origin, include_date=include_date)
+            return f"{start} - {end} ({self._time_axis_label(max_x - min_x)})"
         return f"{min_x:.4f} - {max_x:.4f}"
 
     def describe_loot_chart_selection(self, canvas, min_x, max_x):
         payload = self.loot_chart_payloads.get(canvas) or {}
         kind = payload.get("kind")
         x_is_time = bool(payload.get("x_is_time", False))
-        range_text = self._selection_time_text(min_x, max_x, x_is_time)
+        range_text = self._selection_time_text(min_x, max_x, x_is_time, payload.get("time_origin"))
         if kind == "line":
             points = self._points_in_x_range(payload.get("points") or [], min_x, max_x)
             if not points:
@@ -2732,7 +2769,7 @@ class SkillTrackerApp:
     def format_chart_time_label(self, event_time, fallback_index):
         if event_time is None:
             return str(fallback_index)
-        return event_time.strftime("%H:%M:%S")
+        return self.chart_local_time(event_time, 0).strftime("%H:%M:%S")
 
     def _chart_area(self, canvas):
         width = max(canvas.winfo_width(), 320)
@@ -2764,7 +2801,22 @@ class SkillTrackerApp:
             return f"{text}{suffix}"
         return text
 
-    def _time_axis_label(self, minutes_value):
+    def chart_local_time(self, time_origin, minutes_value):
+        if time_origin.tzinfo is None:
+            time_origin = time_origin.replace(tzinfo=timezone.utc)
+        # Add elapsed time in UTC before converting: local DST transitions do
+        # not change event spacing or the actual instant represented by a tick.
+        return (time_origin.astimezone(timezone.utc) + timedelta(minutes=float(minutes_value))).astimezone()
+
+    def chart_range_crosses_date(self, time_origin, min_x, max_x):
+        return bool(time_origin is not None and
+                    self.chart_local_time(time_origin, min_x).date() != self.chart_local_time(time_origin, max_x).date())
+
+    def _time_axis_label(self, minutes_value, *, time_origin=None, include_date=False):
+        if time_origin is not None:
+            local_time = self.chart_local_time(time_origin, minutes_value)
+            clock = local_time.strftime("%H:%M:%S" if local_time.second else "%H:%M")
+            return f'{local_time:%d.%m} {clock}' if include_date else clock
         minutes_value = float(minutes_value)
         total_seconds = int(round(minutes_value * 60.0))
         hours = total_seconds // 3600
@@ -2774,7 +2826,7 @@ class SkillTrackerApp:
             return f"{hours:d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:d}:{seconds:02d}"
 
-    def _draw_xy_axes(self, canvas, title, x_label, y_label, min_x, max_x, min_y, max_y, *, x_is_time=False, y_suffix=""):
+    def _draw_xy_axes(self, canvas, title, x_label, y_label, min_x, max_x, min_y, max_y, *, x_is_time=False, y_suffix="", time_origin=None):
         width, height, left, top, right, bottom = self._chart_area(canvas)
         canvas.delete("all")
         canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
@@ -2797,13 +2849,17 @@ class SkillTrackerApp:
             canvas.create_line(left, y, right, y, fill=grid_color)
             canvas.create_text(left - 6, y, anchor="e", text=self._format_axis_value(y_value, y_suffix), fill=muted_color, font=("Arial", 8))
 
-        for i in range(6):
-            frac = i / 5
+        include_date = x_is_time and self.chart_range_crosses_date(time_origin, min_x, max_x)
+        tick_count = 4 if include_date and right - left < 800 else 6
+        for i in range(tick_count):
+            frac = i / (tick_count - 1)
             x = left + (right - left) * frac
             x_value = min_x + x_range * frac
             canvas.create_line(x, top, x, bottom, fill=grid_color)
-            label = self._time_axis_label(x_value) if x_is_time else self._format_axis_value(x_value)
-            canvas.create_text(x, bottom + 14, anchor="n", text=label, fill=muted_color, font=("Arial", 8))
+            label = self._time_axis_label(x_value, time_origin=time_origin, include_date=include_date) if x_is_time else self._format_axis_value(x_value)
+            # Long dated labels stay within the canvas at the two edge ticks.
+            anchor = "nw" if i == 0 else "ne" if i == tick_count - 1 else "n"
+            canvas.create_text(x, bottom + 14, anchor=anchor, text=label, fill=muted_color, font=("Arial", 8))
 
         canvas.create_text((left + right) / 2, height - 8, text=x_label, fill=text_color, font=("Arial", 9))
         canvas.create_text(14, (top + bottom) / 2, text=y_label, fill=text_color, font=("Arial", 9), angle=90)
@@ -2816,7 +2872,7 @@ class SkillTrackerApp:
         py = bottom - (bottom - top) * ((float(y) - min_y) / y_range)
         return px, py
 
-    def render_line_chart(self, canvas, points, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, y_reference_lines=None):
+    def render_line_chart(self, canvas, points, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, y_reference_lines=None, time_origin=None):
         payload = {
             "kind": "line",
             "points": list(points or []),
@@ -2824,6 +2880,7 @@ class SkillTrackerApp:
             "x_label": x_label,
             "y_label": y_label,
             "x_is_time": bool(x_is_time),
+            "time_origin": time_origin,
             "y_suffix": y_suffix,
             "smooth": bool(smooth),
             "y_reference_lines": list(y_reference_lines or []),
@@ -2866,6 +2923,7 @@ class SkillTrackerApp:
             max_y,
             x_is_time=bool(payload.get("x_is_time", True)),
             y_suffix=str(payload.get("y_suffix", "") or ""),
+            time_origin=payload.get("time_origin"),
         )
         self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="line")
         for reference_value, reference_label in reference_lines:
@@ -3007,7 +3065,7 @@ class SkillTrackerApp:
             canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=("Arial", 9, "bold"))
             y += line_height
 
-    def render_multi_line_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False):
+    def render_multi_line_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, time_origin=None):
         payload = {
             "kind": "multi_line",
             "series": [(name, list(points or [])) for name, points in list(series or [])],
@@ -3015,6 +3073,7 @@ class SkillTrackerApp:
             "x_label": x_label,
             "y_label": y_label,
             "x_is_time": bool(x_is_time),
+            "time_origin": time_origin,
             "y_suffix": y_suffix,
             "smooth": bool(smooth),
         }
@@ -3049,6 +3108,7 @@ class SkillTrackerApp:
             max_y,
             x_is_time=bool(payload.get("x_is_time", True)),
             y_suffix=str(payload.get("y_suffix", "") or ""),
+            time_origin=payload.get("time_origin"),
         )
         palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
         legend_entries = []
@@ -3068,7 +3128,7 @@ class SkillTrackerApp:
                 canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline="")
         self._draw_chart_legend(canvas, legend_entries, right=right, top=top, bottom=bottom)
 
-    def render_multi_point_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True):
+    def render_multi_point_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, time_origin=None):
         payload = {
             "kind": "multi_points",
             "series": [(name, list(points or [])) for name, points in list(series or [])],
@@ -3076,6 +3136,7 @@ class SkillTrackerApp:
             "x_label": x_label,
             "y_label": y_label,
             "x_is_time": bool(x_is_time),
+            "time_origin": time_origin,
         }
         self.loot_chart_payloads[canvas] = payload
         self._draw_multi_point_chart_payload(canvas, payload)
@@ -3119,6 +3180,7 @@ class SkillTrackerApp:
             max_y,
             x_is_time=bool(payload.get("x_is_time", True)),
             y_suffix="",
+            time_origin=payload.get("time_origin"),
         )
         self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="multi_points")
         palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
