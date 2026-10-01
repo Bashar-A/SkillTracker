@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -964,8 +965,12 @@ class SkillTrackerApp:
 
         self.profession_var = tk.StringVar()
         default_projection_profession = "Animal Looter" if "Animal Looter" in PROFESSIONS else next(iter(PROFESSIONS), "")
-        self.session_projection_profession_var = tk.StringVar(value=default_projection_profession)
-        self.session_projection_ped_var = tk.StringVar(value="1000")
+        saved_projection_profession = self.state.get("projection_profession", default_projection_profession)
+        if saved_projection_profession not in PROFESSIONS:
+            saved_projection_profession = default_projection_profession
+        self.session_projection_profession_var = tk.StringVar(value=saved_projection_profession)
+        self.session_projection_ped_var = tk.StringVar(value=str(self.state.get("projection_ped_cycle", "1000")))
+        self.projection_refresh_after_id = None
         self.total_gain_var = tk.StringVar(value="Total profession gain: 0.0000")
         self.selected_skill_var = tk.StringVar(value="")
         self.current_var = tk.StringVar(value="0")
@@ -977,6 +982,13 @@ class SkillTrackerApp:
         self.monitor_status_var = tk.StringVar(value="Stopped")
         self.monitor_progress_var = tk.StringVar(value="")
         self.session_summary_var = tk.StringVar(value="No active session")
+        self.monitor_metric_vars = {
+            key: tk.StringVar(value="—")
+            for key in ("ped", "loot", "damage", "kills", "cost", "dpp", "effective_dpp", "skill_tt")
+        }
+        self.monitor_combat_var = tk.StringVar(value="")
+        self.monitor_skills_var = tk.StringVar(value="")
+        self.monitor_projection_var = tk.StringVar(value="Start a session to project profession and HP gains.")
         self.sync_start_modes = (
             "Resume saved position",
             "From chosen time",
@@ -1046,6 +1058,8 @@ class SkillTrackerApp:
         self.mob_analysis_results = []
 
         self.create_ui()
+        for projection_var in (self.session_projection_profession_var, self.session_projection_ped_var):
+            projection_var.trace_add("write", self.schedule_projection_refresh)
         self.load_profession()
         self.refresh_hunting_info()
         self.refresh_sessions_table()
@@ -1213,38 +1227,80 @@ class SkillTrackerApp:
         self.skill_tree.bind("<<TreeviewSelect>>", self.on_skill_selected)
 
     def create_monitor_tab(self):
+        self.configure_monitor_styles()
         top = ttk.Frame(self.monitor_tab, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="chat.log:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.chat_log_path_var, width=90).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(top, text="Browse", command=self.browse_chat_log).grid(row=0, column=2, padx=4)
-        ttk.Button(top, text="Start Sync", command=self.start_sync).grid(row=0, column=3, padx=4)
-        ttk.Button(top, text="Stop Sync", command=self.stop_sync).grid(row=0, column=4, padx=4)
-        self.pause_sync_button = ttk.Button(top, text="Pause Sync", command=self.toggle_pause_sync)
-        self.pause_sync_button.grid(row=0, column=5, padx=4)
-        ttk.Label(top, textvariable=self.monitor_status_var, font=("Arial", 11, "bold")).grid(row=0, column=6, padx=12)
-        ttk.Label(top, text="Start from:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.chat_log_path_var).grid(row=0, column=1, columnspan=5, sticky="ew", padx=6)
+        ttk.Button(top, text="Browse", command=self.browse_chat_log).grid(row=0, column=6, padx=4)
+        actions = ttk.Frame(top)
+        actions.grid(row=1, column=0, columnspan=7, sticky="ew", pady=8)
+        ttk.Button(actions, text="Start Sync", command=self.start_sync).pack(side="left")
+        ttk.Button(actions, text="Stop Sync", command=self.stop_sync).pack(side="left", padx=6)
+        self.pause_sync_button = ttk.Button(actions, text="Pause Sync", command=self.toggle_pause_sync)
+        self.pause_sync_button.pack(side="left")
+        ttk.Label(actions, textvariable=self.monitor_status_var).pack(side="right", padx=8)
+        ttk.Label(top, text="Start from:").grid(row=2, column=0, sticky="w")
         ttk.Combobox(
             top,
             textvariable=self.sync_start_mode_var,
             values=self.sync_start_modes,
             width=24,
             state="readonly",
-        ).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
-        ttk.Label(top, text="last_log_read_at:").grid(row=1, column=2, sticky="e", padx=(8, 4), pady=(6, 0))
-        ttk.Entry(top, textvariable=self.last_log_read_at_var, width=25).grid(row=1, column=3, sticky="w", pady=(6, 0))
-        ttk.Button(top, text="Save Time", command=self.save_last_log_read_at_from_ui).grid(row=1, column=4, sticky="w", padx=4, pady=(6, 0))
-        ttk.Button(top, text="Clear Time", command=self.clear_last_log_read_at).grid(row=1, column=5, sticky="w", padx=4, pady=(6, 0))
-        ttk.Button(top, text="Reload Time", command=self.reload_last_log_read_at).grid(row=1, column=6, sticky="w", padx=4, pady=(6, 0))
-        ttk.Label(top, textvariable=self.monitor_progress_var).grid(row=2, column=1, columnspan=6, sticky="w", padx=6, pady=(4, 0))
+        ).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(top, text="Last read:").grid(row=2, column=2, sticky="e", padx=(8, 4))
+        ttk.Entry(top, textvariable=self.last_log_read_at_var, width=25).grid(row=2, column=3, sticky="w")
+        ttk.Button(top, text="Save Time", command=self.save_last_log_read_at_from_ui).grid(row=2, column=4, sticky="w", padx=4)
+        ttk.Button(top, text="Clear Time", command=self.clear_last_log_read_at).grid(row=2, column=5, sticky="w", padx=4)
+        ttk.Button(top, text="Reload Time", command=self.reload_last_log_read_at).grid(row=2, column=6, sticky="w", padx=4)
+        ttk.Label(top, textvariable=self.monitor_progress_var).grid(row=3, column=0, columnspan=7, sticky="w", pady=(4, 0))
         top.columnconfigure(1, weight=1)
 
         summary = ttk.LabelFrame(self.monitor_tab, text="Current session", padding=10)
         summary.pack(fill="x", padx=10, pady=6)
-        ttk.Label(summary, textvariable=self.session_summary_var, justify="left").pack(anchor="w")
+        self.add_monitor_wrapped_label(summary, self.session_summary_var)
+        metrics = ttk.Frame(summary)
+        metrics.pack(fill="x", pady=(8, 6))
+        for index, (key, title) in enumerate((
+            ("ped", "PED cycled"), ("loot", "Loot TT / Return"),
+            ("damage", "Total damage"), ("kills", "Loot events / Kills"),
+            ("cost", "Average cost / Kill (PED)"), ("dpp", "DPP (damage / PEC)"),
+            ("effective_dpp", "Effective DPP (damage / PEC)"), ("skill_tt", "Skill TT / Cycled"),
+        )):
+            row, column = divmod(index, 4)
+            card = ttk.Frame(metrics, padding=(10, 6))
+            card.grid(row=row, column=column, sticky="nsew")
+            metrics.columnconfigure(column, weight=1, uniform="monitor_metrics")
+            ttk.Label(card, text=title, style="Monitor.Caption.TLabel", wraplength=220).pack(anchor="w")
+            ttk.Label(card, textvariable=self.monitor_metric_vars[key], style="Monitor.Value.TLabel").pack(anchor="w", pady=(3, 0))
+        self.add_monitor_wrapped_label(summary, self.monitor_combat_var)
+        self.add_monitor_wrapped_label(summary, self.monitor_skills_var)
+
+        projection = ttk.LabelFrame(self.monitor_tab, text="Profession projection", padding=10)
+        projection.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(projection, text="Profession:").grid(row=0, column=0, sticky="w")
+        self.monitor_projection_combo = ttk.Combobox(
+            projection, textvariable=self.session_projection_profession_var,
+            values=sorted(PROFESSIONS.keys(), key=str.lower), state="readonly", width=35,
+        )
+        self.monitor_projection_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Label(projection, text="PED to cycle:").grid(row=0, column=2, sticky="w", padx=(16, 0))
+        self.monitor_projection_ped_entry = ttk.Entry(projection, textvariable=self.session_projection_ped_var, width=14)
+        self.monitor_projection_ped_entry.grid(row=0, column=3, sticky="w", padx=8)
+        self.monitor_projection_ped_entry.bind("<Return>", self.refresh_projection_views)
+        ttk.Button(projection, text="Calculate", command=self.refresh_projection_views).grid(row=0, column=4, padx=4)
+        projection.columnconfigure(1, weight=1)
+        projection_result = ttk.Frame(projection)
+        projection_result.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self.add_monitor_wrapped_label(projection_result, self.monitor_projection_var)
+
+        body = ttk.Panedwindow(self.monitor_tab, orient="vertical")
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        skill_frame = ttk.LabelFrame(body, text="Session skill gains", padding=6)
+        body.add(skill_frame, weight=3)
 
         columns = ("skill", "tt_gain", "tt_percent", "point_gain", "gain_count", "message_percent", "current")
-        self.session_skill_tree = ttk.Treeview(self.monitor_tab, columns=columns, show="headings", height=10)
+        self.session_skill_tree = ttk.Treeview(skill_frame, columns=columns, show="headings", height=7)
         for col, title, width in [
             ("skill", "Skill", 280), ("tt_gain", "TT-equivalent gain", 160),
             ("tt_percent", "TT % of skills", 120),
@@ -1253,7 +1309,7 @@ class SkillTrackerApp:
             ("current", "Current skill", 160),
         ]:
             self.session_skill_tree.heading(col, text=title)
-            self.session_skill_tree.column(col, width=width, anchor="center" if col != "skill" else "w")
+            self.session_skill_tree.column(col, width=width, minwidth=width, anchor="center" if col != "skill" else "w")
         self.make_tree_sortable(self.session_skill_tree, {
             "skill": "Skill",
             "tt_gain": "TT-equivalent gain",
@@ -1263,16 +1319,81 @@ class SkillTrackerApp:
             "message_percent": "Msg % of skills",
             "current": "Current skill",
         })
-        self.session_skill_tree.pack(fill="both", expand=True, padx=10, pady=6)
+        skill_y = ttk.Scrollbar(skill_frame, orient="vertical", command=self.session_skill_tree.yview)
+        skill_x = ttk.Scrollbar(skill_frame, orient="horizontal", command=self.session_skill_tree.xview)
+        self.session_skill_tree.configure(yscrollcommand=skill_y.set, xscrollcommand=skill_x.set)
+        self.session_skill_tree.grid(row=0, column=0, sticky="nsew")
+        skill_y.grid(row=0, column=1, sticky="ns")
+        skill_x.grid(row=1, column=0, sticky="ew")
+        skill_frame.columnconfigure(0, weight=1)
+        skill_frame.rowconfigure(0, weight=1)
         self.session_skill_tree.bind(
             "<Double-1>",
             lambda event: self.open_skill_gain_details_from_tree(event, self.session_skill_tree, "active"),
         )
 
-        event_frame = ttk.LabelFrame(self.monitor_tab, text="Recent parsed events", padding=6)
-        event_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        self.event_text = tk.Text(event_frame, height=10, wrap="none")
-        self.event_text.pack(fill="both", expand=True)
+        event_frame = ttk.LabelFrame(body, text="Recent parsed events", padding=6)
+        body.add(event_frame, weight=1)
+        self.event_text = tk.Text(event_frame, height=4, wrap="none")
+        event_y = ttk.Scrollbar(event_frame, orient="vertical", command=self.event_text.yview)
+        event_x = ttk.Scrollbar(event_frame, orient="horizontal", command=self.event_text.xview)
+        self.event_text.configure(yscrollcommand=event_y.set, xscrollcommand=event_x.set)
+        self.event_text.grid(row=0, column=0, sticky="nsew")
+        event_y.grid(row=0, column=1, sticky="ns")
+        event_x.grid(row=1, column=0, sticky="ew")
+        event_frame.columnconfigure(0, weight=1)
+        event_frame.rowconfigure(0, weight=1)
+        self.style_monitor_widgets(self.monitor_tab)
+
+    def configure_monitor_styles(self):
+        """Scope the visual refresh to Live Monitor; other tabs keep their theme."""
+        style = ttk.Style(self.root)
+        font = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+        self.monitor_font = (font, 9)
+        background, surface, ink = "#f3f5f7", "#ffffff", "#192b3a"
+        style.configure("Monitor.TFrame", background=background)
+        style.configure("Monitor.Surface.TFrame", background=surface)
+        style.configure("Monitor.TLabelframe", background=surface, borderwidth=1, relief="solid")
+        style.configure("Monitor.TLabelframe.Label", background=surface, foreground=ink, font=(font, 10, "bold"))
+        style.configure("Monitor.TLabel", background=background, foreground=ink, font=self.monitor_font)
+        style.configure("Monitor.Surface.TLabel", background=surface, foreground=ink, font=self.monitor_font)
+        style.configure("Monitor.Caption.TLabel", background=surface, foreground="#536779", font=(font, 8))
+        style.configure("Monitor.Value.TLabel", background=surface, foreground="#126579", font=(font, 14, "bold"))
+        style.configure("Monitor.TButton", font=self.monitor_font, padding=(8, 4))
+        style.configure("Monitor.Treeview", font=self.monitor_font, rowheight=24, background=surface, fieldbackground=surface)
+        style.configure("Monitor.Treeview.Heading", font=(font, 9, "bold"), padding=(4, 5))
+
+    def style_monitor_widgets(self, parent, surface=False):
+        for widget in (parent, *parent.winfo_children()):
+            widget_class = widget.winfo_class()
+            on_surface = surface or widget_class == "TLabelframe"
+            styles = {
+                "TFrame": "Monitor.Surface.TFrame" if on_surface else "Monitor.TFrame",
+                "TLabel": "Monitor.Surface.TLabel" if on_surface else "Monitor.TLabel",
+                "TLabelframe": "Monitor.TLabelframe", "TButton": "Monitor.TButton",
+                "Treeview": "Monitor.Treeview",
+            }
+            if widget_class in styles and not widget.cget("style"):
+                widget.configure(style=styles[widget_class])
+            if widget is not parent:
+                self.style_monitor_widgets(widget, on_surface)
+
+    def add_monitor_wrapped_label(self, parent, variable):
+        label = ttk.Label(parent, textvariable=variable, justify="left", anchor="w")
+        label.pack(fill="x", anchor="w")
+        label.bind("<Configure>", lambda event: label.configure(wraplength=max(1, event.width)))
+        return label
+
+    def schedule_projection_refresh(self, *_args):
+        if self.projection_refresh_after_id is not None:
+            self.root.after_cancel(self.projection_refresh_after_id)
+        self.projection_refresh_after_id = self.root.after(200, self.refresh_projection_views)
+
+    def refresh_projection_views(self, event=None):
+        if self.projection_refresh_after_id is not None:
+            self.root.after_cancel(self.projection_refresh_after_id)
+            self.projection_refresh_after_id = None
+        self.refresh_selected_session_details()
 
 
     def create_loot_tab(self):
@@ -4468,7 +4589,7 @@ class SkillTrackerApp:
         self.reader_done_pending = False
         self.monitor_status_var.set("Stopped")
         self.monitor_progress_var.set("")
-        self.session_summary_var.set("No active session")
+        self.update_session_summary()
         self.refresh_sessions_table()
         self.save_state()
 
@@ -5032,7 +5153,7 @@ class SkillTrackerApp:
         if not profession:
             return [], 0.0
         if isinstance(session, MonitorSession):
-            session = asdict(session)
+            session = vars(session)  # Read-only: avoid copying the entire event history.
 
         skill_tt = session.get("skill_gains_tt", {}) or {}
         ped_cycled = float(session.get("ped_cycled", 0.0) or 0.0)
@@ -5083,7 +5204,7 @@ class SkillTrackerApp:
     def calculate_session_projected_hp_details(self, session, ped_cycle: float | None = None):
         """Project HP gain from every HP-granting skill gained in the session."""
         if isinstance(session, MonitorSession):
-            session = asdict(session)
+            session = vars(session)
 
         skill_tt = session.get("skill_gains_tt", {}) or {}
         skill_points = session.get("skill_gains_points", {}) or {}
@@ -5144,7 +5265,7 @@ class SkillTrackerApp:
 
     def selected_projection_ped_cycle(self) -> float | None:
         ped_cycle = parse_float(self.session_projection_ped_var.get(), None)
-        if ped_cycle is None or ped_cycle < 0:
+        if ped_cycle is None or not math.isfinite(ped_cycle) or ped_cycle < 0:
             return None
         return ped_cycle
 
@@ -5155,9 +5276,12 @@ class SkillTrackerApp:
         profession_name = self.selected_projection_profession()
         ped_cycle = self.selected_projection_ped_cycle()
         if ped_cycle is None:
-            return f"{profession_name} projected gain: invalid PED cycle"
+            return f"{profession_name} projected gain: enter a finite, non-negative PED amount."
+        session_data = vars(session) if isinstance(session, MonitorSession) else session
+        if float(session_data.get("ped_cycled", 0.0) or 0.0) <= 0:
+            return "Projection unavailable until the session has a positive PED cycled total."
 
-        rows, projected = self.calculate_profession_projection_details(
+        _rows, projected = self.calculate_profession_projection_details(
             session,
             profession_name,
             ped_cycle,
@@ -5168,8 +5292,33 @@ class SkillTrackerApp:
         )
         return (
             f"{profession_name} projected gain at {self.format_ped_cycle(ped_cycle)} PED: "
-            f"{projected:.4f} | Projected HP gain from all session skills: {projected_hp:.6f}"
+            f"{projected:.4f} | Projected HP gain (all skills): {projected_hp:.6f}"
         )
+
+    def calculate_session_combat_metrics(self, session):
+        """Derived display values only; never add fields to saved sessions.
+
+        Both DPP values use damage/PEC. Effective DPP uses the saved session's
+        mob and maturity, and the same average cost/kill used by session details
+        (total PED cycled / loot events). Loot events are a proxy for kills.
+        """
+        if isinstance(session, MonitorSession):
+            data = vars(session)
+            kills = len(session.loot_events)
+        else:
+            data = session or {}
+            kills = len(self.loot_events_for_session(data))
+            if not kills:
+                kills = max(0, int(data.get("loot_event_count", 0) or 0))
+        ped = parse_float(data.get("ped_cycled"), 0.0)
+        damage = parse_float(data.get("damage_total"), 0.0)
+        cost = ped / kills if kills and math.isfinite(ped) and ped > 0 else None
+        dpp = damage / ped / 100.0 if math.isfinite(damage) and math.isfinite(ped) and ped > 0 else None
+        mob = MOBS.get(data.get("mob", "")) or {}
+        maturity = (mob.get("maturities") or {}).get(data.get("maturity", "")) or {}
+        hp = parse_float(maturity.get("hp"), None)
+        effective_dpp = hp / cost / 100.0 if cost and hp is not None and math.isfinite(hp) and hp > 0 else None
+        return {"kills": kills, "cost_per_kill": cost, "dpp": dpp, "effective_dpp": effective_dpp}
 
     def refresh_session_skill_tree(self):
         self.session_skill_tree.delete(*self.session_skill_tree.get_children())
@@ -5199,45 +5348,49 @@ class SkillTrackerApp:
     def update_session_summary(self):
         if self.current_session is None:
             self.session_summary_var.set("No active session")
+            for variable in self.monitor_metric_vars.values():
+                variable.set("—")
+            self.monitor_combat_var.set("")
+            self.monitor_skills_var.set("")
+            self.monitor_projection_var.set("Start a session to project profession and HP gains.")
             return
         s = self.current_session
-        top_professions = sorted(s.total_profession_gain_by_profession.items(), key=lambda item: item[1], reverse=True)[:5]
-        top_text = ", ".join(f"{name}: +{value:.4f}" for name, value in top_professions) or "-"
+        metrics = self.calculate_session_combat_metrics(s)
         total_skill_gain_events = sum(s.skill_gain_events_by_skill.values())
         loot_percent = percent(s.loot_ped_total, s.ped_cycled)
-        loot_event_count = len(s.loot_events)
-        cost_per_kill = s.ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(s.skill_gain_tt_total, s.ped_cycled)
         skill_messages_per_attack = percent(total_skill_gain_events, s.attacks_total)
         session_hp_gain = sum(
             skill_hp_gain(skill_name, point_gain)
             for skill_name, point_gain in s.skill_gains_points.items()
         )
-        top_skills = []
-        for skill, tt_gain in sorted(s.skill_gains_tt.items(), key=lambda item: item[1], reverse=True)[:5]:
-            gain_count = int(s.skill_gain_events_by_skill.get(skill, 0))
-            top_skills.append(
-                f"{skill}: {tt_gain:.4f} TT ({percent(tt_gain, s.skill_gain_tt_total):.1f}% TT, "
-                f"{percent(gain_count, total_skill_gain_events):.1f}% msgs)"
-            )
-        top_skills_text = "; ".join(top_skills) or "-"
         attachments = ", ".join(s.attachments or []) or "-"
-        profession_projection_text = self.profession_projection_text(s)
         self.session_summary_var.set(
             f"Started: {s.started_at} | Weapon: {s.weapon or '-'} | Amp: {s.amplifier or '-'} | Attachments: {attachments}\n"
-            f"Mob: {s.mob or '-'} {s.maturity or ''}\n"
-            f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, "
-            f"defended {s.defended_attacks}, misses {s.missed_attacks}) | "
-            f"Damage: {s.damage_total:.1f} | PED cycled: {s.ped_cycled:.4f} | Loot: {s.loot_ped_total:.4f} PED ({loot_percent:.2f}%) | "
-            f"Loot events/kills: {loot_event_count} | Cost/kill: {cost_per_kill:.6f} PED\n"
-            f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
-            f"TT-equivalent total: {s.skill_gain_tt_total:.4f} ({skill_tt_percent:.2f}% of cycled) | "
-            f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
-            f"HP gained from skills: {session_hp_gain:.6f}\n"
-            f"Top skills: {top_skills_text}\n"
-            f"Top profession gains: {top_text}\n"
-            f"{profession_projection_text}"
+            f"Mob: {s.mob or '-'} {s.maturity or ''}"
         )
+        display_values = {
+            "ped": f"{s.ped_cycled:.4f}",
+            "loot": f"{s.loot_ped_total:.4f} / {loot_percent:.2f}%" if s.ped_cycled > 0 else f"{s.loot_ped_total:.4f} / —",
+            "damage": f"{s.damage_total:.1f}",
+            "kills": str(metrics["kills"]),
+            "cost": f'{metrics["cost_per_kill"]:.6f}' if metrics["cost_per_kill"] is not None else "—",
+            "dpp": f'{metrics["dpp"]:.3f}' if metrics["dpp"] is not None else "—",
+            "effective_dpp": f'{metrics["effective_dpp"]:.3f}' if metrics["effective_dpp"] is not None else "—",
+            "skill_tt": f"{s.skill_gain_tt_total:.4f} / {skill_tt_percent:.2f}%" if s.ped_cycled > 0 else f"{s.skill_gain_tt_total:.4f} / —",
+        }
+        for key, value in display_values.items():
+            self.monitor_metric_vars[key].set(value)
+        self.monitor_combat_var.set(
+            f"Attacks: {s.attacks_total} (hits {s.normal_hits}, crits {s.critical_hits}, "
+            f"defended {s.defended_attacks}, misses {s.missed_attacks})"
+        )
+        self.monitor_skills_var.set(
+            f"Skill gains: {total_skill_gain_events} messages | Point total: {s.skill_gain_points_total:.4f} | "
+            f"Skill messages/attack: {skill_messages_per_attack:.2f}% | "
+            f"HP gained from skills: {session_hp_gain:.6f}"
+        )
+        self.monitor_projection_var.set(self.profession_projection_text(s))
 
     def append_event(self, text: str):
         # Writing one Tk Text row per parsed event is extremely expensive. Keep
@@ -5492,6 +5645,7 @@ class SkillTrackerApp:
             self.last_log_read_at_var.set(preserved_last_read_at)
 
         self.state = {
+            **self.state,
             "chat_log_path": chat_log_path,
             "last_log_offset": int(self.log_offset),
             "last_log_read_at": preserved_last_read_at,
@@ -5506,6 +5660,8 @@ class SkillTrackerApp:
             "count_hunting": bool(self.count_hunting_var.get()),
             "selected_hunting_setup": self.hunting_setup_name_var.get().strip(),
             "sync_start_mode": self.sync_start_mode_var.get(),
+            "projection_profession": self.session_projection_profession_var.get(),
+            "projection_ped_cycle": self.session_projection_ped_var.get(),
             "analysis_efficiency": self.analysis_efficiency_var.get(),
             "analysis_animal_looter": self.analysis_looter_vars["Animal"].get(),
             "analysis_robot_looter": self.analysis_looter_vars["Robot"].get(),
