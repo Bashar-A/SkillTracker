@@ -117,7 +117,7 @@ class LiveMonitorTkIntegration(unittest.TestCase):
             self.root = tk.Tk()
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
-        self.addCleanup(lambda: self.root.destroy())
+        self.addCleanup(self.destroy_root)
         self.original_cwd = os.getcwd()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -139,6 +139,11 @@ class LiveMonitorTkIntegration(unittest.TestCase):
         self.app = tracker.SkillTrackerApp(self.root)
         self.root.update()
 
+    def destroy_root(self):
+        for timer in self.root.tk.call("after", "info"):
+            self.root.after_cancel(timer)
+        self.root.destroy()
+
     def test_legacy_files_unchanged_and_projection_preferences_survive_restart(self):
         sessions_before = tracker.SESSIONS_FILE.read_bytes()
         analysis_before = tracker.ANALYSIS_SESSIONS_FILE.read_bytes()
@@ -153,7 +158,7 @@ class LiveMonitorTkIntegration(unittest.TestCase):
         self.assertEqual(state["projection_ped_cycle"], "2500.5")
         self.assertEqual(state["last_log_read_at"], "2025-01-01T12:00:00")
         self.assertEqual(state["custom_setting"], {"keep": True})
-        self.root.destroy()
+        self.destroy_root()
         self.root = tk.Tk()
         self.app = tracker.SkillTrackerApp(self.root)
         self.assertEqual(self.app.session_projection_profession_var.get(), "Robot Looter")
