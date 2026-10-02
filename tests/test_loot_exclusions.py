@@ -239,7 +239,8 @@ class LootExclusionTests(unittest.TestCase):
             window = next(w for w in self.root.children.values() if isinstance(w, tk.Toplevel))
             tree = next(w for w in self.descendants(window) if w.winfo_class() == "Treeview")
             tree.selection_set(tree.get_children()[0])
-            button = next(w for w in self.descendants(window) if w.winfo_class() == "TButton")
+            button = next(w for w in self.descendants(window) if w.winfo_class() == "TButton"
+                          and w.cget("text") == "Exclude selected item from this event")
             button.invoke()
             self.assertFalse(window.winfo_exists())
             self.assertEqual(self.source["loot_ped_total"], 30)
@@ -250,7 +251,8 @@ class LootExclusionTests(unittest.TestCase):
             window = next(w for w in self.root.children.values() if isinstance(w, tk.Toplevel))
             tree = next(w for w in self.descendants(window) if w.winfo_class() == "Treeview")
             tree.selection_set(tree.get_children()[0])
-            button = next(w for w in self.descendants(window) if w.winfo_class() == "TButton")
+            button = next(w for w in self.descendants(window) if w.winfo_class() == "TButton"
+                          and w.cget("text") == "Exclude selected drops of this item")
             button.invoke()
             self.assertFalse(window.winfo_exists())
             self.assertEqual(self.source["loot_ped_total"], 70)
