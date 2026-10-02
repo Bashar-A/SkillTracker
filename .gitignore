@@ -23,6 +23,8 @@ hunting_setups.json
 favorite_mobs.json
 loot_markups.json
 mob_analysis_sessions.json
+server_settings.json
+server_upload_receipts.json
 
 # Logs
 *.log
