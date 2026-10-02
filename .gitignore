@@ -54,3 +54,7 @@ htmlcov/
 # Packaging
 *.egg-info/
 .eggs/
+
+
+# Editable local mob catalog
+mob_catalog.json

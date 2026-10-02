@@ -46,3 +46,13 @@ Deploy the companion Mediocre Entropia catalog endpoint before testing the conne
 ## Validation
 
 `python -m unittest discover -s tests -v` covers upload payload privacy, timestamps, exclusions, batching, version/TT preservation, redirects, secret storage, selected/all-page uploads, duplicates, and partial failures. GUI tests require a Tk display.
+
+
+
+## Mob catalog
+
+The **Mob Catalog** tab lists every local mob. Search, double-click to view/edit, or choose **Add mob**. Edit the type and planets; use **Add / update maturity** for each maturity's HP and level, then **Save mob**. The editable catalog is saved atomically in `mob_catalog.json` and loaded on restart alongside bundled defaults. Blank HP/level means unknown.
+
+In **Settings**, choose **Sync mobs** after configuring the server URL and API token. The tracker downloads every server catalog page, merges by case-insensitive mob name with the complete server record taking priority, saves locally, and uploads the merged catalog in batches. The server adds only missing mobs. A final download/save resolves changes made on the server during synchronization. To change an existing shared mob, edit it in the server's **Mob catalog** UI; a subsequent sync will replace the local duplicate with that server version. Synchronization runs off the UI thread and displays failures in Settings. If an upload fails, the successfully downloaded merged catalog remains saved locally and retrying is safe.
+
+Session uploads now include the weapon, amplifier, all attachment names, damage/DPP metrics, and each loot event's original start/end clocks. Naive loot clocks come from UTC chat.log and are explicitly marked UTC; they are never treated as the computer's local timezone. Existing offset clocks are converted to UTC. Missing legacy event times remain unknown. Local raw chat, paths, and skill snapshots are still omitted.

@@ -12,9 +12,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_EVENTS = 100000
-SESSION_FIELDS = ("id", "mob", "mob_type", "maturity", "weapon", "planet", "notes",
+SESSION_FIELDS = ("id", "mob", "mob_type", "maturity", "weapon", "amplifier", "attachments", "planet", "notes",
+                  "dpp", "effective_dpp", "damage_total",
                   "started_at", "ended_at", "ped_cycled")
-EVENT_FIELDS = ("value_ped", "cost_ped", "items", "messages", "excluded_from_loot", "excluded_loot_items")
+EVENT_FIELDS = ("value_ped", "cost_ped", "items", "messages", "excluded_from_loot", "excluded_loot_items", "started_at", "ended_at", "timestamp")
 ITEM_FIELDS = ("value", "minTt", "maxTt", "markupType", "markup")
 
 
@@ -94,6 +95,19 @@ def session_payload(session):
     if any(not isinstance(row, dict) for row in events):
         raise UploadError("Invalid loot event in session.")
     payload["loot_events"] = [{key: row[key] for key in EVENT_FIELDS if key in row} for row in events]
+    for event in payload['loot_events']:
+        for key in ('started_at', 'ended_at', 'timestamp'):
+            raw = event.get(key)
+            if raw in (None, ''):
+                event.pop(key, None)
+                continue
+            try:
+                value = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+                # chat.log clocks have no offset and are UTC, unlike session clocks.
+                if value.tzinfo is None: value = value.replace(tzinfo=timezone.utc)
+                event[key] = value.astimezone(timezone.utc).isoformat()
+            except (ValueError, TypeError, OverflowError):
+                raise UploadError('Loot event has an invalid UTC timestamp.') from None
     encode(payload)
     return payload
 
@@ -220,6 +234,31 @@ class ServerClient:
                 raise UploadError("Catalog changed during reading. Retry the upload.")
             page += 1
 
+    def mobs(self):
+        from mob_catalog import mob_rows
+        rows, page = [], 1
+        while True:
+            data = self.request(f'mobs/?page={page}')
+            if not isinstance(data, dict) or not isinstance(data.get('rows'), list) or not isinstance(data.get('total'), int):
+                raise UploadError('Invalid server mob catalog.')
+            rows.extend(data['rows'])
+            if len(rows) >= data['total']: return mob_rows(rows)
+            if not data['rows'] or page >= 10000: raise UploadError('Mob catalog changed while reading. Retry sync.')
+            page += 1
+
+    def sync_mobs(self, local, save):
+        from mob_catalog import merge_mobs, mob_rows
+        merged = merge_mobs(local, self.mobs())
+        save(merged)
+        for batch in batches('mobs', mob_rows(merged)):
+            response = self.request('mobs/sync', batch, 'POST')
+            if not isinstance(response, dict) or not isinstance(response.get('added'), int):
+                raise UploadError('Invalid mob sync response. Refresh before retrying.')
+        # Re-read after uploads: concurrent server additions/edits also win locally.
+        merged = merge_mobs(merged, self.mobs())
+        save(merged)
+        return merged
+
     def upload(self, kind, rows, progress=lambda *args: None):
         method = "PUT" if kind == "skills" else "POST"
         if kind == "skills":
@@ -246,3 +285,4 @@ class ServerClient:
                     raise UploadError("Invalid session receipts. The server may have accepted the batch; re-uploading safely checks duplicates.")
             progress(index, len(bodies), body, response)
         return len(bodies)
+

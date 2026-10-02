@@ -39,6 +39,9 @@ try:
 except ImportError:
     MOBS = {}
 
+from mob_catalog import load_mobs
+MOBS = load_mobs(MOBS)
+
 try:
     from amplifier_data import AMPLIFIERS
 except ImportError:
@@ -1112,6 +1115,7 @@ class SkillTrackerApp(ServerUploadUI):
 
         self.current_skills = load_current_skills()
         self.initialize_server_uploads()
+        self.mob_catalog = MOBS
         self.state = load_json(TRACKER_STATE_FILE, {})
         self.sessions = load_json(SESSIONS_FILE, [])
         if not isinstance(self.sessions, list):
@@ -1358,6 +1362,7 @@ class SkillTrackerApp(ServerUploadUI):
         self.loot_tab = ttk.Frame(notebook)
         self.mob_analysis_tab = ttk.Frame(notebook)
         self.analytic_sessions_tab = ttk.Frame(notebook)
+        self.mob_catalog_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
 
         notebook.add(self.monitor_tab, text="Live Monitor")
@@ -1367,6 +1372,7 @@ class SkillTrackerApp(ServerUploadUI):
         notebook.add(self.session_details_tab, text="Session Details")
         notebook.add(self.mob_analysis_tab, text="What Mob to Hunt")
         notebook.add(self.analytic_sessions_tab, text="Analytic Sessions")
+        notebook.add(self.mob_catalog_tab, text="Mob Catalog")
         notebook.add(self.settings_tab, text="Settings")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
@@ -1385,6 +1391,7 @@ class SkillTrackerApp(ServerUploadUI):
         self.create_session_details_tab()
         self.create_profession_tab()
         self.create_analytic_sessions_tab(PagedTree)
+        self.create_mob_catalog_tab()
         self.create_settings_tab()
         self.style_tracker_widgets(self.root)
         self.configure_ui_navigation()
@@ -7010,3 +7017,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
