@@ -207,8 +207,14 @@ class SessionAssignmentTests(unittest.TestCase):
             self.assertEqual(tree.set('session_0', 'skill_tt_percent'), f'{.002 / ped * 100:.2f}%')
             self.assertEqual(session['loot_events'][0]['cost_ped'], ped)
             self.assertEqual(self.app.analysis_sessions[0]['loot_events'][0]['analysis_loot_extension'], 'keep')
+            # Hidden views now render on activation, after the files/metrics
+            # have already been synchronized.
+            self.app.notebook.select(self.app.loot_tab)
+            self.root.update()
             self.assertEqual(self.app.loot_events_tree.set('loot_event_0', 'cost'), f'{ped:.4f}')
             self.assertIn(f'PED cycled: {ped:.4f}', self.app.loot_summary_var.get())
+            self.app.notebook.select(self.app.sessions_tab)
+            self.root.update()
         self.app.sessions[0]['maturity'] = 'unknown'
         self.app.refresh_sessions_table()
         self.assertEqual(self.app.sessions_tree.set('session_0', 'effective_dpp'), '—')

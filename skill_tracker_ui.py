@@ -6,7 +6,7 @@ import queue
 import re
 import threading
 import time
-from collections import deque
+from collections import deque, OrderedDict
 import tkinter as tk
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -918,11 +918,196 @@ class ChatLogParser:
         return None
 
 
+class SessionDerivedCache:
+    """Disposable, in-memory summaries; never serialize cache fields into sessions.
+
+    Keep small item totals for history/analysis, but bound the much larger
+    normalized event lists. All application loot mutations explicitly invalidate
+    their entry. Identity/length guards also detect replaced/imported histories.
+    """
+    def __init__(self, event_limit=6, event_budget=25000):
+        self.entries = {}
+        self.events = OrderedDict()
+        self.event_limit = event_limit
+        self.event_budget = event_budget
+        self.serial = 0
+
+    @staticmethod
+    def signature(session):
+        rows = session.get("loot_events") or ()
+        raw = session.get("events") or ()
+        version = parse_float(session.get("loot_event_grouping_version"), 0)
+        legacy = version < LOOT_EVENT_GROUPING_VERSION
+        return (id(rows), len(rows), version,
+                (id(raw), len(raw), session.get("count_hunting"), session.get("weapon"),
+                 session.get("amplifier"), tuple(session.get("attachments") or [])) if legacy else None)
+
+    def entry(self, session):
+        key, signature = id(session), self.signature(session)
+        entry = self.entries.get(key)
+        if entry is None or entry["source"] is not session or entry["signature"] != signature:
+            self.events.pop(key, None)
+            self.serial += 1
+            entry = {"source": session, "signature": signature, "summary": None, "generation": self.serial}
+            self.entries[key] = entry
+        return entry
+
+    def invalidate(self, session, *, keep_summary=False):
+        key = id(session)
+        old = self.entries.get(key)
+        summary = old["summary"] if keep_summary and old and old["source"] is session else None
+        self.events.pop(key, None)
+        self.serial += 1
+        self.entries[key] = {"source": session, "signature": self.signature(session), "summary": summary,
+                             "generation": self.serial}
+
+    def inherit_summary(self, source, target):
+        entry = self.entries.get(id(source))
+        if entry and entry["source"] is source and entry["signature"] == self.signature(source):
+            self.invalidate(target)
+            self.entries[id(target)]["summary"] = entry["summary"]
+
+    def normalized(self, session, build):
+        self.entry(session)
+        key = id(session)
+        if key not in self.events:
+            self.events[key] = build(session)
+            while len(self.events) > 1 and (len(self.events) > self.event_limit
+                                          or sum(len(rows) for rows in self.events.values()) > self.event_budget):
+                self.events.popitem(last=False)
+        self.events.move_to_end(key)
+        return self.events[key]
+
+    def prune(self, sources):
+        alive = {id(source) for source in sources if isinstance(source, dict)}
+        for key in list(self.entries):
+            if key not in alive:
+                self.entries.pop(key, None)
+                self.events.pop(key, None)
+
+
+class PageControls(ttk.Frame):
+    """Navigate all records while keeping only one page in Tk widgets."""
+    def __init__(self, parent, command, page_size=200):
+        super().__init__(parent)
+        self.command, self.page_size, self.page, self.total = command, page_size, 0, 0
+        buttons = ttk.Frame(self)
+        buttons.pack(side="left")
+        self.first = ttk.Button(buttons, text="First", width=5, command=lambda: self.go(0))
+        self.previous = ttk.Button(buttons, text="Prev", width=5, command=lambda: self.go(self.page - 1))
+        self.next = ttk.Button(buttons, text="Next", width=5, command=lambda: self.go(self.page + 1))
+        self.last = ttk.Button(buttons, text="Last", width=5, command=lambda: self.go(self.pages - 1))
+        for button in (self.first, self.previous, self.next, self.last):
+            button.pack(side="left", padx=1)
+        status = ttk.Frame(self)
+        status.pack(side="left")
+        self.label = ttk.Label(status)
+        self.label.pack(side="left", padx=6)
+        self.number = tk.StringVar(self, value="1")
+        entry = ttk.Entry(status, textvariable=self.number, width=5)
+        entry.pack(side="left")
+        entry.bind("<Return>", self.jump)
+        ttk.Button(status, text="Go", width=3, command=self.jump).pack(side="left", padx=2)
+        self.update_count(0)
+
+    @property
+    def pages(self):
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+    def update_count(self, total, *, reset=False):
+        self.total = total
+        self.page = 0 if reset else min(self.page, self.pages - 1)
+        start = self.page * self.page_size
+        self.label.configure(text=f"{start + 1 if total else 0}-{min(start + self.page_size, total)} / {total}")
+        self.number.set(str(self.page + 1))
+        for button in (self.first, self.previous):
+            button.configure(state="normal" if self.page else "disabled")
+        for button in (self.next, self.last):
+            button.configure(state="normal" if self.page + 1 < self.pages else "disabled")
+
+    def go(self, page):
+        page = max(0, min(page, self.pages - 1))
+        changed = page != self.page
+        if changed:
+            self.page = page
+        self.update_count(self.total)
+        if changed:
+            self.command()
+
+    def jump(self, event=None):
+        try:
+            self.go(int(self.number.get()) - 1)
+        except ValueError:
+            self.number.set(str(self.page + 1))
+
+
+class PagedTree:
+    def __init__(self, app, tree, parent, *, page_size=200):
+        self.app, self.tree = app, tree
+        self.rows, self.order, self.format_row = [], [], None
+        self.on_render = None
+        self.display_records = {}
+        self.controls = PageControls(parent, self.render, page_size)
+        app.paged_trees[tree] = self
+        tree.bind("<Destroy>", self.destroy, add="+")
+
+    def destroy(self, event):
+        if event.widget is self.tree:
+            self.app.paged_trees.pop(self.tree, None)
+            self.app.tree_sort_state.pop(self.tree, None)
+            self.app.tree_heading_titles.pop(self.tree, None)
+
+    def set_rows(self, rows, format_row, *, reset=False, on_render=None):
+        self.rows, self.format_row, self.on_render = rows, format_row, on_render
+        self.order = list(range(len(rows)))
+        self.controls.update_count(len(rows), reset=reset)
+        self.sort()
+
+    def sort(self):
+        state = self.app.tree_sort_state.get(self.tree, {})
+        column = state.get("column")
+        if column:
+            position = list(self.tree["columns"]).index(column)
+            keyed, empty = [], []
+            for index in self.order:
+                key = self.app.tree_sort_key(self.format_row(self.rows[index])[position])
+                (empty if key is None else keyed).append(index if key is None else (key, index))
+            keyed.sort(key=lambda pair: pair[0], reverse=bool(state.get("descending")))
+            self.order = [index for _, index in keyed] + empty
+        self.render()
+
+    def render(self):
+        selection = set(self.tree.selection())
+        focus = self.tree.focus()
+        self.tree.delete(*self.tree.get_children())
+        start = self.controls.page * self.controls.page_size
+        visible = [self.rows[index] for index in self.order[start:start + self.controls.page_size]]
+        for row in visible:
+            iid, _record = row
+            self.tree.insert("", "end", iid=iid, values=self.format_row(row))
+        kept = [iid for iid, record in visible if iid in selection and self.display_records.get(iid) is record]
+        if kept:
+            self.tree.selection_set(kept)
+        if self.tree.exists(focus) and self.display_records.get(focus) is dict(visible).get(focus):
+            self.tree.focus(focus)
+        self.display_records = dict(visible)
+        if self.on_render:
+            self.on_render(visible)
+
+
 class SkillTrackerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Entropia Skill Tracker")
         self.root.geometry("1280x820")
+        self.session_cache = SessionDerivedCache()
+        self.paged_trees = {}
+        self.loot_view_signature = None
+        self.loot_chart_signature = None
+        self.loot_base_chart_signature = None
+        self.loot_plot_data = None
+        self.loot_rows_signature = None
+        self.detail_session = None
 
         self.current_skills = load_current_skills()
         self.state = load_json(TRACKER_STATE_FILE, {})
@@ -1208,12 +1393,14 @@ class SkillTrackerApp:
         # Heavy loot tables/charts are refreshed on demand when their tab is
         # opened, rather than after every parsed log batch.
         if self.is_tab_active(getattr(self, "loot_tab", None)):
-            self.refresh_loot_tab()
+            self.refresh_loot_tab(force=False)
             self.last_loot_live_refresh_at = time.monotonic()
         elif self.is_tab_active(getattr(self, "profession_tab", None)):
             self.refresh_profession_current_values()
         elif self.is_tab_active(getattr(self, "mob_analysis_tab", None)):
-            self.refresh_mob_analysis()
+            self.refresh_mob_analysis(persist_settings=False)
+        elif self.is_tab_active(getattr(self, "session_details_tab", None)):
+            self.show_session_details(self.selected_session_from_table())
 
     def make_tree_sortable(self, tree, headings):
         self.tree_heading_titles[tree] = dict(headings)
@@ -1238,6 +1425,9 @@ class SkillTrackerApp:
         else:
             state["column"] = column
             state["descending"] = False
+        pager = self.paged_trees.get(tree)
+        if pager is not None:
+            pager.controls.update_count(len(pager.rows), reset=True)
         self.apply_tree_sort(tree)
         self.refresh_tree_sort_headings(tree)
 
@@ -1260,6 +1450,10 @@ class SkillTrackerApp:
             return (1, text.casefold())
 
     def apply_tree_sort(self, tree):
+        pager = getattr(self, "paged_trees", {}).get(tree)
+        if pager is not None:
+            pager.sort()
+            return
         state = self.tree_sort_state.get(tree, {})
         column = state.get("column")
         if not column:
@@ -1275,8 +1469,7 @@ class SkillTrackerApp:
                 keyed_items.append((key, item_id))
         keyed_items.sort(key=lambda item: item[0], reverse=descending)
         ordered_items = [item_id for _, item_id in keyed_items] + empty_items
-        for index, item_id in enumerate(ordered_items):
-            tree.move(item_id, "", index)
+        tree.set_children("", *ordered_items)
 
     def create_profession_tab(self):
         top_frame = ttk.LabelFrame(self.profession_tab, text="Profession", padding=10)
@@ -1657,7 +1850,7 @@ class SkillTrackerApp:
     def create_loot_tab(self):
         top = ttk.Frame(self.loot_tab, padding=10)
         top.pack(fill="x")
-        ttk.Button(top, text="Refresh", command=self.refresh_loot_tab).pack(side="right", padx=4)
+        ttk.Button(top, text="Refresh", command=lambda: self.refresh_loot_tab(force=True)).pack(side="right", padx=4)
         ttk.Button(top, text="Reset zoom", command=self.reset_loot_zoom).pack(side="right", padx=4)
         self.restore_loot_button = ttk.Button(top, text="Restore excluded loot", command=self.restore_excluded_loot)
         self.restore_loot_button.pack(side="right", padx=4)
@@ -1696,6 +1889,7 @@ class SkillTrackerApp:
         self.loot_item_summary_tree.pack(side="left", fill="x", expand=True)
         item_summary_scroll.pack(side="right", fill="y")
         self.loot_item_summary_tree.bind("<Double-1>", self.on_loot_item_summary_double_click)
+        self.loot_tab.bind("<Configure>", self.resize_loot_layout, add="+")
 
         selection = ttk.LabelFrame(self.loot_tab, text="Graph selection / zoom", padding=8)
         selection.pack(fill="x", padx=10, pady=(0, 6))
@@ -1727,8 +1921,13 @@ class SkillTrackerApp:
             if event.height <= 50:
                 return
             previous_height = getattr(left_panels, "previous_height", None)
-            fraction = left_panels.sashpos(0) / previous_height if previous_height else 0.5
-            left_panels.sashpos(0, int(event.height * fraction))
+            fraction = left_panels.sashpos(0) / previous_height if previous_height else 0.4
+            # Keep a usable checkbox viewport and at least one receipt row at
+            # smaller window sizes; paging controls must not squeeze either
+            # pane down to just its headings.
+            maximum = max(0, event.height - 185)
+            minimum = min(140, maximum)
+            left_panels.sashpos(0, max(minimum, min(maximum, int(event.height * fraction))))
             left_panels.previous_height = event.height
         left_panels.bind("<Configure>", balance_left_panels)
         items_frame = ttk.LabelFrame(left_panels, text="Item filter", padding=6)
@@ -1739,7 +1938,7 @@ class SkillTrackerApp:
         item_filter.bind("<KeyRelease>", lambda event: self.refresh_loot_item_checks(force=True))
         filter_actions = ttk.Frame(items_frame)
         filter_actions.pack(fill="x", pady=(0, 6))
-        ttk.Button(filter_actions, text="Apply selected items", command=self.refresh_loot_tab).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(filter_actions, text="Apply selected items", command=lambda: self.refresh_loot_tab(force=False)).pack(side="left", fill="x", expand=True, padx=(0, 4))
         ttk.Button(filter_actions, text="Clear selection", command=self.clear_loot_item_selection).pack(side="left", fill="x", expand=True)
 
         canvas_holder = ttk.Frame(items_frame)
@@ -1783,6 +1982,9 @@ class SkillTrackerApp:
         self.loot_events_tree.bind("<Double-1>", self.open_loot_event_details)
         ttk.Button(events_frame, text="Exclude selected events", command=self.exclude_selected_loot_events).grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.loot_pager = PagedTree(self, self.loot_events_tree, events_frame)
+        self.loot_pager.controls.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.loot_page_source = None
 
         graph1 = ttk.LabelFrame(graphs, text="1. Loot value / local time (% return)", padding=6)
         graph1.pack(fill="x", pady=(0, 6))
@@ -1805,6 +2007,11 @@ class SkillTrackerApp:
             canvas.bind("<B1-Motion>", lambda event, c=canvas: self.on_loot_chart_drag_motion(c, event))
             canvas.bind("<ButtonRelease-1>", lambda event, c=canvas: self.on_loot_chart_drag_end(c, event))
 
+    def resize_loot_layout(self, event=None):
+        height = 2 if self.root.winfo_height() < 800 else 3
+        if int(self.loot_item_summary_tree.cget("height")) != height:
+            self.loot_item_summary_tree.configure(height=height)
+
     def loot_source_session(self):
         if self.current_session is not None:
             # A shallow mapping is enough for read-only loot rendering. asdict()
@@ -1817,6 +2024,45 @@ class SkillTrackerApp:
         if self.sessions:
             return self.sessions[-1]
         return None
+
+    def derived_cache(self):
+        # Calculation helpers are also used without constructing Tk in tests.
+        if not hasattr(self, "session_cache"):
+            self.session_cache = SessionDerivedCache()
+        return self.session_cache
+
+    def session_loot_summary(self, session):
+        if not session:
+            return {"kills": 0, "loot_total": 0.0, "item_totals": {}, "item_values": {},
+                    "excluded_events": 0, "excluded_items": 0}
+        entry = self.derived_cache().entry(session)
+        if entry["summary"] is None:
+            rows = self.loot_events_for_session(session)
+            raw = session.get("loot_events") or []
+            entry["summary"] = {
+                "kills": len(rows),
+                "loot_total": sum(parse_float(row.get("value_ped"), 0.0) for row in rows),
+                "item_totals": self.loot_item_totals(rows),
+                "item_values": self.loot_item_value_totals(rows),
+                "excluded_events": sum(bool(row.get("excluded_from_loot")) for row in raw),
+                "excluded_items": sum(len(row.get("excluded_loot_items") or []) for row in raw),
+            }
+        return entry["summary"]
+
+    def refresh_visible_session_views(self):
+        """Hidden views read the current source on their next tab activation."""
+        if self.is_tab_active(getattr(self, "session_details_tab", None)):
+            self.show_session_details(self.selected_session_from_table())
+        if self.is_tab_active(getattr(self, "loot_tab", None)):
+            self.refresh_loot_tab(force=False)
+        if self.is_tab_active(getattr(self, "mob_analysis_tab", None)):
+            self.refresh_mob_analysis(persist_settings=False)
+
+    def prune_session_cache(self):
+        sources = [*self.sessions, *self.analysis_sessions]
+        if self.current_session is not None:
+            sources.append(vars(self.current_session))
+        self.derived_cache().prune(sources)
 
     def reconstruct_loot_events_from_events(self, session):
         """Rebuild loot events from parsed events using the current grouping rules.
@@ -1923,6 +2169,11 @@ class SkillTrackerApp:
         return []
 
     def loot_events_for_session(self, session):
+        if not session:
+            return []
+        return self.derived_cache().normalized(session, self.build_included_loot_events)
+
+    def build_included_loot_events(self, session):
         """Read included loot without destroying original messages or amounts."""
         result = []
         excluded_cost = 0.0
@@ -1973,7 +2224,8 @@ class SkillTrackerApp:
                     copied["loot_events"][index] = {**extensions, **row}
         return {**previous, **copied}
 
-    def synchronized_analysis_sessions(self, sessions):
+    def analysis_sources(self, sessions):
+        """Resolve links once; ambiguous legacy boundaries must never be guessed."""
         by_id = {str(row["id"]): row for row in sessions if isinstance(row, dict) and row.get("id")}
         def legacy_key(row):
             if not isinstance(row, dict) or row.get("id") or not row.get("started_at"):
@@ -1996,12 +2248,41 @@ class SkillTrackerApp:
             source = by_id.get(str(row.get("id"))) if isinstance(row, dict) and row.get("id") else None
             if source is None and key is not None and len(legacy.get(key, [])) == 1 and archive_key_counts[key] == 1:
                 source = legacy[key][0]
-            result.append(self.analysis_session_copy(source, row) if source is not None else row)
+            result.append(source)
         return result
 
-    def save_session_updates(self, staged):
+    @staticmethod
+    def analysis_source_is_current(source, archived):
+        # Compare original fields, allowing archive-only extensions. This avoids
+        # serialization/deep-copy of every already synchronized history at
+        # startup. Stale standard event fields still require a full repair.
+        for key, value in source.items():
+            if key not in ("loot_events", "loot_events_before_exclusion") and (key not in archived or archived[key] != value):
+                return False
+        if source.get("loot_events_before_exclusion") and not archived.get("loot_events_before_exclusion"):
+            return False
+        rows, old_rows = source.get("loot_events") or [], archived.get("loot_events") or []
+        if len(rows) != len(old_rows):
+            return False
+        standard = {"index", "started_at", "ended_at", "value_ped", "cost_ped", "shots", "items", "messages",
+                    "excluded_from_loot", "excluded_loot_items", "manual_cost_fraction"}
+        for row, old in zip(rows, old_rows):
+            if any(key not in old or old[key] != value for key, value in row.items()):
+                return False
+            if any(key in old and key not in row for key in standard):
+                return False
+        return True
+
+    def synchronized_analysis_sessions(self, sessions, *, changed_only=False):
+        unchanged = {id(row) for row in self.sessions} if changed_only else set()
+        return [self.analysis_session_copy(source, archived)
+                if source is not None and id(source) not in unchanged and not self.analysis_source_is_current(source, archived)
+                else archived
+                for source, archived in zip(self.analysis_sources(sessions), self.analysis_sessions)]
+
+    def save_session_updates(self, staged, *, loot_changed=True):
         """Persist edits and existing analysis copies; roll back on write failure."""
-        analysis = self.synchronized_analysis_sessions(staged)
+        analysis = self.synchronized_analysis_sessions(staged, changed_only=True)
         try:
             save_json(SESSIONS_FILE, staged)
         except OSError as error:
@@ -2019,6 +2300,16 @@ class SkillTrackerApp:
                     return False
                 messagebox.showerror("Changes not saved", f"Analysis could not be saved: {error}. The session edit was undone; retry after fixing the write error.")
                 return False
+        if not loot_changed:
+            cache = self.derived_cache()
+            for original, updated in zip(self.sessions, staged):
+                if updated is not original:
+                    cache.inherit_summary(original, updated)
+            for source, original, updated in zip(self.analysis_sources(staged), self.analysis_sessions, analysis):
+                if updated is not original:
+                    # Use the canonical source totals: an archive loaded from
+                    # disk can be stale even during a metadata/cost-only edit.
+                    cache.inherit_summary(source, updated)
         self.analysis_sessions = analysis
         return True
 
@@ -2075,6 +2366,7 @@ class SkillTrackerApp:
             # fields so exclusions survive the normal session save path.
             for key in ("loot_events", "loot_event_grouping_version", "loot_ped_total", "loot_event_count", "loot_events_before_exclusion"):
                 setattr(live, key, updated[key])
+            self.derived_cache().invalidate(vars(live))
             live._has_loot_exclusions = any(row.get("excluded_from_loot") or row.get("excluded_loot_items") for row in raw)
             self.live_ui_dirty = True
             self.refresh_live_ui(force=True)
@@ -2082,14 +2374,17 @@ class SkillTrackerApp:
             staged = list(self.sessions)
             staged[saved_index] = updated
             if not self.save_session_updates(staged):
+                self.prune_session_cache()
                 return False
             source.update(updated)
+            self.derived_cache().invalidate(source)
             self.refresh_sessions_table()
             iid = f"session_{saved_index}"
-            self.sessions_tree.selection_set(iid)
-            self.sessions_tree.focus(iid)
-            self.show_session_details(source)
-            self.refresh_mob_analysis(persist_settings=False)
+            if self.sessions_tree.exists(iid):
+                self.sessions_tree.selection_set(iid)
+                self.sessions_tree.focus(iid)
+            self.refresh_visible_session_views()
+        self.prune_session_cache()
         self.reset_loot_zoom()
         return True
 
@@ -2105,6 +2400,8 @@ class SkillTrackerApp:
         for original in list(loot_events or []):
             event = dict(original or {})
             messages = list(event.get("messages", []) or [])
+            if "messages" in event:
+                event["messages"] = messages
             rebuilt_items = {}
             rebuilt_value = 0.0
             rebuilt_from_messages = False
@@ -2505,11 +2802,10 @@ class SkillTrackerApp:
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        for index, row in enumerate(details, start=1):
-            detail_tree.insert(
-                "",
-                "end",
-                values=(
+        def skill_message_values(pair):
+            iid, row = pair
+            index = int(iid.replace("gain_", "")) + 1
+            return (
                     index,
                     row.get("timestamp", ""),
                     f"{float(row.get('point_gain', 0.0) or 0.0):.6f}",
@@ -2517,8 +2813,12 @@ class SkillTrackerApp:
                     f"{float(row.get('old_points', 0.0) or 0.0):.6f}",
                     f"{float(row.get('new_points', 0.0) or 0.0):.6f}",
                     row.get("message", ""),
-                ),
             )
+
+        self.make_tree_sortable(detail_tree, {column: title for column, title, _ in setup})
+        pager = PagedTree(self, detail_tree, table_frame)
+        pager.controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        pager.set_rows([(f"gain_{i}", row) for i, row in enumerate(details)], skill_message_values)
 
         if not details:
             detail_tree.insert("", "end", values=("", "", "", "", "", "", "No saved gain messages for this skill."))
@@ -2704,7 +3004,8 @@ class SkillTrackerApp:
         table_frame.columnconfigure(0, weight=1)
 
         drop_indices = {}
-        for row in drops:
+        def drop_values(pair):
+            _iid, row = pair
             value_ped = float(row.get("value_ped", 0.0) or 0.0)
             event_value = float(row.get("event_value_ped", 0.0) or 0.0)
             item_after_mu = self.loot_value_after_markup(
@@ -2713,10 +3014,7 @@ class SkillTrackerApp:
             messages = " | ".join(str(message) for message in row.get("messages", []) if message)
             if not messages:
                 messages = "Original message unavailable for this older saved event."
-            drop_iid = detail_tree.insert(
-                "",
-                "end",
-                values=(
+            return (
                     row.get("event_index", ""),
                     row.get("started_at", ""),
                     row.get("ended_at", ""),
@@ -2727,9 +3025,15 @@ class SkillTrackerApp:
                     markup_display,
                     f"{item_after_mu:.4f}",
                     messages,
-                ),
             )
-            drop_indices[drop_iid] = row["event_index"]
+
+        self.make_tree_sortable(detail_tree, {column: title for column, title, _ in setup})
+        pager = PagedTree(self, detail_tree, table_frame)
+        pager.controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        def map_drops(visible):
+            drop_indices.clear()
+            drop_indices.update({iid: row["event_index"] for iid, row in visible})
+        pager.set_rows([(f"drop_{i}", row) for i, row in enumerate(drops)], drop_values, on_render=map_drops)
 
         def exclude_drops():
             indices = [drop_indices[iid] for iid in detail_tree.selection() if iid in drop_indices]
@@ -2793,8 +3097,8 @@ class SkillTrackerApp:
         self.loot_markups[item_name] = markup
         self.save_loot_markups()
         self.loot_markup_status_var.set(f"Saved manual override for {item_name}: {markup:g}% in {LOOT_MARKUPS_FILE}.")
-        self.refresh_loot_tab()
-        self.refresh_mob_analysis(persist_settings=False)
+        self.refresh_loot_tab(force=False)
+        self.refresh_visible_session_views()
 
     def cancel_loot_markup_edit(self, event=None):
         editor = self.loot_markup_editor
@@ -2812,17 +3116,17 @@ class SkillTrackerApp:
     def clear_loot_item_selection(self):
         for var in self.loot_item_vars.values():
             var.set(False)
-        self.refresh_loot_tab()
+        self.refresh_loot_tab(force=False)
 
-    def refresh_loot_item_checks(self, force=False):
+    def refresh_loot_item_checks(self, force=False, *, totals=None):
         """Rebuild the loot item checkbox list only when it actually changed.
 
         Recreating dozens/hundreds of Tk checkboxes on every parsed log batch is
         expensive and was one of the main reasons the tracker UI felt slow.
         """
         session = self.loot_source_session()
-        loot_events = self.loot_events_for_session(session)
-        totals = self.loot_item_totals(loot_events)
+        if totals is None:
+            totals = self.session_loot_summary(session)["item_totals"]
         query = self.loot_item_filter_var.get().strip().lower()
         signature = (tuple(totals.items()), query)
         if not force and signature == self.loot_item_check_signature:
@@ -2840,7 +3144,7 @@ class SkillTrackerApp:
                 text=f"{item} ({quantity})",
                 variable=self.loot_item_vars[item],
                 style="Tracker.Surface.TCheckbutton",
-                command=self.refresh_loot_tab,
+                command=lambda: self.refresh_loot_tab(force=False),
             ).pack(anchor="w")
         self.loot_item_check_signature = signature
 
@@ -2857,7 +3161,7 @@ class SkillTrackerApp:
     def _run_scheduled_loot_refresh(self):
         self.loot_refresh_after_id = None
         if self.is_tab_active(self.loot_tab):
-            self.refresh_loot_tab()
+            self.refresh_loot_tab(force=False)
             self.last_loot_live_refresh_at = time.monotonic()
 
     def first_loot_event_time(self, loot_events):
@@ -2916,21 +3220,40 @@ class SkillTrackerApp:
             sampled.append(points[-1])
         return self.downsample_points(sampled, max_points)
 
-    def refresh_loot_tab(self):
+    def refresh_loot_tab(self, *, force=True):
         if not hasattr(self, "loot_value_time_canvas"):
             return
         self.reload_market_data_if_changed()
         session = self.loot_source_session()
+        if force and session:
+            self.derived_cache().invalidate(session)
+        summary = self.session_loot_summary(session)
+        generation = self.derived_cache().entry(session)["generation"] if session else None
+        signature = (id(session), generation, (session or {}).get("ped_cycled"),
+                     (session or {}).get("damage_total"), (session or {}).get("mob"),
+                     (session or {}).get("maturity"), repr(self.loot_markups),
+                     repr(self.market_weekly_markups), tuple(self.selected_loot_items()))
+        if not force and signature == self.loot_view_signature:
+            return
         loot_events = self.loot_events_for_session(session)
-        raw = (session or {}).get("loot_events", []) or []
-        excluded_events = sum(bool(row.get("excluded_from_loot")) for row in raw)
-        excluded_items = sum(len(row.get("excluded_loot_items", []) or []) for row in raw)
+        excluded_events = summary["excluded_events"]
+        excluded_items = summary["excluded_items"]
         self.restore_loot_button.configure(state="normal" if excluded_events or excluded_items else "disabled")
-        self.refresh_loot_item_checks()
-        self.loot_events_tree.delete(*self.loot_events_tree.get_children())
-        self.loot_event_iid_to_event = {}
+        self.refresh_loot_item_checks(totals=summary["item_totals"])
+        reset_page = session is not self.loot_page_source
+        self.loot_page_source = session
+        rows_signature = (id(session), generation)
+        if force or rows_signature != self.loot_rows_signature:
+            self.loot_pager.set_rows([(f"loot_event_{i}", row) for i, row in enumerate(loot_events)],
+                                     self.loot_event_table_values, reset=reset_page,
+                                     on_render=lambda rows: setattr(self, "loot_event_iid_to_event", dict(rows)))
+            self.loot_rows_signature = rows_signature
+        self.loot_view_signature = signature
 
         if not session:
+            self.loot_chart_signature = self.loot_base_chart_signature = None
+            self.loot_plot_data = None
+            self.loot_chart_payloads.clear()
             self.loot_summary_var.set("No active or saved session yet.")
             if hasattr(self, "loot_item_summary_tree"):
                 self.loot_item_summary_tree.delete(*self.loot_item_summary_tree.get_children())
@@ -2941,10 +3264,10 @@ class SkillTrackerApp:
             return
 
         ped_cycled = float(session.get("ped_cycled", 0.0) or 0.0)
-        loot_total = sum(float(event.get("value_ped", 0.0) or 0.0) for event in loot_events)
+        loot_total = summary["loot_total"]
         cost_per_kill = ped_cycled / len(loot_events) if loot_events else 0.0
-        item_totals = self.loot_item_totals(loot_events)
-        item_value_totals = self.loot_item_value_totals(loot_events)
+        item_totals = summary["item_totals"]
+        item_value_totals = summary["item_values"]
         loot_after_mu = self.refresh_loot_item_summary_table(item_value_totals, loot_total)
         known_item_tt = sum(float(row.get("value_ped", 0.0) or 0.0) for row in item_value_totals.values())
         has_item_values = math.isclose(known_item_tt, loot_total, rel_tol=1e-9, abs_tol=1e-9)
@@ -2963,86 +3286,81 @@ class SkillTrackerApp:
             f"Excluded events: {excluded_events} | Excluded item drops: {excluded_items}"
         )
 
-        # Show every saved loot event. Earlier versions only displayed the last
-        # 500 rows, which looked like older loot events were not saved.
-        # The graphs are still downsampled separately, so drawing performance is
-        # not tied to the number of rows shown here.
-        for row_index, loot_event in enumerate(loot_events):
-            cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
-            iid = f"loot_event_{row_index}"
-            self.loot_event_iid_to_event[iid] = loot_event
-            self.loot_events_tree.insert("", "end", iid=iid, values=(
-                loot_event.get("index", ""),
-                loot_event.get("ended_at", loot_event.get("started_at", "")),
-                sum(int(v or 0) for v in (loot_event.get("items", {}) or {}).values()),
-                f"{float(loot_event.get('value_ped', 0.0) or 0.0):.4f}",
-                f"{cost_ped:.4f}",
-                f"{(float(loot_event.get('value_ped', 0.0) or 0.0) / cost_ped):.2f}x" if cost_ped else "",
-            ))
-        self.apply_tree_sort(self.loot_events_tree)
+        chart_signature = (id(session), generation, ped_cycled, tuple(self.selected_loot_items()))
+        if not force and chart_signature == self.loot_chart_signature:
+            return
+        self.loot_chart_signature = chart_signature
 
-        # Use the first real loot timestamp, not the app session start time.
-        # Resyncing historical logs can give a session start later than its
-        # loot. Retain relative minutes for sampling/zoom; the display-only UTC
-        # origin converts tick labels to the PC's local clock, including DST.
-        event_times = [self.loot_event_chart_time(event) for event in loot_events]
-        base_time = min((value for value in event_times if value is not None), default=None)
-        has_real_time_axis = base_time is not None
+        base_signature = (id(session), generation, ped_cycled)
+        if force or base_signature != self.loot_base_chart_signature:
+            # Use the first real loot timestamp, not the app session start time.
+            # Resyncing historical logs can give a session start later than its
+            # loot. Retain relative minutes for sampling/zoom; the display-only UTC
+            # origin converts tick labels to the PC's local clock, including DST.
+            event_times = [self.loot_event_chart_time(event) for event in loot_events]
+            time_labels = [self.format_chart_time_label(value, index) for index, value in enumerate(event_times, start=1)]
+            base_time = min((value for value in event_times if value is not None), default=None)
+            has_real_time_axis = base_time is not None
 
-        # Graph 1: cumulative loot return over actual loot time.
-        cumulative_loot = 0.0
-        cumulative_cost = 0.0
-        loot_value_points = []
-        for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
-            value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
-            event_cost = float(loot_event.get("cost_ped", 0.0) or 0.0)
-            if event_cost <= 0 and cost_per_kill > 0:
-                event_cost = cost_per_kill
-            cumulative_loot += value_ped
-            cumulative_cost += event_cost
-            if has_real_time_axis and event_time is None:
-                # Include unknown-time loot in totals, but do not invent a time
-                # for its plot point. Entirely undated sessions use event #.
-                continue
-            x_value = self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index)
-            denominator = cumulative_cost if cumulative_cost > 0 else ped_cycled
-            loot_value_points.append({
-                "x": x_value,
-                "y": percent(cumulative_loot, denominator),
-                "label": self.format_chart_time_label(event_time, index) if has_real_time_axis else str(index),
-            })
-        self.render_line_chart(
-            self.loot_value_time_canvas,
-            self.downsample_time_points_by_minute(loot_value_points, bucket_minutes=1.0),
-            title="Cumulative loot / cumulative cost",
-            x_label="Loot time (local PC time)" if has_real_time_axis else "Loot event #",
-            y_label="Loot return",
-            x_is_time=has_real_time_axis,
-            time_origin=base_time,
-            y_suffix="%",
-            smooth=False,
-            y_reference_lines=[(100.0, "100%")],
-        )
+            # Graph 1: cumulative loot return over actual loot time.
+            cumulative_loot = 0.0
+            cumulative_cost = 0.0
+            loot_value_points = []
+            for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
+                value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
+                event_cost = float(loot_event.get("cost_ped", 0.0) or 0.0)
+                if event_cost <= 0 and cost_per_kill > 0:
+                    event_cost = cost_per_kill
+                cumulative_loot += value_ped
+                cumulative_cost += event_cost
+                if has_real_time_axis and event_time is None:
+                    # Include unknown-time loot in totals, but do not invent a time
+                    # for its plot point. Entirely undated sessions use event #.
+                    continue
+                x_value = self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index)
+                denominator = cumulative_cost if cumulative_cost > 0 else ped_cycled
+                loot_value_points.append({
+                    "x": x_value,
+                    "y": percent(cumulative_loot, denominator),
+                    "label": time_labels[index - 1] if has_real_time_axis else str(index),
+                })
+            self.render_line_chart(
+                self.loot_value_time_canvas,
+                self.downsample_time_points_by_minute(loot_value_points, bucket_minutes=1.0),
+                title="Cumulative loot / cumulative cost",
+                x_label="Loot time (local PC time)" if has_real_time_axis else "Loot event #",
+                y_label="Loot return",
+                x_is_time=has_real_time_axis,
+                time_origin=base_time,
+                y_suffix="%",
+                smooth=False,
+                y_reference_lines=[(100.0, "100%")],
+            )
 
-        scatter_points = []
-        for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
-            cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
-            value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
-            scatter_points.append({
-                "x": cost_ped,
-                "y": value_ped,
-                "label": self.format_chart_time_label(event_time, index),
-            })
-        self.render_scatter_chart(
-            self.loot_cost_canvas,
-            self.downsample_points(scatter_points, max_points=1500),
-            title="Loot value vs cost per kill",
-            x_label="Cost per kill (PED)",
-            y_label="Loot value (PED)",
-            y_suffix=" PED",
-            draw_break_even=True,
-            draw_multiplier_lines=True,
-        )
+            scatter_points = []
+            for index, (loot_event, event_time) in enumerate(zip(loot_events, event_times), start=1):
+                cost_ped = float(loot_event.get("cost_ped", 0.0) or 0.0)
+                value_ped = float(loot_event.get("value_ped", 0.0) or 0.0)
+                scatter_points.append({
+                    "x": cost_ped,
+                    "y": value_ped,
+                    "label": time_labels[index - 1],
+                })
+            self.render_scatter_chart(
+                self.loot_cost_canvas,
+                self.downsample_points(scatter_points, max_points=1500),
+                title="Loot value vs cost per kill",
+                x_label="Cost per kill (PED)",
+                y_label="Loot value (PED)",
+                y_suffix=" PED",
+                draw_break_even=True,
+                draw_multiplier_lines=True,
+            )
+
+            self.loot_plot_data = (event_times, base_time, has_real_time_axis, time_labels)
+            self.loot_base_chart_signature = base_signature
+        else:
+            event_times, base_time, has_real_time_axis, time_labels = self.loot_plot_data
 
         selected_items = self.selected_loot_items()
         if not selected_items:
@@ -3059,7 +3377,7 @@ class SkillTrackerApp:
                 raw_points.append({
                     "x": self.elapsed_minutes(base_time, event_time, index) if has_real_time_axis else float(index),
                     "y": quantity,
-                    "label": self.format_chart_time_label(event_time, index) if has_real_time_axis else str(index),
+                    "label": time_labels[index - 1] if has_real_time_axis else str(index),
                 })
             if raw_points:
                 if has_real_time_axis:
@@ -3082,6 +3400,15 @@ class SkillTrackerApp:
             x_is_time=has_real_time_axis,
             time_origin=base_time,
         )
+
+    @staticmethod
+    def loot_event_table_values(pair):
+        _iid, event = pair
+        cost = parse_float(event.get("cost_ped"), 0.0)
+        value = parse_float(event.get("value_ped"), 0.0)
+        return (event.get("index", ""), event.get("ended_at", event.get("started_at", "")),
+                sum(int(v or 0) for v in (event.get("items") or {}).values()),
+                f"{value:.4f}", f"{cost:.4f}", f"{value / cost:.2f}x" if cost else "")
 
     def clear_chart(self, canvas, text="No data"):
         canvas.delete("all")
@@ -3110,7 +3437,9 @@ class SkillTrackerApp:
     def reset_loot_zoom(self):
         self.loot_zoom_ranges = {}
         self.loot_selection_var.set("Zoom reset. Drag across any loot graph to zoom and show totals for the selected range.")
-        self.refresh_loot_tab()
+        self.redraw_all_loot_charts()
+        self.loot_view_signature = None
+        self.refresh_visible_session_views()
 
     def on_loot_chart_drag_start(self, canvas, event):
         meta = self.loot_chart_meta.get(canvas)
@@ -3847,6 +4176,8 @@ class SkillTrackerApp:
             self.sessions_tree.heading(col, text=title)
             self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
+        self.sessions_pager = PagedTree(self, self.sessions_tree, self.sessions_tab)
+        self.sessions_pager.controls.pack(fill="x", padx=10, pady=(0, 6))
         self.pack_table(self.sessions_tree, self.sessions_tab, padx=10, pady=(0, 10))
         self.sessions_tree.tag_configure("analysis_valid", background=self.ui_colors["valid_session"])
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
@@ -3943,19 +4274,19 @@ class SkillTrackerApp:
         staged = list(self.sessions)
         updated = {**session, **changes}
         staged[session_index] = updated
-        if not self.save_session_updates(staged):
+        if not self.save_session_updates(staged, loot_changed=False):
             return
         session.update(updated)
+        if "loot_events" in changes:
+            self.derived_cache().invalidate(session, keep_summary=True)
 
         self.refresh_sessions_table()
         if self.sessions_tree.exists(iid):
             self.sessions_tree.selection_set(iid)
             self.sessions_tree.focus(iid)
             self.sessions_tree.see(iid)
-        self.show_session_details(session)
-        if self.is_tab_active(getattr(self, "loot_tab", None)):
-            self.refresh_loot_tab()
-        self.refresh_mob_analysis(persist_settings=False)
+        self.refresh_visible_session_views()
+        self.prune_session_cache()
 
     def cancel_session_cell_edit(self, event=None):
         editor = self.session_cell_editor
@@ -3988,7 +4319,7 @@ class SkillTrackerApp:
                        for row in self.favorite_mobs if isinstance(row, dict) and row.get("mob")]
             choices.sort(key=lambda pair: tuple(str(value).casefold() for value in pair[0]))
             columns = (("mob", "Favorite mob", 330), ("maturity", "Maturity", 200))
-            hint = "Changes mob and maturity, then recalculates turnover and DPP. Equipment, loot and skills stay unchanged."
+            hint = "Changes mob and maturity, then updates HP-dependent metrics and mob analysis."
         if not choices:
             messagebox.showwarning("No saved choices", "Add saved setups or favorite mobs in Hunting Setup first.")
             return
@@ -4087,24 +4418,30 @@ class SkillTrackerApp:
             for index in indices:
                 original = self.sessions[index]
                 updated = {**original, **json.loads(json.dumps(changes))}
-                updated.update(self.recalculate_saved_session_turnover(original, updated))
+                # Equipment changes reprice costs. A target change needs only
+                # new HP/grouping; retain compatibility for previously unpriced
+                # sessions that still need their first turnover calculation.
+                if kind == "setup" or not original.get("count_hunting"):
+                    updated.update(self.recalculate_saved_session_turnover(original, updated))
                 staged[index] = updated
         except ValueError as error:
             messagebox.showwarning("Cannot recalculate session", str(error))
             return False
-        if not self.save_session_updates(staged):
+        if not self.save_session_updates(staged, loot_changed=False):
             return False
         for index in indices:
+            costs_changed = staged[index].get("loot_events") is not self.sessions[index].get("loot_events")
             self.sessions[index].update(staged[index])
+            if costs_changed:
+                self.derived_cache().invalidate(self.sessions[index], keep_summary=True)
         self.refresh_sessions_table()
         selected_iids = [f"session_{index}" for index in indices if self.sessions_tree.exists(f"session_{index}")]
         self.sessions_tree.selection_set(selected_iids)
         if selected_iids:
             self.sessions_tree.focus(selected_iids[0])
             self.sessions_tree.see(selected_iids[0])
-        self.show_session_details(self.sessions[indices[0]])
-        self.refresh_loot_tab()
-        self.refresh_mob_analysis(persist_settings=False)
+        self.refresh_visible_session_views()
+        self.prune_session_cache()
         return True
 
     def recalculate_saved_session_turnover(self, original, updated):
@@ -4122,7 +4459,6 @@ class SkillTrackerApp:
         if not math.isfinite(shot_cost) or shot_cost <= 0:
             raise ValueError("The selected equipment has no usable cost per shot. No sessions were changed.")
         attack_types = ("normal_hit", "crit", "defended_attack", "miss", "jammed")
-        raw_attacks = sum(event.get("type") in attack_types for event in original.get("events", []) or [])
         attacks = parse_float(original.get("attacks_total"), 0.0)
         if not attacks:
             attacks = sum(parse_float(original.get(key), 0.0) for key in ("normal_hits", "critical_hits", "missed_attacks"))
@@ -4132,6 +4468,7 @@ class SkillTrackerApp:
             # Very old files may have lost the attack summary or full log.
             attacks = old_ped / old_cost
         if not attacks and old_ped == 0:
+            raw_attacks = sum(event.get("type") in attack_types for event in original.get("events", []) or [])
             attacks = raw_attacks or sum(parse_float(row.get("shots"), 0.0) for row in original.get("loot_events", []) or [])
         if not math.isfinite(attacks) or attacks < 0 or (attacks == 0 and old_ped > 0):
             raise ValueError("This old session has no usable attack count or original shot cost. No sessions were changed.")
@@ -4140,7 +4477,13 @@ class SkillTrackerApp:
             raise ValueError("This session has an invalid attack count. No sessions were changed.")
         result = {"ped_cycled": ped, "count_hunting": True}
         if original.get("loot_events"):
-            reconstructed = self.reconstruct_loot_events_from_events({**original, "count_hunting": True}) if raw_attacks == attacks else []
+            # Modern sessions already retain exact per-receipt shots. Only scan
+            # the raw history when an older receipt actually needs recovery.
+            reconstructed = []
+            if any(row.get("shots") is None for row in original["loot_events"]):
+                raw_attacks = sum(event.get("type") in attack_types for event in original.get("events", []) or [])
+                if raw_attacks == attacks:
+                    reconstructed = self.reconstruct_loot_events_from_events({**original, "count_hunting": True})
             loot_events = []
             for index, original_row in enumerate(original["loot_events"]):
                 row = dict(original_row)
@@ -4207,7 +4550,7 @@ class SkillTrackerApp:
             f"Analysis sessions: {len(self.analysis_sessions)} | added {added}, updated {updated}, skipped {skipped}."
         )
         self.refresh_sessions_table()
-        self.refresh_mob_analysis()
+        self.refresh_visible_session_views()
         messagebox.showinfo(
             "Mob analysis sessions saved",
             f"Saved to {ANALYSIS_SESSIONS_FILE}.\n\nAdded: {added}\nUpdated: {updated}\nSkipped: {skipped}",
@@ -4236,7 +4579,7 @@ class SkillTrackerApp:
         save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
         self.mob_analysis_status_var.set(f"Removed {removed} session(s). Valid analysis sessions: {len(self.analysis_sessions)}.")
         self.refresh_sessions_table()
-        self.refresh_mob_analysis()
+        self.refresh_visible_session_views()
 
     def current_profession_level(self, profession_name: str) -> float:
         """Calculate a profession level from current skills and attributes.
@@ -4337,6 +4680,7 @@ class SkillTrackerApp:
     def reload_analysis_sessions(self):
         loaded = load_json(ANALYSIS_SESSIONS_FILE, [])
         self.analysis_sessions = loaded if isinstance(loaded, list) else []
+        self.prune_session_cache()
         self.refresh_mob_analysis()
 
     def analysis_number(self, variable, label):
@@ -4366,8 +4710,8 @@ class SkillTrackerApp:
             ped_cycled = max(0.0, parse_float(session.get("ped_cycled"), 0.0))
             if ped_cycled <= 0:
                 continue
-            loot_events = self.loot_events_for_session(session)
-            item_totals = self.loot_item_value_totals(loot_events)
+            summary = self.session_loot_summary(session)
+            item_totals = summary["item_values"]
             tt_loot = sum(float(row.get("value_ped", 0.0) or 0.0) for row in item_totals.values())
             after_mu = sum(
                 self.loot_value_after_markup(
@@ -4393,7 +4737,7 @@ class SkillTrackerApp:
             row["ped_cycled"] += ped_cycled
             row["tt_loot"] += tt_loot
             row["after_mu"] += after_mu
-            row["loot_events"] += len(loot_events)
+            row["loot_events"] += summary["kills"]
             maturity = str(session.get("maturity", "") or "").strip()
             if maturity:
                 row["maturities"].add(maturity)
@@ -4421,7 +4765,7 @@ class SkillTrackerApp:
                 "ped_cycled": ped_cycled,
                 "tt_loot": tt_loot,
                 "after_mu": after_mu,
-                "loot_events": len(loot_events),
+                "loot_events": summary["kills"],
             })
 
         results = []
@@ -4550,9 +4894,9 @@ class SkillTrackerApp:
                 width=width,
                 anchor="w" if column in ("weapon", "amplifier", "attachments") else "center",
             )
-        self.pack_table(session_tree, sessions_tab)
-        for row in result["session_rows"]:
-            session_tree.insert("", "end", values=(
+        def analysis_session_values(pair):
+            _iid, row = pair
+            return (
                 row["started_at"],
                 row["maturity"],
                 row.get("weapon", "") or "-",
@@ -4564,7 +4908,11 @@ class SkillTrackerApp:
                 f'{percent(row["tt_loot"], row["ped_cycled"]):.2f}%',
                 f'{percent(row["after_mu"], row["ped_cycled"]):.2f}%',
                 row["loot_events"],
-            ))
+            )
+        pager = PagedTree(self, session_tree, sessions_tab)
+        pager.controls.pack(fill="x", padx=6, pady=6)
+        self.pack_table(session_tree, sessions_tab)
+        pager.set_rows([(f"analysis_session_{i}", row) for i, row in enumerate(result["session_rows"])], analysis_session_values)
         self.style_tracker_widgets(window)
 
     def create_session_details_tab(self):
@@ -4685,7 +5033,7 @@ class SkillTrackerApp:
             lambda event: self.open_skill_gain_details_from_tree(event, self.session_detail_skill_tree, "saved"),
         )
 
-        events_frame = ttk.LabelFrame(content, text="Saved parsed events (display limited, file saves all)", padding=6)
+        events_frame = ttk.LabelFrame(content, text="Saved parsed events — all records available by page", padding=6)
         events_frame.pack(fill="both", expand=True, padx=10, pady=6)
         self.session_detail_events_text = tk.Text(events_frame, height=10, wrap="none")
         events_y = ttk.Scrollbar(events_frame, orient="vertical", command=self.session_detail_events_text.yview)
@@ -4696,6 +5044,9 @@ class SkillTrackerApp:
         events_x.grid(row=1, column=0, sticky="ew")
         events_frame.rowconfigure(0, weight=1)
         events_frame.columnconfigure(0, weight=1)
+        self.detail_events = []
+        self.detail_events_pager = PageControls(events_frame, self.render_session_event_page)
+        self.detail_events_pager.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
     def selected_session_indices_from_table(self):
         indices = []
@@ -4719,17 +5070,21 @@ class SkillTrackerApp:
         return self.sessions[index]
 
     def on_session_selected(self, event=None):
-        self.show_session_details(self.selected_session_from_table())
-        self.refresh_loot_tab()
+        self.refresh_visible_session_views()
 
     def refresh_selected_session_details(self, event=None):
-        self.show_session_details(self.selected_session_from_table())
+        if self.is_tab_active(getattr(self, "session_details_tab", None)):
+            self.show_session_details(self.selected_session_from_table())
         self.update_session_summary()
 
     def show_session_details(self, session):
+        reset_page = session is not self.detail_session
+        self.detail_session = session
+        self.detail_events = (session or {}).get("events") or []
+        self.detail_events_pager.update_count(len(self.detail_events), reset=reset_page)
         self.session_detail_skill_tree.delete(*self.session_detail_skill_tree.get_children())
         self.session_projection_skill_tree.delete(*self.session_projection_skill_tree.get_children())
-        self.session_detail_events_text.delete("1.0", "end")
+        self.render_session_event_page()
         if not session:
             self.session_detail_summary_var.set("No session selected")
             return
@@ -4746,7 +5101,7 @@ class SkillTrackerApp:
         ped_cycled = float(session.get('ped_cycled', 0.0))
         loot_ped = float(session.get('loot_ped_total', 0.0))
         loot_percent = percent(loot_ped, ped_cycled)
-        loot_event_count = len(self.loot_events_for_session(session))
+        loot_event_count = self.session_loot_summary(session)["kills"]
         cost_per_kill = ped_cycled / loot_event_count if loot_event_count else 0.0
         skill_tt_percent = percent(skill_tt_total, ped_cycled)
         skill_messages_per_attack = percent(skill_events_total, session.get('attacks_total', 0))
@@ -4830,7 +5185,13 @@ class SkillTrackerApp:
             )
         self.apply_tree_sort(self.session_detail_skill_tree)
 
-        for event in session.get("events", []) or []:
+    def render_session_event_page(self):
+        text = self.session_detail_events_text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        start = self.detail_events_pager.page * self.detail_events_pager.page_size
+        lines = []
+        for event in self.detail_events[start:start + self.detail_events_pager.page_size]:
             etype = event.get("type", "")
             timestamp = event.get("timestamp", "")
             if etype == "skill_gain":
@@ -4846,8 +5207,11 @@ class SkillTrackerApp:
                 line = f"{timestamp} | loot | +{float(event.get('value_ped', 0.0)):.4f} PED | {event.get('message', '')}"
             else:
                 line = str(event)
-            self.session_detail_events_text.insert("end", line + "\n")
-        self.session_detail_events_text.see("1.0")
+            lines.append(line)
+        if lines:
+            text.insert("end", "\n".join(lines) + "\n")
+        text.see("1.0")
+        text.configure(state="disabled")
 
     def skill_snapshot(self):
         return {str(k): float(v) for k, v in sorted(self.current_skills.items())}
@@ -6088,6 +6452,7 @@ class SkillTrackerApp:
             session.loot_event_count += int(not continue_previous)
         else:
             session.loot_event_count = len(loot_events)
+        self.derived_cache().invalidate(vars(session))
 
     def calculate_profession_gains_for_session(self, session: MonitorSession):
         gains = {}
@@ -6263,7 +6628,7 @@ class SkillTrackerApp:
             kills = session.loot_event_count if getattr(session, "_has_loot_exclusions", False) else len(session.loot_events)
         else:
             data = session or {}
-            kills = len(self.loot_events_for_session(data))
+            kills = self.session_loot_summary(data)["kills"]
             if not kills and not data.get("loot_events") and not data.get("events"):
                 kills = max(0, int(data.get("loot_event_count", 0) or 0))
         ped = parse_float(data.get("ped_cycled"), 0.0)
@@ -6420,7 +6785,7 @@ class SkillTrackerApp:
             if self.is_tab_active(self.loot_tab) and (
                 force or now - self.last_loot_live_refresh_at >= self.loot_live_refresh_interval
             ):
-                self.refresh_loot_tab()
+                self.refresh_loot_tab(force=False)
                 self.last_loot_live_refresh_at = now
 
         self.flush_event_text()
@@ -6438,70 +6803,75 @@ class SkillTrackerApp:
             self.skill_tree.focus(selected_skill)
 
     def refresh_sessions_table(self):
-        self.sessions_tree.delete(*self.sessions_tree.get_children())
+        self.prune_session_cache()
         valid_analysis_ids = {
             str(session.get("id", "") or "")
             for session in self.analysis_sessions
             if isinstance(session, dict) and session.get("id")
         }
-        start_index = max(0, len(self.sessions) - 200)
-        for index in range(len(self.sessions) - 1, start_index - 1, -1):
-            session = self.sessions[index]
-            skills = session.get("skill_gains_points", {}) or {}
-            skill_tt = session.get("skill_gains_tt", {}) or {}
+        rows = [(f"session_{index}", self.sessions[index])
+                for index in range(len(self.sessions) - 1, -1, -1)]
+        def tag_rows(visible):
+            for iid, session in visible:
+                tags = ("analysis_valid",) if str(session.get("id", "") or "") in valid_analysis_ids else ()
+                self.sessions_tree.item(iid, tags=tags)
+        self.sessions_pager.set_rows(rows, self.session_table_values, on_render=tag_rows)
 
-            # Backward-compatible totals for sessions saved by older versions.
-            skill_tt_total = float(session.get("skill_gain_tt_total", sum(float(v) for v in skill_tt.values())))
-            skill_points_total = float(session.get("skill_gain_points_total", sum(float(v) for v in skills.values())))
+    def session_table_values(self, pair):
+        _iid, session = pair
+        skills = session.get("skill_gains_points", {}) or {}
+        skill_tt = session.get("skill_gains_tt", {}) or {}
 
-            mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
-            notes = str(session.get("notes", "") or "").replace("\r", " ").replace("\n", " ")
-            damage_total = float(session.get('damage_total', 0.0) or 0.0)
-            ped_cycled = float(session.get('ped_cycled', 0.0))
-            loot_ped = float(session.get('loot_ped_total', 0.0))
-            combat = self.calculate_session_combat_metrics(session)
-            loot_event_count = combat["kills"]
-            cost_per_kill = combat["cost_per_kill"] or 0.0
-            weapon = session.get("weapon", "")
-            amplifier = session.get("amplifier", "")
-            attachments = session.get("attachments", []) or []
-            weapon_display = weapon
-            if amplifier:
-                weapon_display = f"{weapon or '-'} + {amplifier}"
-            has_weapon_stats = weapon in WEAPONS
-            # Session DPP is based on what actually happened in the session:
-            # damage per PEC = total damage / (PED cycled * 100 PEC/PED).
-            dpp = damage_total / ped_cycled / 100.0 if ped_cycled > 0 else 0.0
-            ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
-            skill_tt_percent = percent(skill_tt_total, ped_cycled)
-            avg_skill_tt_per_hour = (skill_tt_percent / 100.0) * ped_per_hour if ped_per_hour else 0.0
-            defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
-            missed_attacks = int(session.get("missed_attacks", 0) or 0)
-            session_tags = ("analysis_valid",) if str(session.get("id", "") or "") in valid_analysis_ids else ()
-            self.sessions_tree.insert("", "end", iid=f"session_{index}", tags=session_tags, values=(
-                session.get("started_at", ""),
-                session.get("ended_at", ""),
-                weapon_display,
-                mob,
-                notes,
-                session.get("attacks_total", 0),
-                defended_attacks,
-                missed_attacks,
-                f"{damage_total:.1f}",
-                f"{ped_cycled:.4f}",
-                f"{dpp:.3f}" if dpp else "",
-                f'{combat["effective_dpp"]:.3f}' if combat["effective_dpp"] is not None else "—",
-                f"{loot_ped:.4f}",
-                f"{percent(loot_ped, ped_cycled):.2f}%",
-                loot_event_count,
-                f"{cost_per_kill:.6f}" if cost_per_kill else "",
-                f"{skill_tt_total:.4f}",
-                f"{skill_tt_percent:.2f}%",
-                f"{ped_per_hour:.2f}" if ped_per_hour else "",
-                f"{avg_skill_tt_per_hour:.4f}" if avg_skill_tt_per_hour else "",
-                f"{skill_points_total:.4f}",
-            ))
-        self.apply_tree_sort(self.sessions_tree)
+        # Backward-compatible totals for sessions saved by older versions.
+        skill_tt_total = float(session.get("skill_gain_tt_total", sum(float(v) for v in skill_tt.values())))
+        skill_points_total = float(session.get("skill_gain_points_total", sum(float(v) for v in skills.values())))
+
+        mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
+        notes = str(session.get("notes", "") or "").replace("\r", " ").replace("\n", " ")
+        damage_total = float(session.get('damage_total', 0.0) or 0.0)
+        ped_cycled = float(session.get('ped_cycled', 0.0))
+        loot_ped = float(session.get('loot_ped_total', 0.0))
+        combat = self.calculate_session_combat_metrics(session)
+        loot_event_count = combat["kills"]
+        cost_per_kill = combat["cost_per_kill"] or 0.0
+        weapon = session.get("weapon", "")
+        amplifier = session.get("amplifier", "")
+        attachments = session.get("attachments", []) or []
+        weapon_display = weapon
+        if amplifier:
+            weapon_display = f"{weapon or '-'} + {amplifier}"
+        has_weapon_stats = weapon in WEAPONS
+        # Session DPP is based on what actually happened in the session:
+        # damage per PEC = total damage / (PED cycled * 100 PEC/PED).
+        dpp = damage_total / ped_cycled / 100.0 if ped_cycled > 0 else 0.0
+        ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
+        skill_tt_percent = percent(skill_tt_total, ped_cycled)
+        avg_skill_tt_per_hour = (skill_tt_percent / 100.0) * ped_per_hour if ped_per_hour else 0.0
+        defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
+        missed_attacks = int(session.get("missed_attacks", 0) or 0)
+        return (
+            session.get("started_at", ""),
+            session.get("ended_at", ""),
+            weapon_display,
+            mob,
+            notes,
+            session.get("attacks_total", 0),
+            defended_attacks,
+            missed_attacks,
+            f"{damage_total:.1f}",
+            f"{ped_cycled:.4f}",
+            f"{dpp:.3f}" if dpp else "",
+            f'{combat["effective_dpp"]:.3f}' if combat["effective_dpp"] is not None else "—",
+            f"{loot_ped:.4f}",
+            f"{percent(loot_ped, ped_cycled):.2f}%",
+            loot_event_count,
+            f"{cost_per_kill:.6f}" if cost_per_kill else "",
+            f"{skill_tt_total:.4f}",
+            f"{skill_tt_percent:.2f}%",
+            f"{ped_per_hour:.2f}" if ped_per_hour else "",
+            f"{avg_skill_tt_per_hour:.4f}" if avg_skill_tt_per_hour else "",
+            f"{skill_points_total:.4f}",
+        )
 
     def clear_sessions(self):
         if not messagebox.askyesno("Clear sessions", "Delete all saved session history?"):
@@ -6510,6 +6880,7 @@ class SkillTrackerApp:
         save_json(SESSIONS_FILE, self.sessions)
         self.refresh_sessions_table()
         self.show_session_details(None)
+        self.refresh_visible_session_views()
 
     def delete_selected_sessions(self):
         indices = self.selected_session_indices_from_table()
@@ -6551,7 +6922,7 @@ class SkillTrackerApp:
         save_json(SESSIONS_FILE, self.sessions)
         self.refresh_sessions_table()
         self.show_session_details(None)
-        self.refresh_loot_tab()
+        self.refresh_visible_session_views()
 
     def save_state(self, last_log_read_at=None):
         """Save app state without accidentally moving the log cutoff forward.
