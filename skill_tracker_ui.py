@@ -63,6 +63,30 @@ IGNORED_LOOT_ITEMS = ("Universal Ammo", "Nanocube")
 # Some stackables do not print quantity in chat.log. Derive count from TT value.
 STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
 LOOT_TRACKER_GRAPH_VERSION = "loot-local-time-mu-dpp-v13"
+
+# Presentation preferences are separate from saved sessions and equipment.
+UI_THEMES = {
+    "Compact": {
+        "background": "#f3f5f8", "surface": "#ffffff", "ink": "#1d2b3a",
+        "muted": "#637286", "accent": "#176a78", "border": "#d7dfe9",
+        "hover": "#eaf5f5", "pressed": "#dcebed", "disabled": "#8793a0",
+        "heading": "#eaf0f3", "scrollbar": "#dce3e8", "field": "#ffffff",
+        "selection": "#176a78", "selection_ink": "#ffffff", "axis": "#8a95a3",
+        "grid": "#e6e9ee", "positive": "#15803d", "valid_session": "#dff3df",
+        "selection_preview": "#dcebed",
+        "series": ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"],
+    },
+    "Command": {
+        "background": "#10151e", "surface": "#191f2b", "ink": "#edf1f8",
+        "muted": "#a8b5c8", "accent": "#8cd3bb", "border": "#344154",
+        "hover": "#243d38", "pressed": "#305449", "disabled": "#8591a4",
+        "heading": "#243040", "scrollbar": "#43516a", "field": "#111824",
+        "selection": "#305449", "selection_ink": "#edf1f8", "axis": "#9ba9bd",
+        "grid": "#2d3748", "positive": "#8cd3bb", "valid_session": "#243d38",
+        "selection_preview": "#305449",
+        "series": ["#82b8ff", "#ff9191", "#8cd3bb", "#c49bff", "#ffb575", "#79d5e1", "#badc7b", "#ff9bc4", "#6ed0ff", "#f3d273", "#c2cfdf", "#aaa5ff"],
+    },
+}
 LOOT_EVENT_GROUPING_VERSION = 2
 
 # Entropia attributes contribute to professions at 20 times their displayed
@@ -1031,6 +1055,10 @@ class SkillTrackerApp:
         self.hunting_setup_name_var = tk.StringVar(value=str(self.state.get("selected_hunting_setup", "") or ""))
         self.hunting_setup_status_var = tk.StringVar(value="Name and save current equipment to add a setup.")
         self.favorite_mob_status_var = tk.StringVar(value="Choose a target below to add it to favorites.")
+        saved_theme = self.state.get("ui_theme", "Compact")
+        self.ui_theme_var = tk.StringVar(
+            value=saved_theme if isinstance(saved_theme, str) and saved_theme in UI_THEMES else "Compact"
+        )
         self.weapon_cost_var = tk.StringVar(value="Cost/shot: 0.000000 PED")
         self.mob_info_var = tk.StringVar(value="Mob: -")
         self.all_weapon_names = sorted(WEAPONS.keys(), key=str.lower)
@@ -1088,9 +1116,23 @@ class SkillTrackerApp:
 
     def create_ui(self):
         self.configure_ui_styles()
-        notebook = ttk.Notebook(self.root)
+        header = ttk.Frame(self.root, padding=(12, 8))
+        header.pack(fill="x")
+        ttk.Label(header, text="SkillTracker", style="Tracker.Brand.TLabel").pack(side="left")
+        self.theme_combo = ttk.Combobox(header, textvariable=self.ui_theme_var, values=list(UI_THEMES), state="readonly", width=13)
+        self.theme_combo.pack(side="right")
+        self.theme_combo.bind("<<ComboboxSelected>>", self.apply_ui_theme)
+        ttk.Label(header, text="Appearance:").pack(side="right", padx=8)
+
+        self.ui_body = ttk.Frame(self.root)
+        self.ui_body.pack(fill="both", expand=True)
+        self.ui_body.rowconfigure(0, weight=1)
+        self.ui_body.columnconfigure(1, weight=1)
+        self.sidebar = ttk.Frame(self.ui_body, padding=(10, 12))
+        self.sidebar.grid(row=0, column=0, sticky="ns")
+        notebook = ttk.Notebook(self.ui_body)
         self.notebook = notebook
-        notebook.pack(fill="both", expand=True)
+        notebook.grid(row=0, column=1, sticky="nsew")
 
         self.profession_tab = ttk.Frame(notebook)
         self.monitor_tab = ttk.Frame(notebook)
@@ -1108,6 +1150,13 @@ class SkillTrackerApp:
         notebook.add(self.session_details_tab, text="Session Details")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
+        self.navigation_buttons = {}
+        for tab in notebook.tabs():
+            button = ttk.Button(self.sidebar, text=notebook.tab(tab, "text"), width=22,
+                                style="Tracker.Nav.TButton", command=lambda tab=tab: notebook.select(tab))
+            button.pack(fill="x", pady=3)
+            self.navigation_buttons[tab] = button
+
         self.create_monitor_tab()
         self.create_loot_tab()
         self.create_hunting_tab()
@@ -1116,6 +1165,7 @@ class SkillTrackerApp:
         self.create_session_details_tab()
         self.create_profession_tab()
         self.style_tracker_widgets(self.root)
+        self.configure_ui_navigation()
         notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
 
     def is_tab_active(self, tab):
@@ -1125,6 +1175,7 @@ class SkillTrackerApp:
             return False
 
     def on_notebook_tab_changed(self, event=None):
+        self.update_navigation_selection()
         # Heavy loot tables/charts are refreshed on demand when their tab is
         # opened, rather than after every parsed log batch.
         if self.is_tab_active(getattr(self, "loot_tab", None)):
@@ -1370,47 +1421,109 @@ class SkillTrackerApp:
         event_frame.columnconfigure(0, weight=1)
         event_frame.rowconfigure(0, weight=1)
     def configure_ui_styles(self):
-        """One theme for all tabs, dynamically created controls and dialogs."""
+        """Update existing widgets through shared styles; never rebuild a tab."""
         style = ttk.Style(self.root)
-        # Native themes can ignore custom backgrounds on Windows. Clam makes
-        # the same palette and controls available on every supported platform.
-        style.theme_use("clam")
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+        theme = self.ui_theme_var.get()
+        self.ui_colors = UI_THEMES.get(theme, UI_THEMES["Compact"])
+        colors = self.ui_colors
+        background, surface, ink, accent, border = (colors[key] for key in ("background", "surface", "ink", "accent", "border"))
         self.ui_font_family = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
-        self.ui_font = (self.ui_font_family, 9)
-        self.ui_log_font = ("Consolas" if os.name == "nt" else "DejaVu Sans Mono", 9)
-        self.ui_colors = {"background": "#f3f5f7", "surface": "#ffffff", "ink": "#192b3a", "muted": "#536779", "accent": "#126579", "border": "#d7dce2"}
-        background, surface, ink, accent, border = (self.ui_colors[key] for key in ("background", "surface", "ink", "accent", "border"))
         font = self.ui_font_family
+        self.ui_font = (font, 9)
+        self.ui_log_font = ("Consolas" if os.name == "nt" else "DejaVu Sans Mono", 9)
         self.root.configure(background=background)
         self.root.option_add("*Font", self.ui_font)
         self.root.option_add("*TCombobox*Listbox.font", self.ui_font)
-        style.configure(".", font=self.ui_font, background=background, foreground=ink)
+        for option, value in (("background", colors["field"]), ("foreground", ink),
+                              ("selectBackground", colors["selection"]), ("selectForeground", colors["selection_ink"])):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", value)
+        style.configure(".", font=self.ui_font, background=background, foreground=ink, bordercolor=border)
         style.configure("TFrame", background=background)
         style.configure("Tracker.Surface.TFrame", background=surface)
         style.configure("TLabelframe", background=surface, bordercolor=border, borderwidth=1, relief="solid")
         style.configure("TLabelframe.Label", background=surface, foreground=ink, font=(font, 10, "bold"))
         style.configure("TLabel", background=background, foreground=ink, font=self.ui_font)
         style.configure("Tracker.Surface.TLabel", background=surface, foreground=ink, font=self.ui_font)
-        style.configure("Tracker.Caption.TLabel", background=surface, foreground=self.ui_colors["muted"], font=(font, 8))
-        style.configure("Tracker.Value.TLabel", background=surface, foreground=accent, font=(font, 14, "bold"))
+        style.configure("Tracker.Brand.TLabel", background=background, foreground=ink, font=(font, 12, "bold"))
+        style.configure("Tracker.Caption.TLabel", background=surface, foreground=colors["muted"], font=(font, 8))
+        style.configure("Tracker.Value.TLabel", background=surface, foreground=accent, font=(font, 16 if theme == "Command" else 14, "bold"))
         style.configure("Tracker.Emphasis.TLabel", background=surface, foreground=accent, font=(font, 11, "bold"))
-        style.configure("TButton", font=self.ui_font, padding=(8, 4), background=surface, foreground=ink, bordercolor=border, focusthickness=1, focuscolor=accent)
-        style.map("TButton", background=[("disabled", background), ("pressed", "#dcebed"), ("active", "#e9f1f3")], foreground=[("disabled", "#8793a0")])
+        style.configure("TButton", font=self.ui_font, padding=(8, 4), background=surface, foreground=ink,
+                        bordercolor=border, lightcolor=border, darkcolor=border, focusthickness=1, focuscolor=accent)
+        style.map("TButton", background=[("disabled", background), ("pressed", colors["pressed"]), ("active", colors["hover"])],
+                  foreground=[("disabled", colors["disabled"])])
+        for selected, widget_style in ((False, "Tracker.Nav.TButton"), (True, "Tracker.Selected.Nav.TButton")):
+            nav_background = colors["pressed"] if selected else background
+            style.configure(widget_style, padding=(10, 9), anchor="w", background=nav_background,
+                            foreground=accent if selected else ink, bordercolor=nav_background,
+                            lightcolor=nav_background, darkcolor=nav_background)
+            style.map(widget_style, background=[("pressed", colors["pressed"]), ("active", colors["hover"])])
         for widget_style in ("TEntry", "TCombobox"):
-            style.configure(widget_style, font=self.ui_font, padding=4, fieldbackground=surface, foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border)
-            style.map(widget_style, fieldbackground=[("disabled", background), ("readonly", surface)], bordercolor=[("focus", accent)])
+            style.configure(widget_style, font=self.ui_font, padding=4, fieldbackground=colors["field"], foreground=ink,
+                            insertcolor=ink, arrowcolor=colors["muted"], bordercolor=border, lightcolor=border, darkcolor=border,
+                            selectbackground=colors["selection"], selectforeground=colors["selection_ink"])
+            style.map(widget_style, fieldbackground=[("disabled", background), ("readonly", colors["field"])],
+                      foreground=[("disabled", colors["disabled"]), ("readonly", ink)], bordercolor=[("focus", accent)])
         for widget_style in ("TCheckbutton", "Tracker.Surface.TCheckbutton"):
             widget_background = surface if "Surface" in widget_style else background
-            style.configure(widget_style, background=widget_background, foreground=ink, font=self.ui_font)
-            style.map(widget_style, background=[("active", widget_background)], foreground=[("disabled", "#8793a0")])
-        style.configure("Treeview", font=self.ui_font, rowheight=26, background=surface, fieldbackground=surface, foreground=ink, bordercolor=border)
-        style.configure("Treeview.Heading", font=(font, 9, "bold"), padding=(6, 5), background="#eaf0f3", foreground=ink, bordercolor=border)
-        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", surface)])
-        style.configure("TNotebook", background=background, borderwidth=0)
-        style.configure("TNotebook.Tab", font=self.ui_font, padding=(12, 7), background=background, foreground=self.ui_colors["muted"])
-        style.map("TNotebook.Tab", background=[("selected", surface), ("active", "#e9f1f3")], foreground=[("selected", accent)])
+            style.configure(widget_style, background=widget_background, foreground=ink, font=self.ui_font,
+                            indicatorbackground=colors["field"], indicatorforeground=accent,
+                            bordercolor=border, lightcolor=border, darkcolor=border)
+            style.map(widget_style, background=[("active", widget_background)], foreground=[("disabled", colors["disabled"])],
+                      indicatorbackground=[("selected", colors["pressed"]), ("active", colors["hover"])])
+        style.configure("Treeview", font=self.ui_font, rowheight=26, background=surface, fieldbackground=surface,
+                        foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border)
+        style.configure("Treeview.Heading", font=(font, 9, "bold"), padding=(6, 5), background=colors["heading"],
+                        foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border)
+        style.map("Treeview.Heading", background=[("active", colors["hover"])])
+        style.map("Treeview", background=[("selected", colors["selection"])], foreground=[("selected", colors["selection_ink"])])
+        style.configure("TNotebook", background=background, borderwidth=0, bordercolor=border)
+        style.configure("TNotebook.Tab", font=self.ui_font, padding=(12, 7), background=background, foreground=colors["muted"],
+                        bordercolor=border, lightcolor=border, darkcolor=border)
+        style.map("TNotebook.Tab", background=[("selected", surface), ("active", colors["hover"])], foreground=[("selected", accent)])
+        style.layout("Tracker.Sidebar.TNotebook.Tab", [])
+        style.configure("Tracker.Sidebar.TNotebook", background=background, borderwidth=0, tabmargins=0)
         for widget_style in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
-            style.configure(widget_style, background="#dce3e8", troughcolor=background, bordercolor=background, arrowcolor=self.ui_colors["muted"])
+            style.configure(widget_style, background=colors["scrollbar"], troughcolor=background,
+                            bordercolor=background, lightcolor=border, darkcolor=border, arrowcolor=colors["muted"])
+            style.map(widget_style, background=[("active", colors["hover"]), ("pressed", colors["pressed"])])
+        style.configure("TPanedwindow", background=background)
+        style.configure("Sash", background=border)
+
+    def configure_ui_navigation(self):
+        if self.ui_theme_var.get() == "Command":
+            self.sidebar.grid()
+            self.notebook.configure(style="Tracker.Sidebar.TNotebook")
+        else:
+            self.sidebar.grid_remove()
+            self.notebook.configure(style="TNotebook")
+        self.update_navigation_selection()
+
+    def update_navigation_selection(self):
+        selected = self.notebook.select()
+        for tab, button in self.navigation_buttons.items():
+            button.configure(style="Tracker.Selected.Nav.TButton" if tab == selected else "Tracker.Nav.TButton")
+
+    def apply_ui_theme(self, event=None):
+        if self.ui_theme_var.get() not in UI_THEMES:
+            self.ui_theme_var.set("Compact")
+        self.configure_ui_styles()
+        self.configure_ui_navigation()
+        self.style_tracker_widgets(self.root)
+        self.sessions_tree.tag_configure("analysis_valid", background=self.ui_colors["valid_session"])
+        # Recolor cached chart data rather than resetting filters or zoom.
+        self.root.after_idle(self.redraw_theme_charts)
+        # Persist only this preference. Saving equipment here would normalize
+        # unfinished combobox input and could discard the user's edits.
+        self.state["ui_theme"] = self.ui_theme_var.get()
+        save_json(TRACKER_STATE_FILE, self.state)
+
+    def redraw_theme_charts(self):
+        for canvas in (self.loot_value_time_canvas, self.loot_cost_canvas, self.loot_items_time_canvas):
+            if canvas.winfo_exists():
+                self.redraw_chart_canvas(canvas)
 
     def style_tracker_widgets(self, parent, surface=False):
         widget = parent
@@ -1426,21 +1539,32 @@ class SkillTrackerApp:
         if widget_class in ("Tk", "Toplevel"):
             widget.configure(background=self.ui_colors["background"])
         elif widget_class == "Text":
-            widget.configure(font=self.ui_log_font, background=self.ui_colors["surface"], foreground=self.ui_colors["ink"], selectbackground=self.ui_colors["accent"], selectforeground="white", highlightbackground=self.ui_colors["border"], highlightthickness=1, borderwidth=0, padx=6, pady=4)
+            widget.configure(font=self.ui_log_font, background=self.ui_colors["surface"], foreground=self.ui_colors["ink"],
+                             insertbackground=self.ui_colors["ink"], selectbackground=self.ui_colors["selection"],
+                             selectforeground=self.ui_colors["selection_ink"], highlightbackground=self.ui_colors["border"],
+                             highlightcolor=self.ui_colors["accent"], highlightthickness=1, borderwidth=0, padx=6, pady=4)
         elif widget_class == "Canvas":
-            # Plot canvases already request white; scroll containers follow
-            # their enclosing card instead of using Tk's default grey.
-            if widget.winfo_rgb(widget.cget("background")) != widget.winfo_rgb(self.ui_colors["surface"]):
-                widget.configure(background=self.ui_colors["surface" if on_surface else "background"])
+            widget.configure(background=self.ui_colors["surface" if on_surface else "background"],
+                             highlightbackground=self.ui_colors["border"], highlightcolor=self.ui_colors["accent"])
         elif widget_class == "Treeview":
-            for column in widget["columns"]:
-                widget.column(column, minwidth=int(widget.column(column, "width")))
+            if not getattr(widget, "tracker_columns_styled", False):
+                for column in widget["columns"]:
+                    widget.column(column, minwidth=int(widget.column(column, "width")))
+                widget.tracker_columns_styled = True
+        elif widget_class == "TCombobox":
+            # Popdowns created by Tcl aren't Python child widgets. Recolor an
+            # existing listbox too; the option database covers future popdowns.
+            listbox = f"{widget}.popdown.f.l"
+            if self.root.tk.call("winfo", "exists", listbox):
+                self.root.tk.call(listbox, "configure", "-background", self.ui_colors["field"],
+                                  "-foreground", self.ui_colors["ink"], "-selectbackground", self.ui_colors["selection"],
+                                  "-selectforeground", self.ui_colors["selection_ink"])
         elif widget_class == "TLabel" and widget.winfo_manager() == "pack":
             if widget.pack_info().get("side") == "top" and not widget.bind("<Configure>"):
                 widget.pack_configure(fill="x")
                 widget.configure(wraplength=600)
                 widget.bind("<Configure>", lambda event, label=widget: label.configure(wraplength=max(1, event.width)))
-        for child in widget.winfo_children():
+        for child in list(widget.children.values()):
             self.style_tracker_widgets(child, on_surface)
 
     def pack_table(self, tree, parent, *, padx=0, pady=0):
@@ -1627,17 +1751,17 @@ class SkillTrackerApp:
 
         graph1 = ttk.LabelFrame(graphs, text="1. Loot value / local time (% return)", padding=6)
         graph1.pack(fill="x", pady=(0, 6))
-        self.loot_value_time_canvas = tk.Canvas(graph1, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_value_time_canvas = tk.Canvas(graph1, height=210, background=self.ui_colors["surface"], highlightthickness=1, highlightbackground=self.ui_colors["border"])
         self.loot_value_time_canvas.pack(fill="both", expand=True)
 
         graph2 = ttk.LabelFrame(graphs, text="2. Loot value / cost per kill (PED, multiplier)", padding=6)
         graph2.pack(fill="x", pady=6)
-        self.loot_cost_canvas = tk.Canvas(graph2, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_cost_canvas = tk.Canvas(graph2, height=210, background=self.ui_colors["surface"], highlightthickness=1, highlightbackground=self.ui_colors["border"])
         self.loot_cost_canvas.pack(fill="both", expand=True)
 
         graph3 = ttk.LabelFrame(graphs, text="3. Number of looted items / local time (not cumulative)", padding=6)
         graph3.pack(fill="x", pady=(6, 0))
-        self.loot_items_time_canvas = tk.Canvas(graph3, height=210, background="#ffffff", highlightthickness=1, highlightbackground="#d7dce2")
+        self.loot_items_time_canvas = tk.Canvas(graph3, height=210, background=self.ui_colors["surface"], highlightthickness=1, highlightbackground=self.ui_colors["border"])
         self.loot_items_time_canvas.pack(fill="both", expand=True)
 
         for canvas in (self.loot_value_time_canvas, self.loot_cost_canvas, self.loot_items_time_canvas):
@@ -2722,8 +2846,8 @@ class SkillTrackerApp:
         canvas.delete("all")
         width = max(canvas.winfo_width(), 320)
         height = max(canvas.winfo_height(), 170)
-        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
-        canvas.create_text(width / 2, height / 2, text=text, fill="#667085")
+        canvas.create_rectangle(0, 0, width, height, fill=self.ui_colors["surface"], outline="")
+        canvas.create_text(width / 2, height / 2, text=text, fill=self.ui_colors["muted"])
 
     def redraw_chart_canvas(self, canvas):
         payload = self.loot_chart_payloads.get(canvas)
@@ -2768,7 +2892,7 @@ class SkillTrackerApp:
         bottom = meta["bottom"]
         x1 = max(left, min(right, self.loot_drag.get("start_x", event.x)))
         x2 = max(left, min(right, event.x))
-        rect_id = canvas.create_rectangle(min(x1, x2), top, max(x1, x2), bottom, outline="#f59e0b", fill="#fde68a", stipple="gray25")
+        rect_id = canvas.create_rectangle(min(x1, x2), top, max(x1, x2), bottom, outline=self.ui_colors["accent"], fill=self.ui_colors["selection_preview"], stipple="gray25")
         self.loot_drag["rect"] = rect_id
 
     def on_loot_chart_drag_end(self, canvas, event):
@@ -2943,11 +3067,11 @@ class SkillTrackerApp:
     def _draw_xy_axes(self, canvas, title, x_label, y_label, min_x, max_x, min_y, max_y, *, x_is_time=False, y_suffix="", time_origin=None):
         width, height, left, top, right, bottom = self._chart_area(canvas)
         canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
-        axis_color = "#8a95a3"
-        grid_color = "#e6e9ee"
-        text_color = "#111827"
-        muted_color = "#475467"
+        canvas.create_rectangle(0, 0, width, height, fill=self.ui_colors["surface"], outline="")
+        axis_color = self.ui_colors["axis"]
+        grid_color = self.ui_colors["grid"]
+        text_color = self.ui_colors["ink"]
+        muted_color = self.ui_colors["muted"]
 
         canvas.create_text(width / 2, 14, text=title, fill=text_color, font=(self.ui_font_family, 11, "bold"))
         canvas.create_line(left, bottom, right, bottom, fill=axis_color)
@@ -3048,23 +3172,23 @@ class SkillTrackerApp:
             if min_y <= reference_value <= max_y:
                 x1, y1 = self._project_point(min_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
                 x2, y2 = self._project_point(max_x, reference_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
-                canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=2)
+                canvas.create_line(x1, y1, x2, y2, fill=self.ui_colors["positive"], dash=(5, 4), width=2)
                 label_x = max(left + 36, min(right - 6, x2 - 6))
                 label_y = max(top + 10, min(bottom - 10, y2 - 8))
-                canvas.create_text(label_x, label_y, anchor="e", text=str(reference_label), fill="#15803d", font=(self.ui_font_family, 9, "bold"))
+                canvas.create_text(label_x, label_y, anchor="e", text=str(reference_label), fill=self.ui_colors["positive"], font=(self.ui_font_family, 9, "bold"))
         coords = []
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
             coords.extend([px, py])
         if len(coords) >= 4:
-            canvas.create_line(*coords, fill="#2563eb", width=2, smooth=bool(payload.get("smooth", False)))
+            canvas.create_line(*coords, fill=self.ui_colors["series"][0], width=2, smooth=bool(payload.get("smooth", False)))
         # Drawing an oval for every point is expensive with long sessions.
         dot_stride = max(1, len(points) // 250)
         for idx, point in enumerate(points):
             if idx % dot_stride != 0 and idx != len(points) - 1:
                 continue
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
-            canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill="#2563eb", outline="")
+            canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=self.ui_colors["series"][0], outline="")
 
     def render_scatter_chart(self, canvas, points, *, title, x_label, y_label, x_is_time=False, y_suffix="", draw_break_even=False, draw_multiplier_lines=False):
         payload = {
@@ -3144,13 +3268,13 @@ class SkillTrackerApp:
                 x1, y1 = self._project_point(min_x, y_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
                 x2, y2 = self._project_point(max_x, y_value, left, top, right, bottom, min_x, max_x, min_y, max_y)
                 width = 2 if multiplier == 1.0 else 1
-                canvas.create_line(x1, y1, x2, y2, fill="#16a34a", dash=(5, 4), width=width)
+                canvas.create_line(x1, y1, x2, y2, fill=self.ui_colors["positive"], dash=(5, 4), width=width)
                 label = "1.0x" if multiplier == 1.0 else f"x{multiplier:g}"
                 label_y = max(top + 10, min(bottom - 10, y2 - 7))
-                canvas.create_text(right - 6, label_y, anchor="e", text=label, fill="#15803d", font=(self.ui_font_family, 9, "bold"))
+                canvas.create_text(right - 6, label_y, anchor="e", text=label, fill=self.ui_colors["positive"], font=(self.ui_font_family, 9, "bold"))
         for point in points:
             px, py = self._project_point(point.get("x", 0.0), point.get("y", 0.0), left, top, right, bottom, min_x, max_x, min_y, max_y)
-            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#2563eb", outline="")
+            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill=self.ui_colors["series"][0], outline="")
 
     def _draw_chart_legend(self, canvas, entries, *, right, top, bottom):
         entries = [(name, color) for name, color in entries if name]
@@ -3169,14 +3293,14 @@ class SkillTrackerApp:
         box_left = max(64, box_right - max_text_width - 34)
         box_top = top + 8
         box_bottom = min(bottom - 8, box_top + 8 + len(visible_entries) * line_height)
-        canvas.create_rectangle(box_left, box_top, box_right, box_bottom, fill="#ffffff", outline="#94a3b8")
+        canvas.create_rectangle(box_left, box_top, box_right, box_bottom, fill=self.ui_colors["surface"], outline=self.ui_colors["border"])
         y = box_top + 12
         for name, color in visible_entries:
             if y > box_bottom - 4:
                 break
             text = str(name)[:24]
             canvas.create_line(box_left + 8, y, box_left + 22, y, fill=color, width=3)
-            canvas.create_text(box_left + 28, y, anchor="w", text=text, fill="#111827", font=(self.ui_font_family, 9, "bold"))
+            canvas.create_text(box_left + 28, y, anchor="w", text=text, fill=self.ui_colors["ink"], font=(self.ui_font_family, 9, "bold"))
             y += line_height
 
     def render_multi_line_chart(self, canvas, series, *, title, x_label, y_label, x_is_time=True, y_suffix="", smooth=False, time_origin=None):
@@ -3224,7 +3348,7 @@ class SkillTrackerApp:
             y_suffix=str(payload.get("y_suffix", "") or ""),
             time_origin=payload.get("time_origin"),
         )
-        palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
+        palette = self.ui_colors["series"]
         legend_entries = []
         for index, (name, points) in enumerate(series):
             if not points:
@@ -3297,7 +3421,7 @@ class SkillTrackerApp:
             time_origin=payload.get("time_origin"),
         )
         self._remember_chart_meta(canvas, left=left, top=top, right=right, bottom=bottom, min_x=min_x, max_x=max_x, kind="multi_points")
-        palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"]
+        palette = self.ui_colors["series"]
         legend_entries = []
         for index, (name, points) in enumerate(visible_series):
             if not points:
@@ -3481,7 +3605,7 @@ class SkillTrackerApp:
             self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes", "skills") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
         self.pack_table(self.sessions_tree, self.sessions_tab, padx=10, pady=(0, 10))
-        self.sessions_tree.tag_configure("analysis_valid", background="#dff3df")
+        self.sessions_tree.tag_configure("analysis_valid", background=self.ui_colors["valid_session"])
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
         self.sessions_tree.bind("<Double-1>", self.on_sessions_tree_double_click)
 
@@ -5949,6 +6073,7 @@ class SkillTrackerApp:
             "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
             "selected_hunting_setup": self.hunting_setup_name_var.get().strip(),
+            "ui_theme": self.ui_theme_var.get(),
             "sync_start_mode": self.sync_start_mode_var.get(),
             "projection_profession": self.session_projection_profession_var.get(),
             "projection_ped_cycle": self.session_projection_ped_var.get(),
