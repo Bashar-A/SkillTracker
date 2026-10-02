@@ -6,12 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_hunting_setup as hunting_fixture
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 
 class ProfessionCalculationTests(unittest.TestCase):
     def setUp(self):
-        self.app = tracker.SkillTrackerApp.__new__(tracker.SkillTrackerApp)
+        self.app = tracker.EntropiaTrackerApp.__new__(tracker.EntropiaTrackerApp)
         self.data = dict(current=1000., delta=0., weight=10.)
 
     def test_delta_new_skill_gain_and_profession_gain_resolve_same_row(self):
@@ -228,3 +228,4 @@ class ProfessionEditorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

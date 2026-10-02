@@ -13,6 +13,8 @@ ENV/
 build/
 dist/
 *.spec
+!EntropiaTracker.spec
+release/
 
 # App runtime data
 current_skills.json

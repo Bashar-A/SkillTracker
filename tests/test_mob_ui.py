@@ -4,7 +4,7 @@ from tkinter import ttk
 import unittest
 from pathlib import Path
 import test_hunting_setup as fixture
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 from mob_catalog import load_mobs
 
 class MobUITests(unittest.TestCase):

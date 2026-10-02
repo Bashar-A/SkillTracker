@@ -57,7 +57,7 @@ when a previously loaded analysis copy was stale.
 
 Run `python -m unittest discover -s tests` with an available Tk display.
 `python scripts/benchmark_history.py` uses temporary synthetic files and never
-opens user histories. `--module /path/to/older/skill_tracker_ui.py` compares an
+opens user histories. `--module /path/to/older/entropia_tracker_ui.py` compares an
 older source with identical inputs. Benchmark timings exclude startup and disk
 saves; cached timings are explicitly warmed. No timing thresholds are used in CI.
 
@@ -77,3 +77,4 @@ These are illustrative measurements, not Windows performance guarantees. The
 first analysis still processes uncached histories. Startup still parses complete
 JSON archives, and saves still rewrite the JSON files; a future storage change
 can address those remaining costs independently.
+

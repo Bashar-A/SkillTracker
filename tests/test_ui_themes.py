@@ -4,7 +4,7 @@ import tkinter as tk
 import unittest
 from dataclasses import asdict
 
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 import test_hunting_setup as hunting_fixture
 
 APPEARANCES = tuple((style, scheme) for style in tracker.UI_STYLES for scheme in tracker.UI_COLOR_SCHEMES)
@@ -207,3 +207,4 @@ class SavedAppearanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
