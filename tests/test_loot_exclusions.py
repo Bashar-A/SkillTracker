@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import test_loot_tracker as loot_fixture
 import test_session_assignments as assignment_fixture
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 
 class LootExclusionTests(unittest.TestCase):
@@ -222,7 +222,7 @@ class LootExclusionTests(unittest.TestCase):
         tracker.save_json(tracker.ANALYSIS_SESSIONS_FILE, [self.original, unrelated])
         self.destroy_root()
         self.root = tk.Tk()
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.source = self.app.sessions[0]
         self.assertEqual(self.app.analysis_sessions[0]["loot_ped_total"], 70)
         self.assertEqual(self.app.loot_events_for_session(self.app.analysis_sessions[0])[0]["value_ped"], 70)
@@ -293,3 +293,4 @@ class RepricedExcludedSessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

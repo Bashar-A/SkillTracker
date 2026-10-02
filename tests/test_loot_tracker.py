@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 
 @contextmanager
@@ -51,7 +51,7 @@ def saved_session(events):
 @unittest.skipUnless(hasattr(time, "tzset"), "TZ-controlled tests require POSIX; GUI tests also run on Windows")
 class LootClockTests(unittest.TestCase):
     def setUp(self):
-        self.app = tracker.SkillTrackerApp.__new__(tracker.SkillTrackerApp)
+        self.app = tracker.EntropiaTrackerApp.__new__(tracker.EntropiaTrackerApp)
 
     def test_utc_log_is_shown_as_local_clock(self):
         event = loot_event("2026-10-01 19:45:00", "Test item", 1)
@@ -106,7 +106,7 @@ class LootTrackerTkTests(unittest.TestCase):
         self.session = saved_session(self.events)
         tracker.SESSIONS_FILE.write_text(json.dumps([self.session]), encoding="utf-8")
         self.before = tracker.SESSIONS_FILE.read_bytes()
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.app.loot_markups = {"Item B": 150}
         self.app.notebook.select(self.app.loot_tab)
         self.root.update()
@@ -217,3 +217,4 @@ class LootTrackerTkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

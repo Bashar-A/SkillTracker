@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 MOBS = {
     "Test Mob": {"maturities": {"Young": {"hp": 10}, "Mature": {"hp": 20}}},
@@ -54,7 +54,7 @@ class HuntingSetupTests(unittest.TestCase):
         for path in (tracker.SESSIONS_FILE, tracker.ANALYSIS_SESSIONS_FILE):
             path.write_text(json.dumps([self.session]))
         self.original_files = {path: path.read_bytes() for path in (tracker.HUNTING_SETUPS_FILE, tracker.SESSIONS_FILE, tracker.ANALYSIS_SESSIONS_FILE)}
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.app.notebook.select(self.app.hunting_tab)
         self.root.update()
 
@@ -66,7 +66,7 @@ class HuntingSetupTests(unittest.TestCase):
     def restart(self):
         self.destroy_root()
         self.root = tk.Tk()
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.app.notebook.select(self.app.hunting_tab)
         self.root.update()
 
@@ -196,3 +196,4 @@ class HuntingSetupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

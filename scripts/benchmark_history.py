@@ -2,7 +2,7 @@
 
 Windows: python scripts/benchmark_history.py
 Linux: run under a Tk-capable display (for example Xvfb).
---module can point to an older skill_tracker_ui.py for before/after comparison.
+--module can point to an older entropia_tracker_ui.py for before/after comparison.
 Timings are medians; cached operations are warmed and exclude startup/import.
 """
 import argparse
@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--module", type=Path, default=Path(__file__).resolve().parents[1] / "skill_tracker_ui.py")
+    parser.add_argument("--module", type=Path, default=Path(__file__).resolve().parents[1] / "entropia_tracker_ui.py")
     parser.add_argument("--receipts", type=int, default=10000)
     parser.add_argument("--sessions", type=int, default=100)
     parser.add_argument("--receipts-per-session", type=int, default=200)
@@ -75,7 +75,7 @@ def main():
         os.chdir(temp.name)
         tracker.save_json(tracker.TRACKER_STATE_FILE, {"hunting_targets_imported": True})
         root = tk.Tk()
-        app = tracker.SkillTrackerApp(root)
+        app = tracker.EntropiaTrackerApp(root)
         root.update()
         source = session(args.receipts, "large")
         app.sessions = [source]
@@ -130,3 +130,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

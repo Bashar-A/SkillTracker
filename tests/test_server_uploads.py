@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server_sync as sync
 import server_ui
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 import test_hunting_setup as fixture
 
 
@@ -309,3 +309,4 @@ class UploadTkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_hunting_setup as hunting_fixture
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 
 class SessionAssignmentTests(unittest.TestCase):
@@ -231,7 +231,7 @@ class SessionAssignmentTests(unittest.TestCase):
 
 class TurnoverRecalculationTests(unittest.TestCase):
     def setUp(self):
-        self.app = tracker.SkillTrackerApp.__new__(tracker.SkillTrackerApp)
+        self.app = tracker.EntropiaTrackerApp.__new__(tracker.EntropiaTrackerApp)
         weapons = patch.object(tracker, 'WEAPONS', {'old': {'decay': 10}, 'new': {'decay': 20}})
         amplifiers = patch.object(tracker, 'AMPLIFIERS', {'amp': {'decay': 5}})
         attachments = patch.object(tracker, 'ATTACHMENTS', {'sight': {'decay': 1}})
@@ -309,3 +309,4 @@ class TurnoverRecalculationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

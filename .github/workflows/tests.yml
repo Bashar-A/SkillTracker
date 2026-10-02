@@ -1,13 +1,87 @@
-name: Tracker tests
-on: [push, pull_request]
+name: EntropiaTracker tests, build and release
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   tests:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Tk and virtual display
         run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
       - name: Run protocol and desktop UI regressions
         run: xvfb-run -a python3 -m unittest discover -s tests -v
+  windows:
+    name: Build and smoke-test Windows executable
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Build portable executable
+        run: python -m PyInstaller --noconfirm --clean EntropiaTracker.spec
+      - name: Verify packaged GUI and legacy data
+        run: python scripts/smoke_release.py dist/EntropiaTracker.exe
+      - name: Create downloadable archive and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item README.md dist/README.md
+          Compress-Archive -Path dist/EntropiaTracker.exe,dist/README.md -DestinationPath release/EntropiaTracker-windows-x64.zip -Force
+          $checksum = (Get-FileHash release/EntropiaTracker-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  EntropiaTracker-windows-x64.zip" | Set-Content release/EntropiaTracker-windows-x64.zip.sha256 -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EntropiaTracker-windows-x64
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+  release:
+    name: Publish release after merge
+    needs: windows
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: EntropiaTracker-windows-x64
+          path: release
+      - name: Publish commit-specific GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="build-${GITHUB_RUN_NUMBER}"
+          head="$(gh api "repos/${GH_REPO}/commits/master" --jq '.sha')"
+          latest=false
+          if [[ "$head" == "$GITHUB_SHA" ]]; then latest=true; fi
+          cat > release-notes.md <<EOF
+          Windows x64 portable build of EntropiaTracker.
+
+          Download EntropiaTracker-windows-x64.zip, extract it into a writable folder, and run EntropiaTracker.exe. Python is not required. Existing settings and session filenames remain compatible; keep your personal JSON files beside the executable.
+
+          Source commit: ${GITHUB_SHA}
+          Build: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}
+
+          Includes the executable, README and a separate SHA-256 checksum. This build passed the desktop test suite and a smoke test of the actual packaged GUI with legacy data.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+            gh release edit "$tag" --title "EntropiaTracker build ${GITHUB_RUN_NUMBER}" --notes-file release-notes.md --latest="$latest"
+          else
+            gh release create "$tag" release/* --target "$GITHUB_SHA" --title "EntropiaTracker build ${GITHUB_RUN_NUMBER}" --notes-file release-notes.md --latest="$latest"
+          fi

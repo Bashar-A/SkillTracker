@@ -5,13 +5,13 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 import test_loot_tracker as loot_fixture
 
 
 class SessionCacheTests(unittest.TestCase):
     def setUp(self):
-        self.app = tracker.SkillTrackerApp.__new__(tracker.SkillTrackerApp)
+        self.app = tracker.EntropiaTrackerApp.__new__(tracker.EntropiaTrackerApp)
         self.source = loot_fixture.saved_session([
             loot_fixture.loot_event("2026-10-01 19:45:00", "A", 10),
             loot_fixture.loot_event("2026-10-01 19:46:00", "B", 20),
@@ -315,3 +315,4 @@ class HistoryPerformanceTkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

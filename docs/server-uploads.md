@@ -1,6 +1,6 @@
 # Uploading to Mediocre Entropia
 
-Run `python skill_tracker_ui.py`, then open **Settings**.
+Run `python entropia_tracker_ui.py`, then open **Settings**.
 
 1. Enter the URL of your running service, such as `https://entropia.example.com` or `http://192.168.1.110:8088`. This is the application URL, not its GitHub repository. A trailing `/api` is accepted and normalized.
 2. Sign in to your approved server account, generate an API token, and paste it into **API token**.

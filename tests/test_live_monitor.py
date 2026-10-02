@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import skill_tracker_ui as tracker
+import entropia_tracker_ui as tracker
 
 
 TEST_MOBS = {"Test Mob": {"maturities": {"Young": {"hp": 100}, "Mature": {"hp": 200}, "Unknown": {"hp": None}}}}
@@ -23,7 +23,7 @@ TEST_MOBS = {"Test Mob": {"maturities": {"Young": {"hp": 100}, "Mature": {"hp": 
 
 class LiveMonitorCalculations(unittest.TestCase):
     def setUp(self):
-        self.app = tracker.SkillTrackerApp.__new__(tracker.SkillTrackerApp)
+        self.app = tracker.EntropiaTrackerApp.__new__(tracker.EntropiaTrackerApp)
         self.app.current_skills = {"Rifle": 1000.0}
         self.tcl = tk.Tcl()
         self.app.session_projection_profession_var = tk.StringVar(self.tcl, value="Animal Looter")
@@ -136,7 +136,7 @@ class LiveMonitorTkIntegration(unittest.TestCase):
         tracker.TRACKER_STATE_FILE.write_text(json.dumps({
             "last_log_read_at": "2025-01-01T12:00:00", "custom_setting": {"keep": True},
         }), encoding="utf-8")
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.root.update()
 
     def destroy_root(self):
@@ -160,7 +160,7 @@ class LiveMonitorTkIntegration(unittest.TestCase):
         self.assertEqual(state["custom_setting"], {"keep": True})
         self.destroy_root()
         self.root = tk.Tk()
-        self.app = tracker.SkillTrackerApp(self.root)
+        self.app = tracker.EntropiaTrackerApp(self.root)
         self.assertEqual(self.app.session_projection_profession_var.get(), "Robot Looter")
         self.assertEqual(self.app.session_projection_ped_var.get(), "2500.5")
         self.assertEqual(tracker.SESSIONS_FILE.read_bytes(), sessions_before)
@@ -197,3 +197,4 @@ class LiveMonitorTkIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
