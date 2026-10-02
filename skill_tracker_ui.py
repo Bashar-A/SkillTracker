@@ -3573,9 +3573,8 @@ class SkillTrackerApp:
 
         columns = (
             "started", "ended", "weapon", "mob", "notes", "attacks", "defended", "misses", "damage", "ped",
-            "dpp", "efficiency", "ped_h", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
-            "skill_tt_percent", "avg_skill_tt_per_hour", "avg_ped_loss_100",
-            "skill_tt_minus_avg_loss_100", "skill_points", "skill_events", "skills",
+            "dpp", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
+            "skill_tt_percent", "ped_h", "avg_skill_tt_per_hour", "skill_points",
         )
         self.sessions_tree = ttk.Treeview(
             self.sessions_tab,
@@ -3588,21 +3587,19 @@ class SkillTrackerApp:
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
             ("mob", "Mob", 170), ("notes", "Notes", 240), ("attacks", "Attacks", 75),
             ("defended", "J/E/D", 70), ("misses", "Misses", 70), ("damage", "Damage", 85),
-            ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("efficiency", "Efficiency", 80),
-            ("ped_h", "PED/h", 80), ("loot", "Loot PED", 85),
+            ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("loot", "Loot PED", 85),
             ("loot_percent", "Loot %", 75),
             ("loot_events", "Loot events", 90),
             ("cost_per_kill", "Cost/kill", 90),
-            ("skill_tt", "TT-equiv total", 105), ("skill_points", "Point total", 115),
+            ("skill_tt", "Skill TT", 105),
             ("skill_tt_percent", "Skill TT %", 85),
+            ("ped_h", "Base PED/h", 105),
             ("avg_skill_tt_per_hour", "Avg skill TT/h", 105),
-            ("avg_ped_loss_100", "Avg PED lose/100", 125),
-            ("skill_tt_minus_avg_loss_100", "Skill TT - avg lose/100", 145),
-            ("skill_events", "Skill gains", 90), ("skills", "Skills gained", 300),
+            ("skill_points", "Point total", 115),
         ]
         for col, title, width in setup:
             self.sessions_tree.heading(col, text=title)
-            self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes", "skills") else "w")
+            self.sessions_tree.column(col, width=width, anchor="center" if col not in ("weapon", "mob", "notes") else "w")
         self.make_tree_sortable(self.sessions_tree, {col: title for col, title, _ in setup})
         self.pack_table(self.sessions_tree, self.sessions_tab, padx=10, pady=(0, 10))
         self.sessions_tree.tag_configure("analysis_valid", background=self.ui_colors["valid_session"])
@@ -5904,26 +5901,10 @@ class SkillTrackerApp:
             session = self.sessions[index]
             skills = session.get("skill_gains_points", {}) or {}
             skill_tt = session.get("skill_gains_tt", {}) or {}
-            counts = session.get("skill_gain_events_by_skill", {}) or {}
 
             # Backward-compatible totals for sessions saved by older versions.
             skill_tt_total = float(session.get("skill_gain_tt_total", sum(float(v) for v in skill_tt.values())))
             skill_points_total = float(session.get("skill_gain_points_total", sum(float(v) for v in skills.values())))
-            skill_gain_events_total = int(sum(int(v) for v in counts.values())) if counts else 0
-
-            skill_rows = []
-            for skill_name, point_gain in sorted(skills.items(), key=lambda item: item[0].lower()):
-                tt_gain = float(skill_tt.get(skill_name, 0.0))
-                gain_count = int(counts.get(skill_name, 0))
-                count_text = f", {gain_count}x" if gain_count else ""
-                skill_rows.append(
-                    f"{skill_name}: +{float(point_gain):.4f} pts / +{tt_gain:.4f} TT "
-                    f"({percent(tt_gain, skill_tt_total):.1f}% TT, {percent(gain_count, skill_gain_events_total):.1f}% msgs){count_text}"
-                )
-
-            skills_text = "; ".join(skill_rows[:4])
-            if len(skill_rows) > 4:
-                skills_text += f" ... +{len(skill_rows) - 4} more"
 
             mob = f"{session.get('mob', '')} {session.get('maturity', '')}".strip()
             notes = str(session.get("notes", "") or "").replace("\r", " ").replace("\n", " ")
@@ -5942,12 +5923,9 @@ class SkillTrackerApp:
             # Session DPP is based on what actually happened in the session:
             # damage per PEC = total damage / (PED cycled * 100 PEC/PED).
             dpp = damage_total / ped_cycled / 100.0 if ped_cycled > 0 else 0.0
-            efficiency = hunting_setup_efficiency(weapon)
             ped_per_hour = hunting_setup_ped_per_hour(weapon, amplifier, attachments) if has_weapon_stats else 0.0
             skill_tt_percent = percent(skill_tt_total, ped_cycled)
             avg_skill_tt_per_hour = (skill_tt_percent / 100.0) * ped_per_hour if ped_per_hour else 0.0
-            avg_loss = avg_ped_loss_per_100(efficiency)
-            skill_tt_minus_avg_loss = skill_tt_percent - avg_loss if avg_loss is not None else None
             defended_attacks = int(session.get("defended_attacks", session.get("jammed_attacks", 0)) or 0)
             missed_attacks = int(session.get("missed_attacks", 0) or 0)
             session_tags = ("analysis_valid",) if str(session.get("id", "") or "") in valid_analysis_ids else ()
@@ -5963,20 +5941,15 @@ class SkillTrackerApp:
                 f"{damage_total:.1f}",
                 f"{ped_cycled:.4f}",
                 f"{dpp:.3f}" if dpp else "",
-                f"{efficiency:.1f}" if efficiency is not None else "",
-                f"{ped_per_hour:.2f}" if ped_per_hour else "",
                 f"{loot_ped:.4f}",
                 f"{percent(loot_ped, ped_cycled):.2f}%",
                 loot_event_count,
                 f"{cost_per_kill:.6f}" if cost_per_kill else "",
                 f"{skill_tt_total:.4f}",
                 f"{skill_tt_percent:.2f}%",
+                f"{ped_per_hour:.2f}" if ped_per_hour else "",
                 f"{avg_skill_tt_per_hour:.4f}" if avg_skill_tt_per_hour else "",
-                f"{avg_loss:.2f}" if avg_loss is not None else "",
-                f"{skill_tt_minus_avg_loss:.2f}" if skill_tt_minus_avg_loss is not None else "",
                 f"{skill_points_total:.4f}",
-                skill_gain_events_total,
-                skills_text,
             ))
         self.apply_tree_sort(self.sessions_tree)
 
