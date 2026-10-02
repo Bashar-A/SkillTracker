@@ -1,0 +1,13 @@
+name: Tracker tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tk and virtual display
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+      - name: Run protocol and desktop UI regressions
+        run: xvfb-run -a python3 -m unittest discover -s tests -v

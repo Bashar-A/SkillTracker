@@ -39,7 +39,10 @@ def write_private(path, value):
             os.unlink(temporary)
 
 
-class ServerUploadUI:
+from mob_ui import MobCatalogUI
+from mob_catalog import save_mobs
+
+class ServerUploadUI(MobCatalogUI):
     def initialize_server_uploads(self):
         config = read_local(SERVER_SETTINGS_FILE)
         self.server_host_var = tk.StringVar(value=config.get("host", ""))
@@ -84,6 +87,7 @@ class ServerUploadUI:
         actions.grid(row=5, column=0, columnspan=3, sticky="w")
         self.server_button(actions, "Save settings", self.save_server_settings).pack(side="left", padx=(0, 8))
         self.server_button(actions, "Test connection", lambda: self.start_server_upload("test")).pack(side="left")
+        self.server_button(actions, "Sync mobs", lambda: self.start_server_upload("mobs")).pack(side="left", padx=8)
         uploads = ttk.LabelFrame(content, text="Upload data", padding=12)
         uploads.pack(fill="x", padx=10, pady=10)
         uploads.columnconfigure(1, weight=1)
@@ -162,8 +166,8 @@ class ServerUploadUI:
         if not isinstance(receipt, dict):
             return "Not uploaded"
         # Object references prevent id reuse; caches only cover current archives.
-        signature = (id(session.get("loot_events")), len(session.get("loot_events") or []),
-                     tuple(str(session.get(k, "")) for k in ("ped_cycled", "mob", "maturity", "notes", "weapon", "started_at", "ended_at")))
+        signature = (id(session.get("loot_events")), len(session.get("loot_events") or []), tuple(session.get("attachments") or []),
+                     tuple(str(session.get(k, "")) for k in ("ped_cycled", "mob", "maturity", "notes", "weapon", "amplifier", "started_at", "ended_at", "damage_total", "dpp", "effective_dpp")))
         cached = self.server_signature_cache.get(id(session))
         if cached is None or cached[0] is not session or cached[1] != signature:
             try:
@@ -214,6 +218,8 @@ class ServerUploadUI:
                     raise UploadError("Select analytic sessions first." if selected else "Add sessions to Mob Analysis through Previous Sessions first.")
                 # References are captured here; payload preparation runs off the UI thread.
                 data = list(rows)
+            elif kind == "mobs":
+                data = copy.deepcopy(self.mob_catalog)
             elif kind == "skills":
                 data = json.dumps(dict(self.current_skills), allow_nan=False)
             elif kind in ("items", "items_mu"):
@@ -244,6 +250,11 @@ class ServerUploadUI:
             try:
                 if kind == "test":
                     client.request("items?page=1")
+                elif kind == "mobs":
+                    def persist(catalog):
+                        save_mobs(catalog)
+                        self.server_upload_queue.put(("mobs", catalog))
+                    client.sync_mobs(data, persist)
                 else:
                     if kind in ("items", "items_mu"):
                         raw = json.loads(Path(data).read_text(encoding="utf-8-sig"))
@@ -275,7 +286,10 @@ class ServerUploadUI:
                 event = self.server_upload_queue.get_nowait()
             except queue.Empty:
                 break
-            if event[0] == "batch":
+            if event[0] == "mobs":
+                self.apply_mob_catalog(event[1])
+                self.server_status_var.set("Mob catalog saved locally; server records take priority.")
+            elif event[0] == "batch":
                 _, destination, kind, index, total, body, response = event
                 if kind == "sessions":
                     originals = {row["id"]: row for row in body["sessions"]}
@@ -297,10 +311,11 @@ class ServerUploadUI:
                 self.server_upload_busy = False
                 for button in self.server_upload_buttons:
                     button.configure(state="normal")
-                message = error or ("Connection and API token verified." if kind == "test" else
+                message = error or ("Connection and API token verified." if kind == "test" else "Mob sync complete. Server data takes priority; local-only mobs were uploaded." if kind == "mobs" else
                                    "Upload complete. Sessions require independent approval on the server." if kind == "sessions" else "Upload complete.")
                 self.server_status_var.set(message + self.server_receipt_warning)
                 if error:
                     messagebox.showerror("Server upload failed", error)
         if not done:
             self.root.after(100, self.poll_server_upload)
+
