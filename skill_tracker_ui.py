@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+from server_ui import ServerUploadUI
 
 import base64
 
@@ -1095,7 +1096,7 @@ class PagedTree:
             self.on_render(visible)
 
 
-class SkillTrackerApp:
+class SkillTrackerApp(ServerUploadUI):
     def __init__(self, root):
         self.root = root
         self.root.title("Entropia Skill Tracker")
@@ -1110,6 +1111,7 @@ class SkillTrackerApp:
         self.detail_session = None
 
         self.current_skills = load_current_skills()
+        self.initialize_server_uploads()
         self.state = load_json(TRACKER_STATE_FILE, {})
         self.sessions = load_json(SESSIONS_FILE, [])
         if not isinstance(self.sessions, list):
@@ -1355,6 +1357,8 @@ class SkillTrackerApp:
         self.session_details_tab = ttk.Frame(notebook)
         self.loot_tab = ttk.Frame(notebook)
         self.mob_analysis_tab = ttk.Frame(notebook)
+        self.analytic_sessions_tab = ttk.Frame(notebook)
+        self.settings_tab = ttk.Frame(notebook)
 
         notebook.add(self.monitor_tab, text="Live Monitor")
         notebook.add(self.loot_tab, text="Loot Tracker")
@@ -1362,6 +1366,8 @@ class SkillTrackerApp:
         notebook.add(self.sessions_tab, text="Previous Sessions")
         notebook.add(self.session_details_tab, text="Session Details")
         notebook.add(self.mob_analysis_tab, text="What Mob to Hunt")
+        notebook.add(self.analytic_sessions_tab, text="Analytic Sessions")
+        notebook.add(self.settings_tab, text="Settings")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
         self.navigation_buttons = {}
@@ -1378,6 +1384,8 @@ class SkillTrackerApp:
         self.create_mob_analysis_tab()
         self.create_session_details_tab()
         self.create_profession_tab()
+        self.create_analytic_sessions_tab(PagedTree)
+        self.create_settings_tab()
         self.style_tracker_widgets(self.root)
         self.configure_ui_navigation()
         notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
@@ -1401,6 +1409,8 @@ class SkillTrackerApp:
             self.refresh_mob_analysis(persist_settings=False)
         elif self.is_tab_active(getattr(self, "session_details_tab", None)):
             self.show_session_details(self.selected_session_from_table())
+        elif self.is_tab_active(getattr(self, "analytic_sessions_tab", None)):
+            self.refresh_analytic_sessions()
 
     def make_tree_sortable(self, tree, headings):
         self.tree_heading_titles[tree] = dict(headings)
@@ -1926,7 +1936,8 @@ class SkillTrackerApp:
             # smaller window sizes; paging controls must not squeeze either
             # pane down to just its headings.
             maximum = max(0, event.height - 185)
-            minimum = min(140, maximum)
+            # Wrapped filter controls need room for at least one checkbox.
+            minimum = min(160, maximum)
             left_panels.sashpos(0, max(minimum, min(maximum, int(event.height * fraction))))
             left_panels.previous_height = event.height
         left_panels.bind("<Configure>", balance_left_panels)
