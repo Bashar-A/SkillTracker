@@ -148,7 +148,7 @@ class SessionAssignmentTests(unittest.TestCase):
                 tree.selection_set(tree.get_children()[0])
                 self.root.update()
                 self.assertFalse(save.instate(["disabled"]))
-                self.assertEqual(window.cget("background"), tracker.UI_THEMES[theme]["background"])
+                self.assertEqual(window.cget("background"), tracker.UI_COLOR_SCHEMES[self.app.ui_color_scheme_var.get()]["background"])
                 window.destroy()
                 self.assertEqual(self.app.sessions, self.before)
                 self.assertEqual(tracker.SESSIONS_FILE.read_bytes(), saved)

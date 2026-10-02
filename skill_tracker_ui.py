@@ -65,8 +65,10 @@ STACKABLE_ITEM_PED_VALUE = {"Shrapnel": 0.0001}
 LOOT_TRACKER_GRAPH_VERSION = "loot-local-time-mu-dpp-v13"
 
 # Presentation preferences are separate from saved sessions and equipment.
-UI_THEMES = {
-    "Compact": {
+UI_STYLES = ("Compact", "Command")
+LEGACY_UI_COLOR_SCHEMES = {"Compact": "Light", "Command": "Dark"}
+UI_COLOR_SCHEMES = {
+    "Light": {
         "background": "#f3f5f8", "surface": "#ffffff", "ink": "#1d2b3a",
         "muted": "#637286", "accent": "#176a78", "border": "#d7dfe9",
         "hover": "#eaf5f5", "pressed": "#dcebed", "disabled": "#8793a0",
@@ -76,7 +78,7 @@ UI_THEMES = {
         "selection_preview": "#dcebed",
         "series": ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#65a30d", "#be123c", "#0284c7", "#ca8a04", "#475569", "#7c3aed"],
     },
-    "Command": {
+    "Dark": {
         "background": "#10151e", "surface": "#191f2b", "ink": "#edf1f8",
         "muted": "#a8b5c8", "accent": "#8cd3bb", "border": "#344154",
         "hover": "#243d38", "pressed": "#305449", "disabled": "#8591a4",
@@ -87,6 +89,22 @@ UI_THEMES = {
         "series": ["#82b8ff", "#ff9191", "#8cd3bb", "#c49bff", "#ffb575", "#79d5e1", "#badc7b", "#ff9bc4", "#6ed0ff", "#f3d273", "#c2cfdf", "#aaa5ff"],
     },
 }
+
+
+def saved_ui_appearance(state):
+    """Keep legacy Compact/light and Command/dark preferences on upgrade."""
+    legacy = state.get("ui_theme")
+    if not isinstance(legacy, str) or legacy not in UI_STYLES:
+        legacy = "Compact"
+    style = state.get("ui_style", legacy)
+    if not isinstance(style, str) or style not in UI_STYLES:
+        style = legacy
+    scheme = state.get("ui_color_scheme", LEGACY_UI_COLOR_SCHEMES[legacy])
+    if not isinstance(scheme, str) or scheme not in UI_COLOR_SCHEMES:
+        scheme = LEGACY_UI_COLOR_SCHEMES[legacy]
+    return style, scheme
+
+
 LOOT_EVENT_GROUPING_VERSION = 2
 
 # Entropia attributes contribute to professions at 20 times their displayed
@@ -1062,10 +1080,11 @@ class SkillTrackerApp:
         self.hunting_setup_name_var = tk.StringVar(value=str(self.state.get("selected_hunting_setup", "") or ""))
         self.hunting_setup_status_var = tk.StringVar(value="Name and save current equipment to add a setup.")
         self.favorite_mob_status_var = tk.StringVar(value="Choose a target below to add it to favorites.")
-        saved_theme = self.state.get("ui_theme", "Compact")
-        self.ui_theme_var = tk.StringVar(
-            value=saved_theme if isinstance(saved_theme, str) and saved_theme in UI_THEMES else "Compact"
-        )
+        saved_style, saved_scheme = saved_ui_appearance(self.state)
+        self.ui_style_var = tk.StringVar(value=saved_style)
+        self.ui_color_scheme_var = tk.StringVar(value=saved_scheme)
+        # Retain the old internal layout variable for existing integrations.
+        self.ui_theme_var = self.ui_style_var
         self.weapon_cost_var = tk.StringVar(value="Cost/shot: 0.000000 PED")
         self.mob_info_var = tk.StringVar(value="Mob: -")
         self.all_weapon_names = sorted(WEAPONS.keys(), key=str.lower)
@@ -1125,10 +1144,14 @@ class SkillTrackerApp:
         self.configure_ui_styles()
         header = ttk.Frame(self.root, padding=(12, 8))
         header.pack(fill="x")
-        self.theme_combo = ttk.Combobox(header, textvariable=self.ui_theme_var, values=list(UI_THEMES), state="readonly", width=13)
+        self.theme_combo = ttk.Combobox(header, textvariable=self.ui_color_scheme_var, values=list(UI_COLOR_SCHEMES), state="readonly", width=8)
         self.theme_combo.pack(side="right")
         self.theme_combo.bind("<<ComboboxSelected>>", self.apply_ui_theme)
-        ttk.Label(header, text="Appearance:").pack(side="right", padx=8)
+        ttk.Label(header, text="Theme:").pack(side="right", padx=8)
+        self.style_combo = ttk.Combobox(header, textvariable=self.ui_style_var, values=UI_STYLES, state="readonly", width=13)
+        self.style_combo.pack(side="right")
+        self.style_combo.bind("<<ComboboxSelected>>", self.apply_ui_theme)
+        ttk.Label(header, text="Style:").pack(side="right", padx=8)
 
         self.ui_body = ttk.Frame(self.root)
         self.ui_body.pack(fill="both", expand=True)
@@ -1420,8 +1443,8 @@ class SkillTrackerApp:
         style = ttk.Style(self.root)
         if style.theme_use() != "clam":
             style.theme_use("clam")
-        theme = self.ui_theme_var.get()
-        self.ui_colors = UI_THEMES.get(theme, UI_THEMES["Compact"])
+        ui_style = self.ui_style_var.get()
+        self.ui_colors = UI_COLOR_SCHEMES.get(self.ui_color_scheme_var.get(), UI_COLOR_SCHEMES["Light"])
         colors = self.ui_colors
         background, surface, ink, accent, border = (colors[key] for key in ("background", "surface", "ink", "accent", "border"))
         self.ui_font_family = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
@@ -1443,7 +1466,7 @@ class SkillTrackerApp:
         style.configure("Tracker.Surface.TLabel", background=surface, foreground=ink, font=self.ui_font)
         style.configure("Tracker.Brand.TLabel", background=background, foreground=ink, font=(font, 12, "bold"))
         style.configure("Tracker.Caption.TLabel", background=surface, foreground=colors["muted"], font=(font, 8))
-        style.configure("Tracker.Value.TLabel", background=surface, foreground=accent, font=(font, 16 if theme == "Command" else 14, "bold"))
+        style.configure("Tracker.Value.TLabel", background=surface, foreground=accent, font=(font, 16 if ui_style == "Command" else 14, "bold"))
         style.configure("Tracker.Emphasis.TLabel", background=surface, foreground=accent, font=(font, 11, "bold"))
         style.configure("TButton", font=self.ui_font, padding=(8, 4), background=surface, foreground=ink,
                         bordercolor=border, lightcolor=border, darkcolor=border, focusthickness=1, focuscolor=accent)
@@ -1488,7 +1511,7 @@ class SkillTrackerApp:
         style.configure("Sash", background=border)
 
     def configure_ui_navigation(self):
-        if self.ui_theme_var.get() == "Command":
+        if self.ui_style_var.get() == "Command":
             self.sidebar.grid()
             self.notebook.configure(style="Tracker.Sidebar.TNotebook")
         else:
@@ -1502,17 +1525,20 @@ class SkillTrackerApp:
             button.configure(style="Tracker.Selected.Nav.TButton" if tab == selected else "Tracker.Nav.TButton")
 
     def apply_ui_theme(self, event=None):
-        if self.ui_theme_var.get() not in UI_THEMES:
-            self.ui_theme_var.set("Compact")
+        if self.ui_style_var.get() not in UI_STYLES:
+            self.ui_style_var.set("Compact")
+        if self.ui_color_scheme_var.get() not in UI_COLOR_SCHEMES:
+            self.ui_color_scheme_var.set("Light")
         self.configure_ui_styles()
         self.configure_ui_navigation()
         self.style_tracker_widgets(self.root)
         self.sessions_tree.tag_configure("analysis_valid", background=self.ui_colors["valid_session"])
         # Recolor cached chart data rather than resetting filters or zoom.
         self.root.after_idle(self.redraw_theme_charts)
-        # Persist only this preference. Saving equipment here would normalize
+        # Persist only appearance. Saving equipment here would normalize
         # unfinished combobox input and could discard the user's edits.
-        self.state["ui_theme"] = self.ui_theme_var.get()
+        self.state.update(ui_style=self.ui_style_var.get(), ui_color_scheme=self.ui_color_scheme_var.get(),
+                          ui_theme=self.ui_style_var.get())
         save_json(TRACKER_STATE_FILE, self.state)
 
     def redraw_theme_charts(self):
@@ -6570,7 +6596,9 @@ class SkillTrackerApp:
             "maturity": self.maturity_var.get(),
             "count_hunting": bool(self.count_hunting_var.get()),
             "selected_hunting_setup": self.hunting_setup_name_var.get().strip(),
-            "ui_theme": self.ui_theme_var.get(),
+            "ui_theme": self.ui_style_var.get(),
+            "ui_style": self.ui_style_var.get(),
+            "ui_color_scheme": self.ui_color_scheme_var.get(),
             "sync_start_mode": self.sync_start_mode_var.get(),
             "projection_profession": self.session_projection_profession_var.get(),
             "projection_ped_cycle": self.session_projection_ped_var.get(),
