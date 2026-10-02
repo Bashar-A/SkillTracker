@@ -787,6 +787,9 @@ class MonitorSession:
     damage_total: float = 0.0
     loot_ped_total: float = 0.0
     loot_event_count: int = 0
+    # Keep the pre-edit representation too, including fields from old releases
+    # that may not survive legacy loot grouping/quantity normalization.
+    loot_events_before_exclusion: list = field(default_factory=list)
     loot_event_grouping_version: int = LOOT_EVENT_GROUPING_VERSION
     loot_events: list = field(default_factory=list)
     ped_cycled: float = 0.0
@@ -917,6 +920,10 @@ class SkillTrackerApp:
         # point gains when the stored start snapshot makes that exact.
         migrated_sessions = migrate_saved_session_skill_tt(self.sessions)
         migrated_analysis_sessions = migrate_saved_session_skill_tt(self.analysis_sessions)
+        synchronized_analysis = self.synchronized_analysis_sessions(self.sessions)
+        if synchronized_analysis != self.analysis_sessions:
+            self.analysis_sessions = synchronized_analysis
+            migrated_analysis_sessions = True
         if migrated_sessions:
             save_json(SESSIONS_FILE, self.sessions)
         if migrated_analysis_sessions:
@@ -1118,7 +1125,6 @@ class SkillTrackerApp:
         self.configure_ui_styles()
         header = ttk.Frame(self.root, padding=(12, 8))
         header.pack(fill="x")
-        ttk.Label(header, text="SkillTracker", style="Tracker.Brand.TLabel").pack(side="left")
         self.theme_combo = ttk.Combobox(header, textvariable=self.ui_theme_var, values=list(UI_THEMES), state="readonly", width=13)
         self.theme_combo.pack(side="right")
         self.theme_combo.bind("<<ComboboxSelected>>", self.apply_ui_theme)
@@ -1146,8 +1152,8 @@ class SkillTrackerApp:
         notebook.add(self.loot_tab, text="Loot Tracker")
         notebook.add(self.hunting_tab, text="Hunting Setup")
         notebook.add(self.sessions_tab, text="Previous Sessions")
-        notebook.add(self.mob_analysis_tab, text="What Mob to Hunt")
         notebook.add(self.session_details_tab, text="Session Details")
+        notebook.add(self.mob_analysis_tab, text="What Mob to Hunt")
         notebook.add(self.profession_tab, text="Professions / Skills")
 
         self.navigation_buttons = {}
@@ -1627,7 +1633,9 @@ class SkillTrackerApp:
         top.pack(fill="x")
         ttk.Button(top, text="Refresh", command=self.refresh_loot_tab).pack(side="right", padx=4)
         ttk.Button(top, text="Reset zoom", command=self.reset_loot_zoom).pack(side="right", padx=4)
-        source_hint = ttk.Label(top, text="Loot from the active session or selected saved session.", justify="left")
+        self.restore_loot_button = ttk.Button(top, text="Restore excluded loot", command=self.restore_excluded_loot)
+        self.restore_loot_button.pack(side="right", padx=4)
+        source_hint = ttk.Label(top, text="Active or selected saved session. Double-click an item/event to exclude individual drops.", justify="left")
         source_hint.pack(side="left", fill="x", expand=True)
         source_hint.bind("<Configure>", lambda event: source_hint.configure(wraplength=max(1, event.width)))
 
@@ -1643,7 +1651,7 @@ class SkillTrackerApp:
             item_summary_frame,
             columns=item_columns,
             show="headings",
-            height=7,
+            height=3,
         )
         item_setup = [
             ("item", "Item", 300),
@@ -1689,14 +1697,24 @@ class SkillTrackerApp:
 
         left_panels = ttk.Panedwindow(left, orient="vertical")
         left_panels.pack(fill="both", expand=True)
+        def balance_left_panels(event):
+            if event.height <= 50:
+                return
+            previous_height = getattr(left_panels, "previous_height", None)
+            fraction = left_panels.sashpos(0) / previous_height if previous_height else 0.5
+            left_panels.sashpos(0, int(event.height * fraction))
+            left_panels.previous_height = event.height
+        left_panels.bind("<Configure>", balance_left_panels)
         items_frame = ttk.LabelFrame(left_panels, text="Item filter", padding=6)
         left_panels.add(items_frame, weight=1)
         ttk.Label(items_frame, text="Filter item names:").pack(anchor="w")
         item_filter = ttk.Entry(items_frame, textvariable=self.loot_item_filter_var)
         item_filter.pack(fill="x", pady=(2, 6))
         item_filter.bind("<KeyRelease>", lambda event: self.refresh_loot_item_checks(force=True))
-        ttk.Button(items_frame, text="Apply selected items", command=self.refresh_loot_tab).pack(fill="x", pady=(0, 4))
-        ttk.Button(items_frame, text="Clear item selection", command=self.clear_loot_item_selection).pack(fill="x", pady=(0, 8))
+        filter_actions = ttk.Frame(items_frame)
+        filter_actions.pack(fill="x", pady=(0, 6))
+        ttk.Button(filter_actions, text="Apply selected items", command=self.refresh_loot_tab).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(filter_actions, text="Clear selection", command=self.clear_loot_item_selection).pack(side="left", fill="x", expand=True)
 
         canvas_holder = ttk.Frame(items_frame)
         canvas_holder.pack(fill="both", expand=True)
@@ -1737,6 +1755,8 @@ class SkillTrackerApp:
         events_frame.rowconfigure(0, weight=1)
         events_frame.columnconfigure(0, weight=1)
         self.loot_events_tree.bind("<Double-1>", self.open_loot_event_details)
+        ttk.Button(events_frame, text="Exclude selected events", command=self.exclude_selected_loot_events).grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         graph1 = ttk.LabelFrame(graphs, text="1. Loot value / local time (% return)", padding=6)
         graph1.pack(fill="x", pady=(0, 6))
@@ -1840,7 +1860,7 @@ class SkillTrackerApp:
 
         return reconstructed
 
-    def loot_events_for_session(self, session):
+    def raw_loot_events_for_session(self, session):
         if not session:
             return []
 
@@ -1851,7 +1871,8 @@ class SkillTrackerApp:
             grouping_version = 0
 
         # New sessions already store the corrected grouping/cost directly.
-        if saved_events and grouping_version >= LOOT_EVENT_GROUPING_VERSION:
+        if saved_events and (grouping_version >= LOOT_EVENT_GROUPING_VERSION
+                             or any(row.get("excluded_from_loot") or row.get("excluded_loot_items") for row in saved_events)):
             return self.sanitize_loot_events(saved_events)
 
         # Older versions could merge loot lines across different seconds and
@@ -1874,6 +1895,177 @@ class SkillTrackerApp:
         if saved_events:
             return self.sanitize_loot_events(saved_events)
         return []
+
+    def loot_events_for_session(self, session):
+        """Read included loot without destroying original messages or amounts."""
+        result = []
+        excluded_cost = 0.0
+        for row in self.raw_loot_events_for_session(session):
+            if row.get("excluded_from_loot"):
+                excluded_cost += parse_float(row.get("cost_ped"), 0.0)
+                continue
+            excluded_items = set(row.get("excluded_loot_items", []) or [])
+            if excluded_items:
+                details = self.loot_event_item_details(row)
+                kept = {name: detail for name, detail in details.items() if name not in excluded_items}
+                if not kept:
+                    excluded_cost += parse_float(row.get("cost_ped"), 0.0)
+                    continue
+                row = {**row, "items": {name: detail["quantity"] for name, detail in kept.items()},
+                       "value_ped": sum(detail["value_ped"] for detail in kept.values()),
+                       "messages": [message for detail in kept.values() for message in detail["messages"]]}
+            if excluded_cost:
+                row = {**row, "cost_ped": parse_float(row.get("cost_ped"), 0.0) + excluded_cost}
+                excluded_cost = 0.0
+            result.append(row)
+        if result and excluded_cost:
+            result[-1] = {**result[-1], "cost_ped": parse_float(result[-1].get("cost_ped"), 0.0) + excluded_cost}
+        return result
+
+    @staticmethod
+    def analysis_session_copy(session, previous=None):
+        """Keep archive extensions while sharing all source session changes."""
+        copied = json.loads(json.dumps(session, ensure_ascii=False))
+        previous = previous or {}
+        # Match raw event positions as well as their identity: multiple kills
+        # may share the same second. Never attach another event's extension.
+        old_events = previous.get("loot_events", []) or []
+        if copied.get("loot_events_before_exclusion") and old_events:
+            copied["loot_events_before_exclusion"] = json.loads(json.dumps(
+                previous.get("loot_events_before_exclusion") or old_events, ensure_ascii=False))
+        event_fields = {"index", "started_at", "ended_at", "value_ped", "cost_ped", "shots", "items", "messages",
+                        "excluded_from_loot", "excluded_loot_items", "manual_cost_fraction"}
+        for index, row in enumerate(copied.get("loot_events", []) or []):
+            if index < len(old_events):
+                old = old_events[index]
+                same_event = old.get("started_at") == row.get("started_at") and old.get("items") == row.get("items")
+                if (not same_event or any(key in old and key not in row for key in event_fields)) and not copied.get("loot_events_before_exclusion"):
+                    copied["loot_events_before_exclusion"] = json.loads(json.dumps(
+                        previous.get("loot_events_before_exclusion") or old_events, ensure_ascii=False))
+                if same_event:
+                    extensions = {key: value for key, value in old.items() if key not in event_fields}
+                    copied["loot_events"][index] = {**extensions, **row}
+        return {**previous, **copied}
+
+    def synchronized_analysis_sessions(self, sessions):
+        by_id = {str(row["id"]): row for row in sessions if isinstance(row, dict) and row.get("id")}
+        def legacy_key(row):
+            if not isinstance(row, dict) or row.get("id") or not row.get("started_at"):
+                return None
+            return tuple(row.get(key) for key in ("started_at", "ended_at", "start_offset", "end_offset"))
+        # Legacy records without IDs can only be linked when their immutable
+        # session boundaries identify exactly one record in each collection.
+        legacy = {}
+        for row in sessions:
+            key = legacy_key(row)
+            if key is not None:
+                legacy.setdefault(key, []).append(row)
+        archive_keys = [legacy_key(row) for row in self.analysis_sessions]
+        archive_key_counts = {}
+        for key in archive_keys:
+            if key is not None:
+                archive_key_counts[key] = archive_key_counts.get(key, 0) + 1
+        result = []
+        for row, key in zip(self.analysis_sessions, archive_keys):
+            source = by_id.get(str(row.get("id"))) if isinstance(row, dict) and row.get("id") else None
+            if source is None and key is not None and len(legacy.get(key, [])) == 1 and archive_key_counts[key] == 1:
+                source = legacy[key][0]
+            result.append(self.analysis_session_copy(source, row) if source is not None else row)
+        return result
+
+    def save_session_updates(self, staged):
+        """Persist edits and existing analysis copies; roll back on write failure."""
+        analysis = self.synchronized_analysis_sessions(staged)
+        try:
+            save_json(SESSIONS_FILE, staged)
+        except OSError as error:
+            messagebox.showerror("Sessions not saved", str(error))
+            return False
+        if analysis != self.analysis_sessions:
+            try:
+                save_json(ANALYSIS_SESSIONS_FILE, analysis)
+            except OSError as error:
+                try:
+                    save_json(SESSIONS_FILE, self.sessions)
+                except OSError as rollback_error:
+                    messagebox.showerror("Session files need attention", f"Analysis save failed: {error}. "
+                                         f"Restoring sessions also failed: {rollback_error}. Check the session files and their backups.")
+                    return False
+                messagebox.showerror("Changes not saved", f"Analysis could not be saved: {error}. The session edit was undone; retry after fixing the write error.")
+                return False
+        self.analysis_sessions = analysis
+        return True
+
+    def exclude_selected_loot_events(self):
+        rows = [self.loot_event_iid_to_event[iid] for iid in self.loot_events_tree.selection()
+                if iid in self.loot_event_iid_to_event]
+        if not rows:
+            messagebox.showwarning("No loot selected", "Select one or more loot events first. Double-click an event to exclude a specific item.")
+            return
+        self.change_loot_exclusions(self.loot_source_session(), [row["index"] for row in rows])
+
+    def restore_excluded_loot(self):
+        self.change_loot_exclusions(self.loot_source_session(), restore=True)
+
+    def change_loot_exclusions(self, source, event_indices=(), item_name=None, *, restore=False):
+        """Exclude whole receipts or one item in selected receipts, reversibly."""
+        if not source:
+            return False
+        live = self.current_session if self.current_session is not None and source is vars(self.current_session) else None
+        # loot_source_session returns vars(current_session), with its identity.
+        saved_index = next((i for i, row in enumerate(self.sessions) if row is source), None)
+        if live is None and saved_index is None:
+            messagebox.showwarning("Session unavailable", "Select the session again before changing loot.")
+            return False
+        raw = self.raw_loot_events_for_session(source)
+        selected = set(event_indices)
+        changed = False
+        for row in raw:
+            if restore:
+                if row.pop("excluded_from_loot", None) or row.get("excluded_loot_items"):
+                    changed = True
+                row.pop("excluded_loot_items", None)
+            elif row["index"] in selected:
+                if item_name is not None:
+                    if item_name not in row.get("items", {}):
+                        continue
+                    if len(row["items"]) > 1 and not all(detail["messages"] for detail in self.loot_event_item_details(row).values()):
+                        messagebox.showwarning("Item value unavailable", "This older mixed loot event has no exact item values. Exclude the whole event instead.")
+                        return False
+                    row["excluded_loot_items"] = sorted(set(row.get("excluded_loot_items", []) or []) | {item_name})
+                else:
+                    row["excluded_from_loot"] = True
+                changed = True
+        if not changed:
+            return False
+        updated = {**source, "loot_events": raw, "loot_event_grouping_version": LOOT_EVENT_GROUPING_VERSION}
+        if not updated.get("loot_events_before_exclusion") and source.get("loot_events"):
+            updated["loot_events_before_exclusion"] = json.loads(json.dumps(source["loot_events"], ensure_ascii=False))
+        included = self.loot_events_for_session(updated)
+        updated["loot_ped_total"] = sum(row["value_ped"] for row in included)
+        updated["loot_event_count"] = len(included)
+        if live is not None:
+            # Live sessions are saved by stop_sync/on_close; keep dataclass
+            # fields so exclusions survive the normal session save path.
+            for key in ("loot_events", "loot_event_grouping_version", "loot_ped_total", "loot_event_count", "loot_events_before_exclusion"):
+                setattr(live, key, updated[key])
+            live._has_loot_exclusions = any(row.get("excluded_from_loot") or row.get("excluded_loot_items") for row in raw)
+            self.live_ui_dirty = True
+            self.refresh_live_ui(force=True)
+        else:
+            staged = list(self.sessions)
+            staged[saved_index] = updated
+            if not self.save_session_updates(staged):
+                return False
+            source.update(updated)
+            self.refresh_sessions_table()
+            iid = f"session_{saved_index}"
+            self.sessions_tree.selection_set(iid)
+            self.sessions_tree.focus(iid)
+            self.show_session_details(source)
+            self.refresh_mob_analysis(persist_settings=False)
+        self.reset_loot_zoom()
+        return True
 
     def sanitize_loot_events(self, loot_events):
         """Apply ignored loot filtering and stackable quantity fixes to saved events.
@@ -2127,6 +2319,20 @@ class SkillTrackerApp:
             detail_tree.heading(column, text=title)
             detail_tree.column(column, width=width, anchor="w" if column == "item" else "center")
         self.pack_table(detail_tree, table_frame)
+
+        source = self.loot_source_session()
+        def exclude_item():
+            selected = detail_tree.selection()
+            if not selected:
+                messagebox.showwarning("No item selected", "Select an item in this event first.", parent=window)
+                return
+            name = detail_tree.item(selected[0], "values")[0]
+            if self.change_loot_exclusions(source, [event_index], name):
+                window.destroy()
+        actions = ttk.Frame(window, padding=(10, 0, 10, 6))
+        actions.pack(fill="x", before=table_frame)
+        ttk.Button(actions, text="Exclude selected item from this event", command=exclude_item).pack(side="left")
+        ttk.Label(actions, text="Original loot is kept. Use Restore excluded loot to undo.").pack(side="left", padx=10)
 
         for item_name, row in item_details.items():
             quantity = int(row.get("quantity", 0) or 0)
@@ -2471,6 +2677,7 @@ class SkillTrackerApp:
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
+        drop_indices = {}
         for row in drops:
             value_ped = float(row.get("value_ped", 0.0) or 0.0)
             event_value = float(row.get("event_value_ped", 0.0) or 0.0)
@@ -2480,7 +2687,7 @@ class SkillTrackerApp:
             messages = " | ".join(str(message) for message in row.get("messages", []) if message)
             if not messages:
                 messages = "Original message unavailable for this older saved event."
-            detail_tree.insert(
+            drop_iid = detail_tree.insert(
                 "",
                 "end",
                 values=(
@@ -2496,6 +2703,19 @@ class SkillTrackerApp:
                     messages,
                 ),
             )
+            drop_indices[drop_iid] = row["event_index"]
+
+        def exclude_drops():
+            indices = [drop_indices[iid] for iid in detail_tree.selection() if iid in drop_indices]
+            if not indices:
+                messagebox.showwarning("No drops selected", "Select the unwanted drops first.", parent=window)
+                return
+            if self.change_loot_exclusions(session, indices, item_name):
+                window.destroy()
+        actions = ttk.Frame(window, padding=(10, 0, 10, 8))
+        actions.pack(fill="x", before=table_frame)
+        ttk.Button(actions, text="Exclude selected drops of this item", command=exclude_drops).pack(side="left")
+        ttk.Label(actions, text="Only selected receipts change; other drops of this item stay included.").pack(side="left", padx=10)
 
         if not drops:
             detail_tree.insert("", "end", values=("", "", "", "", "", "", "", "", "", "No saved drops found for this item."))
@@ -2548,6 +2768,7 @@ class SkillTrackerApp:
         self.save_loot_markups()
         self.loot_markup_status_var.set(f"Saved manual override for {item_name}: {markup:g}% in {LOOT_MARKUPS_FILE}.")
         self.refresh_loot_tab()
+        self.refresh_mob_analysis(persist_settings=False)
 
     def cancel_loot_markup_edit(self, event=None):
         editor = self.loot_markup_editor
@@ -2675,6 +2896,10 @@ class SkillTrackerApp:
         self.reload_market_data_if_changed()
         session = self.loot_source_session()
         loot_events = self.loot_events_for_session(session)
+        raw = (session or {}).get("loot_events", []) or []
+        excluded_events = sum(bool(row.get("excluded_from_loot")) for row in raw)
+        excluded_items = sum(len(row.get("excluded_loot_items", []) or []) for row in raw)
+        self.restore_loot_button.configure(state="normal" if excluded_events or excluded_items else "disabled")
         self.refresh_loot_item_checks()
         self.loot_events_tree.delete(*self.loot_events_tree.get_children())
         self.loot_event_iid_to_event = {}
@@ -2708,7 +2933,8 @@ class SkillTrackerApp:
             f"Loot after MU: {loot_after_mu:.4f} PED ({percent(loot_after_mu, ped_cycled):.2f}% of cycled)\n"
             f"Average overall MU (TT-weighted): {average_mu} | "
             f"DPP: {dpp} | Effective DPP: {effective_dpp} (damage/PEC)\n"
-            f"Cost per kill/event: {cost_per_kill:.6f} PED | Unique items: {len(item_value_totals)}"
+            f"Cost per kill/event: {cost_per_kill:.6f} PED | Unique items: {len(item_value_totals)} | "
+            f"Excluded events: {excluded_events} | Excluded item drops: {excluded_items}"
         )
 
         # Show every saved loot event. Earlier versions only displayed the last
@@ -3665,27 +3891,35 @@ class SkillTrackerApp:
         session = self.sessions[session_index]
         if column_name == "ped":
             ped_cycled = parse_float(raw_value.replace(",", "."), None)
-            if ped_cycled is None or ped_cycled < 0:
+            if ped_cycled is None or not math.isfinite(ped_cycled) or ped_cycled < 0:
                 messagebox.showerror("Invalid PED cycled", "PED cycled must be a number greater than or equal to 0.")
                 return
-            session["ped_cycled"] = float(ped_cycled)
+            changes = {"ped_cycled": float(ped_cycled)}
+            old_ped = parse_float(session.get("ped_cycled"), 0.0)
+            if session.get("loot_events"):
+                repriced = []
+                attacks = parse_float(session.get("attacks_total"), 0.0)
+                for row in session["loot_events"]:
+                    fraction = (parse_float(row.get("cost_ped"), 0.0) / old_ped if old_ped > 0
+                                else parse_float(row.get("manual_cost_fraction"), None))
+                    if fraction is None and attacks > 0 and row.get("shots") is not None:
+                        fraction = parse_float(row.get("shots"), 0.0) / attacks
+                    # Retain the fraction when setting PED to zero, so a later
+                    # correction can restore costs even in summary-only files.
+                    repriced.append({**row, "cost_ped": fraction * ped_cycled, "manual_cost_fraction": fraction}
+                                    if fraction is not None else dict(row))
+                changes["loot_events"] = repriced
         elif column_name == "notes":
-            session["notes"] = raw_value
+            changes = {"notes": raw_value}
         else:
             return
 
-        # Keep an already-exported valid analysis session in sync with edits.
-        session_id = str(session.get("id", "") or "")
-        analysis_changed = False
-        if session_id:
-            for analysis_index, analysis_session in enumerate(self.analysis_sessions):
-                if isinstance(analysis_session, dict) and str(analysis_session.get("id", "") or "") == session_id:
-                    self.analysis_sessions[analysis_index] = json.loads(json.dumps(session, ensure_ascii=False))
-                    analysis_changed = True
-
-        save_json(SESSIONS_FILE, self.sessions)
-        if analysis_changed:
-            save_json(ANALYSIS_SESSIONS_FILE, self.analysis_sessions)
+        staged = list(self.sessions)
+        updated = {**session, **changes}
+        staged[session_index] = updated
+        if not self.save_session_updates(staged):
+            return
+        session.update(updated)
 
         self.refresh_sessions_table()
         if self.sessions_tree.exists(iid):
@@ -3695,8 +3929,7 @@ class SkillTrackerApp:
         self.show_session_details(session)
         if self.is_tab_active(getattr(self, "loot_tab", None)):
             self.refresh_loot_tab()
-        if analysis_changed:
-            self.refresh_mob_analysis()
+        self.refresh_mob_analysis(persist_settings=False)
 
     def cancel_session_cell_edit(self, event=None):
         editor = self.session_cell_editor
@@ -3824,47 +4057,19 @@ class SkillTrackerApp:
         # Stage copies so a failed primary write leaves live objects untouched.
         # Keep dictionaries: old sessions may contain fields unknown to us.
         staged = list(self.sessions)
-        updates_by_id = {}
         try:
             for index in indices:
                 original = self.sessions[index]
                 updated = {**original, **json.loads(json.dumps(changes))}
-                recalculated = self.recalculate_saved_session_turnover(original, updated)
-                updated.update(recalculated)
+                updated.update(self.recalculate_saved_session_turnover(original, updated))
                 staged[index] = updated
-                session_id = str(original.get("id", "") or "")
-                if session_id:
-                    updates_by_id[session_id] = {**changes, **recalculated}
-            analysis = []
-            for row in self.analysis_sessions:
-                session_id = str(row.get("id", "") or "") if isinstance(row, dict) else ""
-                if session_id in updates_by_id:
-                    # Reprice its own event dictionaries so analysis-only
-                    # extension fields and recorded messages are retained.
-                    updated_row = {**row, **json.loads(json.dumps(changes))}
-                    updated_row.update(self.recalculate_saved_session_turnover(row, updated_row))
-                    updated_row["ped_cycled"] = updates_by_id[session_id]["ped_cycled"]
-                    analysis.append(updated_row)
-                else:
-                    analysis.append(row)
         except ValueError as error:
             messagebox.showwarning("Cannot recalculate session", str(error))
             return False
-        analysis_changed = analysis != self.analysis_sessions
-        try:
-            save_json(SESSIONS_FILE, staged)
-        except OSError as error:
-            messagebox.showerror("Sessions not saved", f"Could not save the selected sessions: {error}")
+        if not self.save_session_updates(staged):
             return False
         for index in indices:
             self.sessions[index].update(staged[index])
-        if analysis_changed:
-            try:
-                save_json(ANALYSIS_SESSIONS_FILE, analysis)
-            except OSError as error:
-                messagebox.showerror("Analysis not saved", f"Sessions were saved, but the analysis file could not be updated: {error}. Apply the same choice again to retry.")
-                return False
-            self.analysis_sessions = analysis
         self.refresh_sessions_table()
         selected_iids = [f"session_{index}" for index in indices if self.sessions_tree.exists(f"session_{index}")]
         self.sessions_tree.selection_set(selected_iids)
@@ -3873,8 +4078,7 @@ class SkillTrackerApp:
             self.sessions_tree.see(selected_iids[0])
         self.show_session_details(self.sessions[indices[0]])
         self.refresh_loot_tab()
-        if analysis_changed:
-            self.refresh_mob_analysis(persist_settings=False)
+        self.refresh_mob_analysis(persist_settings=False)
         return True
 
     def recalculate_saved_session_turnover(self, original, updated):
@@ -3963,7 +4167,8 @@ class SkillTrackerApp:
             copied = json.loads(json.dumps(session, ensure_ascii=False))
             session_id = str(copied.get("id", "") or "")
             if session_id and session_id in existing_by_id:
-                self.analysis_sessions[existing_by_id[session_id]] = copied
+                self.analysis_sessions[existing_by_id[session_id]] = self.analysis_session_copy(
+                    copied, self.analysis_sessions[existing_by_id[session_id]])
                 updated += 1
             else:
                 self.analysis_sessions.append(copied)
@@ -5820,6 +6025,8 @@ class SkillTrackerApp:
             loot_events
             and shots_since_loot == 0
             and timestamp
+            and not loot_events[-1].get("excluded_from_loot")
+            and item not in (loot_events[-1].get("excluded_loot_items") or [])
             and timestamp == str(loot_events[-1].get("ended_at", "") or "")
         )
 
@@ -5851,7 +6058,10 @@ class SkillTrackerApp:
         loot_event["value_ped"] = float(loot_event.get("value_ped", 0.0) or 0.0) + loot_value
         loot_event.setdefault("items", {})[item] = int(loot_event.setdefault("items", {}).get(item, 0) or 0) + quantity
         loot_event.setdefault("messages", []).append(event.get("message", ""))
-        session.loot_event_count = len(loot_events)
+        if getattr(session, "_has_loot_exclusions", False):
+            session.loot_event_count += int(not continue_previous)
+        else:
+            session.loot_event_count = len(loot_events)
 
     def calculate_profession_gains_for_session(self, session: MonitorSession):
         gains = {}
@@ -6024,11 +6234,11 @@ class SkillTrackerApp:
         """
         if isinstance(session, MonitorSession):
             data = vars(session)
-            kills = len(session.loot_events)
+            kills = session.loot_event_count if getattr(session, "_has_loot_exclusions", False) else len(session.loot_events)
         else:
             data = session or {}
             kills = len(self.loot_events_for_session(data))
-            if not kills:
+            if not kills and not data.get("loot_events") and not data.get("events"):
                 kills = max(0, int(data.get("loot_event_count", 0) or 0))
         ped = parse_float(data.get("ped_cycled"), 0.0)
         damage = parse_float(data.get("damage_total"), 0.0)
