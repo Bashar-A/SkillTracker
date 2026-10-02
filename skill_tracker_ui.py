@@ -1015,10 +1015,10 @@ class SkillTrackerApp:
         self.session_projection_ped_var = tk.StringVar(value=str(self.state.get("projection_ped_cycle", "1000")))
         self.projection_refresh_after_id = None
         self.total_gain_var = tk.StringVar(value="Total profession gain: 0.0000")
-        self.selected_skill_var = tk.StringVar(value="")
-        self.current_var = tk.StringVar(value="0")
-        self.delta_var = tk.StringVar(value="0")
-        self.auto_update_current_skills_var = tk.BooleanVar(value=True)
+        self.profession_skill_drafts = {}
+        self.profession_cell_editor = None
+        self.profession_cell_editor_meta = None
+        self.profession_cell_committing = False
         self.entries = {}
 
         self.chat_log_path_var = tk.StringVar(value=self.last_log_path)
@@ -1265,44 +1265,33 @@ class SkillTrackerApp:
         self.profession_var.set("Animal Looter" if "Animal Looter" in PROFESSIONS else list(PROFESSIONS.keys())[0])
         self.profession_combo.bind("<<ComboboxSelected>>", lambda e: self.load_profession())
 
-        ttk.Button(top_frame, text="Calculate", command=self.calculate_profession_gain).grid(row=0, column=2, padx=5)
-        ttk.Label(top_frame, textvariable=self.total_gain_var, style="Tracker.Emphasis.TLabel").grid(row=0, column=3, sticky="e", padx=10)
+        ttk.Label(top_frame, textvariable=self.total_gain_var, style="Tracker.Emphasis.TLabel").grid(row=0, column=2, sticky="e", padx=10)
         actions = ttk.Frame(top_frame)
-        actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Button(actions, text="Save Current Skills", command=self.save_current_skills_from_table).pack(side="left", padx=(0, 5))
+        actions.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="Save New Values", command=self.save_current_skills_from_table).pack(side="left", padx=(0, 5))
         ttk.Button(actions, text="Reload Saved Skills", command=self.reload_saved_skills).pack(side="left", padx=5)
-        ttk.Checkbutton(
-            actions,
-            text="After calculate, set current skills = new x2",
-            variable=self.auto_update_current_skills_var,
-        ).pack(side="left", padx=10)
+        ttk.Label(top_frame, text="Double-click a value to edit; Enter or leaving the cell recalculates, Esc cancels. Edits are saved only with Save New Values.", wraplength=600).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(top_frame, text="100 profession gain = 1 profession level.").grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
         top_frame.columnconfigure(1, weight=1)
 
         columns = ("skill", "weight", "current", "delta", "new", "skill_gain", "profession_gain")
         self.skill_tree = ttk.Treeview(self.profession_tab, columns=columns, show="headings", height=24)
         headings = {
-            "skill": "Skill", "weight": "Weight %", "current": "Current x1", "delta": "TT delta",
-            "new": "New x2", "skill_gain": "Skill gain", "profession_gain": "Profession gain"
+            "skill": "Skill", "weight": "Weight %", "current": "Current value", "delta": "TT delta",
+            "new": "New value", "skill_gain": "Skill gain", "profession_gain": "Profession gain"
         }
         widths = {"skill": 250, "weight": 90, "current": 130, "delta": 120, "new": 130, "skill_gain": 130, "profession_gain": 150}
         for col in columns:
             self.skill_tree.heading(col, text=headings[col])
             self.skill_tree.column(col, width=widths[col], anchor="center" if col != "skill" else "w")
-        table_holder = self.pack_table(self.skill_tree, self.profession_tab, padx=10, pady=(0, 6))
-
-        input_frame = ttk.LabelFrame(self.profession_tab, text="Edit selected skill", padding=10)
-        input_frame.pack(side="bottom", fill="x", padx=10, pady=10)
-        # Reserve the editor before the expanding table at smaller heights.
-        table_holder.pack_configure(after=input_frame)
-        ttk.Label(input_frame, text="Selected skill:").grid(row=0, column=0, sticky="w")
-        ttk.Label(input_frame, textvariable=self.selected_skill_var).grid(row=0, column=1, columnspan=5, sticky="w", padx=8)
-        ttk.Label(input_frame, text="Current x1:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(input_frame, textvariable=self.current_var, width=14).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(input_frame, text="TT delta:").grid(row=1, column=2, sticky="w", padx=(12, 4), pady=(8, 0))
-        ttk.Entry(input_frame, textvariable=self.delta_var, width=14).grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
-        ttk.Button(input_frame, text="Apply to selected skill", command=self.apply_selected_skill).grid(row=1, column=4, padx=8, pady=(8, 0))
-        ttk.Button(input_frame, text="Save selected current skill", command=self.save_selected_current_skill).grid(row=1, column=5, padx=5, pady=(8, 0))
-        self.skill_tree.bind("<<TreeviewSelect>>", self.on_skill_selected)
+        table_holder = self.pack_table(self.skill_tree, self.profession_tab, padx=10, pady=(0, 10))
+        for scrollbar in table_holder.children.values():
+            view = self.skill_tree.yview if scrollbar.cget("orient") == "vertical" else self.skill_tree.xview
+            scrollbar.configure(command=lambda *args, view=view: self.scroll_profession_table(view, *args))
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.skill_tree.bind(event, lambda event: None if self.commit_profession_cell_edit() else "break", add="+")
+        self.skill_tree.bind("<Configure>", self.position_profession_cell_editor)
+        self.skill_tree.bind("<Double-1>", self.on_profession_skill_double_click)
 
     def create_monitor_tab(self):
         top = ttk.Frame(self.monitor_tab, padding=10)
@@ -4700,99 +4689,179 @@ class SkillTrackerApp:
         self.last_log_read_at_var.set(str(self.state.get("last_log_read_at", "") or ""))
 
     def load_profession(self):
+        self.cancel_profession_cell_edit()
         self.entries.clear()
         self.skill_tree.delete(*self.skill_tree.get_children())
         profession = PROFESSIONS[self.profession_var.get()]
         for skill_name, weight in sorted(profession["skills"].items(), key=lambda item: item[1], reverse=True):
             current = float(self.current_skills.get(skill_name, 0.0))
-            self.entries[skill_name] = {"weight": float(weight), "current": current, "delta": 0.0, "new": current, "skill_gain": 0.0, "profession_gain": 0.0}
-            self.skill_tree.insert("", "end", iid=skill_name, values=(skill_name, f"{weight:g}", f"{current:.4f}", "0.0000", f"{current:.4f}", "0.0000", "0.0000"))
-        self.total_gain_var.set("Total profession gain: 0.0000")
-        self.selected_skill_var.set("")
-        self.current_var.set("0")
-        self.delta_var.set("0")
-
-    def on_skill_selected(self, event=None):
-        selected = self.skill_tree.selection()
-        if not selected:
-            return
-        skill_name = selected[0]
-        data = self.entries[skill_name]
-        self.selected_skill_var.set(skill_name)
-        self.current_var.set(str(data["current"]))
-        self.delta_var.set(str(data["delta"]))
-
-    def apply_selected_skill(self):
-        selected = self.skill_tree.selection()
-        if not selected:
-            messagebox.showwarning("No skill selected", "Select a skill first.")
-            return
-        skill_name = selected[0]
-        current = parse_float(self.current_var.get(), None)
-        delta = parse_float(self.delta_var.get(), None)
-        if current is None or delta is None:
-            messagebox.showerror("Invalid input", "Current x1 and TT delta must be numbers.")
-            return
-        self.entries[skill_name].update({"current": current, "delta": delta, "new": current, "skill_gain": 0.0, "profession_gain": 0.0})
-        self.current_skills[skill_name] = current
-        self.update_skill_tree_row(skill_name)
-
-    def save_selected_current_skill(self):
-        selected = self.skill_tree.selection()
-        if not selected:
-            messagebox.showwarning("No skill selected", "Select a skill first.")
-            return
-        skill_name = selected[0]
-        current = parse_float(self.current_var.get(), None)
-        if current is None:
-            messagebox.showerror("Invalid input", "Current x1 must be a number.")
-            return
-        self.current_skills[skill_name] = current
-        if skill_name in self.entries:
-            self.entries[skill_name]["current"] = current
+            draft = self.profession_skill_drafts.get(skill_name, {})
+            data = {"weight": float(weight), "current": current, "delta": 0.0, **draft}
+            self.entries[skill_name] = self.calculate_profession_skill_row(skill_name, data)
+            self.skill_tree.insert("", "end", iid=skill_name)
             self.update_skill_tree_row(skill_name)
-        save_current_skills(self.current_skills)
-        messagebox.showinfo("Saved", f"Saved {skill_name} = {current:.4f}")
+        self.update_profession_gain_total()
+
+    def calculate_profession_skill_row(self, skill_name, data, column="delta", value=None):
+        """Resolve any editable cell against the same forward/inverse TT curve."""
+        result = dict(data)
+        if value is not None:
+            if not math.isfinite(value):
+                raise ValueError("Enter a finite number.")
+            result[column] = value
+        current = result["current"]
+        if not math.isfinite(current) or current < 0:
+            raise ValueError("Current value must be a non-negative finite number.")
+        factor = profession_weighted_value(skill_name, 1.0) * result["weight"] / 100.0
+        if column in ("new", "skill_gain", "profession_gain"):
+            if column == "skill_gain":
+                new = current + result["skill_gain"]
+            elif column == "profession_gain":
+                if not factor:
+                    raise ValueError("This skill has no contribution to the selected profession.")
+                new = current + result["profession_gain"] / factor
+            else:
+                new = result["new"]
+            # Unchanged legacy values above the verified curve remain usable.
+            delta = 0.0 if new == current else skill_tt_value(new) - skill_tt_value(current)
+        else:
+            delta = result["delta"]
+            new = current if delta == 0 else find_skill_after_tt_delta(current, delta)
+            candidate = result.get("new")
+            # Rounded TT samples can contain flat segments. Keep a directly
+            # entered point value when it already has the target TT instead of
+            # snapping it to the start of the segment on a later refresh.
+            if candidate is not None and (candidate == current and delta == 0 or
+                    0 <= candidate <= SKILL_TT_CURVE_MAX_POINTS and current <= SKILL_TT_CURVE_MAX_POINTS
+                    and math.isclose(skill_tt_value(candidate), skill_tt_value(current) + delta, rel_tol=0, abs_tol=1e-12)):
+                new = candidate
+        gain = new - current
+        result.update(delta=delta, new=new, skill_gain=gain, profession_gain=gain * factor)
+        return result
+
+    def update_profession_gain_total(self):
+        total = sum(data["profession_gain"] for data in self.entries.values())
+        self.total_gain_var.set(f"Total profession gain: {total:.4f}")
+
+    def edit_profession_skill_value(self, skill_name, column, value):
+        if column not in ("current", "delta", "new", "skill_gain", "profession_gain") or skill_name not in self.entries:
+            raise ValueError("Choose an editable skill value.")
+        data = self.calculate_profession_skill_row(skill_name, self.entries[skill_name], column, value)
+        # Drafts stay separate from current_skills: live autosaves and closing
+        # the app must never implicitly persist calculator previews.
+        self.profession_skill_drafts[skill_name] = {key: data[key] for key in ("current", "delta", "new")}
+        self.entries[skill_name] = data
+        self.update_skill_tree_row(skill_name)
+        self.update_profession_gain_total()
+
+    def on_profession_skill_double_click(self, event):
+        tree = self.skill_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        skill = tree.identify_row(event.y)
+        token = tree.identify_column(event.x)
+        if not skill or not token.startswith("#"):
+            return
+        column = tree.column(token, "id")
+        if column not in ("current", "delta", "new", "skill_gain", "profession_gain"):
+            return
+        if not self.commit_profession_cell_edit():
+            return
+        bbox = tree.bbox(skill, column)
+        if not bbox:
+            return
+        tree.selection_set(skill)
+        editor = ttk.Entry(tree)
+        editor.insert(0, repr(self.entries[skill][column]))
+        editor.select_range(0, "end")
+        x, y, width, height = bbox
+        editor.place(x=x, y=y, width=width, height=height)
+        self.profession_cell_editor = editor
+        self.profession_cell_editor_meta = (skill, column)
+        editor.bind("<Return>", self.commit_profession_cell_edit)
+        editor.bind("<FocusOut>", self.commit_profession_cell_edit)
+        editor.bind("<Escape>", self.cancel_profession_cell_edit)
+        editor.focus_set()
+
+    def commit_profession_cell_edit(self, event=None):
+        editor = self.profession_cell_editor
+        if editor is None:
+            return True
+        if self.profession_cell_committing:
+            return False
+        self.profession_cell_committing = True
+        try:
+            value = parse_float(editor.get().strip().replace(",", "."), None)
+            if value is None:
+                raise ValueError("Enter a number.")
+            self.edit_profession_skill_value(*self.profession_cell_editor_meta, value)
+        except ValueError as error:
+            messagebox.showerror("Invalid skill value", str(error))
+            editor.focus_set()
+            return False
+        finally:
+            self.profession_cell_committing = False
+        self.cancel_profession_cell_edit()
+        return True
+
+    def scroll_profession_table(self, view, *args):
+        if self.commit_profession_cell_edit():
+            view(*args)
+
+    def position_profession_cell_editor(self, event=None):
+        if self.profession_cell_editor is not None:
+            bbox = self.skill_tree.bbox(*self.profession_cell_editor_meta)
+            if bbox:
+                x, y, width, height = bbox
+                self.profession_cell_editor.place(x=x, y=y, width=width, height=height)
+
+    def cancel_profession_cell_edit(self, event=None):
+        editor = self.profession_cell_editor
+        self.profession_cell_editor = None
+        self.profession_cell_editor_meta = None
+        if editor is not None:
+            editor.destroy()
 
     def save_current_skills_from_table(self):
-        for skill_name, data in self.entries.items():
-            self.current_skills[skill_name] = float(data["current"])
-        save_current_skills(self.current_skills)
-        messagebox.showinfo("Saved", f"Current skills saved to {CURRENT_SKILLS_FILE}")
+        if not self.commit_profession_cell_edit():
+            return
+        updated = dict(self.current_skills)
+        updated.update({skill_name: float(data["new"]) for skill_name, data in self.entries.items()
+                        if skill_name in self.profession_skill_drafts})
+        try:
+            save_current_skills(updated)
+        except OSError as error:
+            messagebox.showerror("Skills not saved", str(error))
+            return
+        self.current_skills = updated
+        for skill in self.entries:
+            self.profession_skill_drafts.pop(skill, None)
+        self.load_profession_keep_selection()
+        self.load_analysis_looters_from_current_skills()
+        self.refresh_session_skill_tree()
+        self.update_session_summary()
+        messagebox.showinfo("Saved", f"New values saved as current skills to {CURRENT_SKILLS_FILE}")
 
     def reload_saved_skills(self):
+        self.cancel_profession_cell_edit()
+        self.profession_skill_drafts.clear()
         self.current_skills = load_current_skills()
-        self.load_profession()
+        self.load_profession_keep_selection()
         self.load_analysis_looters_from_current_skills()
         self.refresh_session_skill_tree()
         messagebox.showinfo("Reloaded", f"Loaded skills from {CURRENT_SKILLS_FILE}")
 
     def calculate_profession_gain(self):
-        total_profession_gain = 0.0
         for skill_name, data in self.entries.items():
-            try:
-                new_x = find_skill_after_tt_delta(data["current"], data["delta"])
-            except Exception as ex:
-                messagebox.showerror("Calculation error", f"{skill_name}: {ex}")
-                return
-            skill_gain = new_x - data["current"]
-            profession_gain = profession_weighted_value(skill_name, skill_gain) * data["weight"] / 100.0
-            total_profession_gain += profession_gain
-            data.update({"new": new_x, "skill_gain": skill_gain, "profession_gain": profession_gain})
-            if self.auto_update_current_skills_var.get() and data["delta"] != 0:
-                data["current"] = new_x
-                data["delta"] = 0.0
-                self.current_skills[skill_name] = new_x
+            self.entries[skill_name] = self.calculate_profession_skill_row(skill_name, data)
             self.update_skill_tree_row(skill_name)
-        if self.auto_update_current_skills_var.get():
-            save_current_skills(self.current_skills)
-        self.total_gain_var.set(f"Total profession gain: {total_profession_gain:.4f}")
+        self.update_profession_gain_total()
 
     def update_skill_tree_row(self, skill_name):
         if skill_name not in self.entries or not self.skill_tree.exists(skill_name):
             return
         data = self.entries[skill_name]
-        self.skill_tree.item(skill_name, values=(skill_name, f"{data['weight']:g}", f"{data['current']:.4f}", f"{data['delta']:.4f}", f"{data['new']:.4f}", f"{data['skill_gain']:.4f}", f"{data['profession_gain']:.4f}"))
+        self.skill_tree.item(skill_name, values=(skill_name, f"{data['weight']:g}", f"{data['current']:.4f}", f"{data['delta']:.8f}", f"{data['new']:.4f}", f"{data['skill_gain']:.4f}", f"{data['profession_gain']:.4f}"))
 
     def filter_names(self, names, query):
         query = (query or "").strip().lower()
@@ -6068,16 +6137,19 @@ class SkillTrackerApp:
     def refresh_profession_current_values(self):
         # Update only existing rows. Rebuilding the complete profession table on
         # every log batch caused selection flicker and large UI stalls.
+        changed = False
         for skill_name, data in self.entries.items():
+            if skill_name in self.profession_skill_drafts or (self.profession_cell_editor_meta and self.profession_cell_editor_meta[0] == skill_name):
+                continue
             current = float(self.current_skills.get(skill_name, 0.0))
             if current == float(data.get("current", 0.0)):
                 continue
             data["current"] = current
-            if float(data.get("delta", 0.0)) == 0.0:
-                data["new"] = current
-                data["skill_gain"] = 0.0
-                data["profession_gain"] = 0.0
+            self.entries[skill_name] = self.calculate_profession_skill_row(skill_name, data)
             self.update_skill_tree_row(skill_name)
+            changed = True
+        if changed:
+            self.update_profession_gain_total()
 
     def maybe_persist_live_state(self, force=False):
         if not self.monitoring or self.current_session is None:
@@ -6121,13 +6193,13 @@ class SkillTrackerApp:
 
     def load_profession_keep_selection(self):
         selected_profession = self.profession_var.get()
-        selected_skill = self.selected_skill_var.get()
+        selected = self.skill_tree.selection()
+        selected_skill = selected[0] if selected else None
         self.load_profession()
         self.profession_var.set(selected_profession)
         if selected_skill and self.skill_tree.exists(selected_skill):
             self.skill_tree.selection_set(selected_skill)
             self.skill_tree.focus(selected_skill)
-            self.on_skill_selected()
 
     def refresh_sessions_table(self):
         self.sessions_tree.delete(*self.sessions_tree.get_children())
@@ -6300,6 +6372,7 @@ class SkillTrackerApp:
         save_json(TRACKER_STATE_FILE, self.state)
 
     def on_close(self):
+        self.cancel_profession_cell_edit()
         if self.monitoring:
             self.stop_sync()
         else:
