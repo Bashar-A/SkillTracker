@@ -18,7 +18,6 @@ def main():
         (portable / 'current_skills.json').write_text(json.dumps(skills), encoding='utf-8')
         session_file = portable / 'skill_tracker_sessions.json'
         session_file.write_text(json.dumps(sessions), encoding='utf-8')
-        before = session_file.read_bytes()
         (portable / 'skill_tracker_state.json').write_text(json.dumps({'ui_style': 'Command', 'ui_color_scheme': 'Dark'}), encoding='utf-8')
         report_file = folder / 'smoke-report.json'
         result = subprocess.run([str(program), '--smoke-test', str(report_file)], cwd=foreign, timeout=120)
@@ -28,7 +27,17 @@ def main():
         assert Path(report['dataDirectory']).resolve() == portable.resolve(), report
         assert report['skills'] == skills and report['sessionIds'] == ['legacy-session'], report
         assert report['hpSkills'] > 0 and report['mobs'] >= 830, report
-        assert session_file.read_bytes() == before, 'Packaged startup modified archived sessions.'
+        saved_sessions = json.loads(session_file.read_text(encoding='utf-8'))
+        assert len(saved_sessions) == len(sessions), 'Packaged startup lost archived sessions.'
+        for original, saved in zip(sessions, saved_sessions):
+            assert all(saved.get(key) == value for key, value in original.items()), 'Packaged startup changed original session data.'
+        # Existing startup migration adds derived TT fields to legacy records.
+        # A second launch must preserve the migrated archive exactly.
+        migrated = session_file.read_bytes()
+        result = subprocess.run([str(program), '--smoke-test', str(report_file)], cwd=foreign, timeout=120)
+        report = json.loads(report_file.read_text(encoding='utf-8'))
+        assert result.returncode == 0 and report.get('ok'), report
+        assert session_file.read_bytes() == migrated, 'Packaged startup repeatedly rewrote archived sessions.'
         assert not list(foreign.iterdir()), 'User data was written to the unrelated working directory.'
         print('Packaged GUI, bundled reference data, portable paths and legacy data verified.')
 

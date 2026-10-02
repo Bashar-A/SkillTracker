@@ -7064,6 +7064,7 @@ def smoke_test(report_path):
                   "hpSkills": len(SKILL_HP_INCREASES), "mobs": len(MOBS), "sessionIds": [s.get('id') for s in app.sessions]}
         app.on_close(); root = None
     except Exception:
+        report['ok'] = False
         report['error'] = traceback.format_exc()
     finally:
         if root is not None:
