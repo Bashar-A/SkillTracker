@@ -3577,7 +3577,7 @@ class SkillTrackerApp:
 
         columns = (
             "started", "ended", "weapon", "mob", "notes", "attacks", "defended", "misses", "damage", "ped",
-            "dpp", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
+            "dpp", "effective_dpp", "loot", "loot_percent", "loot_events", "cost_per_kill", "skill_tt",
             "skill_tt_percent", "ped_h", "avg_skill_tt_per_hour", "skill_points",
         )
         self.sessions_tree = ttk.Treeview(
@@ -3591,7 +3591,8 @@ class SkillTrackerApp:
             ("started", "Started", 155), ("ended", "Ended", 155), ("weapon", "Weapon / Amp", 260),
             ("mob", "Mob", 170), ("notes", "Notes", 240), ("attacks", "Attacks", 75),
             ("defended", "J/E/D", 70), ("misses", "Misses", 70), ("damage", "Damage", 85),
-            ("ped", "PED cycled", 95), ("dpp", "DPP", 70), ("loot", "Loot PED", 85),
+            ("ped", "PED cycled", 95), ("dpp", "DPP", 70),
+            ("effective_dpp", "Effective DPP", 110), ("loot", "Loot PED", 85),
             ("loot_percent", "Loot %", 75),
             ("loot_events", "Loot events", 90),
             ("cost_per_kill", "Cost/kill", 90),
@@ -3733,13 +3734,13 @@ class SkillTrackerApp:
                        for name, row in sorted(self.hunting_setups.items(), key=lambda pair: str(pair[0]).casefold())
                        if isinstance(row, dict)]
             columns = (("name", "Saved setup", 250), ("weapon", "Weapon", 280))
-            hint = "Changes weapon, amplifier and attachments. Recorded PED, loot and skills stay unchanged."
+            hint = "Changes equipment and recalculates PED and loot-event costs from recorded attacks. Loot and skills stay unchanged."
         else:
             choices = [((row["mob"], row.get("maturity", "")), (row["mob"], row.get("maturity", "")))
                        for row in self.favorite_mobs if isinstance(row, dict) and row.get("mob")]
             choices.sort(key=lambda pair: tuple(str(value).casefold() for value in pair[0]))
             columns = (("mob", "Favorite mob", 330), ("maturity", "Maturity", 200))
-            hint = "Changes mob and maturity. Equipment, recorded PED, loot and skills stay unchanged."
+            hint = "Changes mob and maturity, then recalculates turnover and DPP. Equipment, loot and skills stay unchanged."
         if not choices:
             messagebox.showwarning("No saved choices", "Add saved setups or favorite mobs in Hunting Setup first.")
             return
@@ -3811,7 +3812,7 @@ class SkillTrackerApp:
         search.focus_set()
 
     def assign_saved_session_choice(self, sessions, kind, choice):
-        """Patch only equipment/target fields; preserve legacy and extension data."""
+        """Update equipment/target and turnover; preserve loot and skill data."""
         if kind == "setup":
             setup = self.hunting_setups.get(choice)
             if not isinstance(setup, dict):
@@ -3834,13 +3835,32 @@ class SkillTrackerApp:
         # Stage copies so a failed primary write leaves live objects untouched.
         # Keep dictionaries: old sessions may contain fields unknown to us.
         staged = list(self.sessions)
-        for index in indices:
-            staged[index] = dict(self.sessions[index])
-            staged[index].update(json.loads(json.dumps(changes)))
-        session_ids = {str(self.sessions[index].get("id", "") or "") for index in indices} - {""}
-        analysis = [dict(row, **json.loads(json.dumps(changes)))
-                    if isinstance(row, dict) and str(row.get("id", "") or "") in session_ids else row
-                    for row in self.analysis_sessions]
+        updates_by_id = {}
+        try:
+            for index in indices:
+                original = self.sessions[index]
+                updated = {**original, **json.loads(json.dumps(changes))}
+                recalculated = self.recalculate_saved_session_turnover(original, updated)
+                updated.update(recalculated)
+                staged[index] = updated
+                session_id = str(original.get("id", "") or "")
+                if session_id:
+                    updates_by_id[session_id] = {**changes, **recalculated}
+            analysis = []
+            for row in self.analysis_sessions:
+                session_id = str(row.get("id", "") or "") if isinstance(row, dict) else ""
+                if session_id in updates_by_id:
+                    # Reprice its own event dictionaries so analysis-only
+                    # extension fields and recorded messages are retained.
+                    updated_row = {**row, **json.loads(json.dumps(changes))}
+                    updated_row.update(self.recalculate_saved_session_turnover(row, updated_row))
+                    updated_row["ped_cycled"] = updates_by_id[session_id]["ped_cycled"]
+                    analysis.append(updated_row)
+                else:
+                    analysis.append(row)
+        except ValueError as error:
+            messagebox.showwarning("Cannot recalculate session", str(error))
+            return False
         analysis_changed = analysis != self.analysis_sessions
         try:
             save_json(SESSIONS_FILE, staged)
@@ -3867,6 +3887,65 @@ class SkillTrackerApp:
         if analysis_changed:
             self.refresh_mob_analysis(persist_settings=False)
         return True
+
+    def recalculate_saved_session_turnover(self, original, updated):
+        """Reprice attacks and per-loot costs without replacing recorded loot."""
+        weapon = updated.get("weapon", "")
+        amplifier = updated.get("amplifier", "")
+        attachments = updated.get("attachments", []) or []
+        if (weapon not in WEAPONS or (amplifier and amplifier not in AMPLIFIERS)
+                or any(name and name not in ATTACHMENTS for name in attachments[:3])):
+            raise ValueError("The session equipment is missing from current item data. Choose a known saved setup first.")
+        shot_cost = hunting_setup_cost_per_shot_ped(weapon, amplifier, attachments)
+        old_cost = hunting_setup_cost_per_shot_ped(original.get("weapon", ""), original.get("amplifier", ""), original.get("attachments", []) or [])
+        if original.get("weapon", "") not in WEAPONS:
+            old_cost = 0.0
+        if not math.isfinite(shot_cost) or shot_cost <= 0:
+            raise ValueError("The selected equipment has no usable cost per shot. No sessions were changed.")
+        attack_types = ("normal_hit", "crit", "defended_attack", "miss", "jammed")
+        raw_attacks = sum(event.get("type") in attack_types for event in original.get("events", []) or [])
+        attacks = parse_float(original.get("attacks_total"), 0.0)
+        if not attacks:
+            attacks = sum(parse_float(original.get(key), 0.0) for key in ("normal_hits", "critical_hits", "missed_attacks"))
+            attacks += parse_float(original.get("defended_attacks", original.get("jammed_attacks")), 0.0)
+        old_ped = parse_float(original.get("ped_cycled"), 0.0)
+        if not attacks and old_ped > 0 and old_cost > 0:
+            # Very old files may have lost the attack summary or full log.
+            attacks = old_ped / old_cost
+        if not attacks and old_ped == 0:
+            attacks = raw_attacks or sum(parse_float(row.get("shots"), 0.0) for row in original.get("loot_events", []) or [])
+        if not math.isfinite(attacks) or attacks < 0 or (attacks == 0 and old_ped > 0):
+            raise ValueError("This old session has no usable attack count or original shot cost. No sessions were changed.")
+        ped = attacks * shot_cost
+        if not math.isfinite(ped):
+            raise ValueError("This session has an invalid attack count. No sessions were changed.")
+        result = {"ped_cycled": ped, "count_hunting": True}
+        if original.get("loot_events"):
+            reconstructed = self.reconstruct_loot_events_from_events({**original, "count_hunting": True}) if raw_attacks == attacks else []
+            loot_events = []
+            for index, original_row in enumerate(original["loot_events"]):
+                row = dict(original_row)
+                shots = parse_float(row.get("shots"), None)
+                if shots is None and index < len(reconstructed):
+                    rebuilt = reconstructed[index]
+                    if (row.get("started_at") == rebuilt.get("started_at")
+                            and math.isclose(parse_float(row.get("value_ped"), 0), rebuilt["value_ped"], abs_tol=1e-9)):
+                        shots = rebuilt["shots"]
+                if shots is not None and math.isfinite(shots) and shots >= 0:
+                    row["cost_ped"] = shots * shot_cost
+                elif attacks > 0 and not original.get("count_hunting") and not row.get("cost_ped"):
+                    raise ValueError("This old session has no per-loot shot counts or costs. No sessions were changed.")
+                elif old_cost > 0:
+                    row["cost_ped"] = parse_float(row.get("cost_ped"), 0.0) * shot_cost / old_cost
+                elif old_ped > 0:
+                    row["cost_ped"] = parse_float(row.get("cost_ped"), 0.0) * ped / old_ped
+                else:
+                    raise ValueError("This old session has insufficient per-loot attack/cost data. No sessions were changed.")
+                if not math.isfinite(row["cost_ped"]) or row["cost_ped"] < 0:
+                    raise ValueError("This old session has an invalid loot-event cost. No sessions were changed.")
+                loot_events.append(row)
+            result["loot_events"] = loot_events
+        return result
 
     def add_selected_sessions_to_analysis(self):
         indices = self.selected_session_indices_from_table()
@@ -6072,8 +6151,9 @@ class SkillTrackerApp:
             damage_total = float(session.get('damage_total', 0.0) or 0.0)
             ped_cycled = float(session.get('ped_cycled', 0.0))
             loot_ped = float(session.get('loot_ped_total', 0.0))
-            loot_event_count = len(self.loot_events_for_session(session))
-            cost_per_kill = ped_cycled / loot_event_count if loot_event_count else 0.0
+            combat = self.calculate_session_combat_metrics(session)
+            loot_event_count = combat["kills"]
+            cost_per_kill = combat["cost_per_kill"] or 0.0
             weapon = session.get("weapon", "")
             amplifier = session.get("amplifier", "")
             attachments = session.get("attachments", []) or []
@@ -6102,6 +6182,7 @@ class SkillTrackerApp:
                 f"{damage_total:.1f}",
                 f"{ped_cycled:.4f}",
                 f"{dpp:.3f}" if dpp else "",
+                f'{combat["effective_dpp"]:.3f}' if combat["effective_dpp"] is not None else "—",
                 f"{loot_ped:.4f}",
                 f"{percent(loot_ped, ped_cycled):.2f}%",
                 loot_event_count,
