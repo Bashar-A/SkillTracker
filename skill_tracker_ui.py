@@ -3569,7 +3569,11 @@ class SkillTrackerApp:
         )):
             for column, (text, command) in enumerate(actions):
                 ttk.Button(top, text=text, command=command).grid(row=row, column=column, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(top, text="Double-click PED cycled or Notes to edit.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        assignments = ttk.Frame(top)
+        assignments.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(assignments, text="Change setup", command=lambda: self.open_session_assignment("setup")).pack(side="left")
+        ttk.Button(assignments, text="Change mob", command=lambda: self.open_session_assignment("mob")).pack(side="left", padx=8)
+        ttk.Label(top, text="Select sessions to change setup or mob. Double-click Weapon / Amp, Mob, PED cycled or Notes to edit.").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         columns = (
             "started", "ended", "weapon", "mob", "notes", "attacks", "defended", "misses", "damage", "ped",
@@ -3607,7 +3611,7 @@ class SkillTrackerApp:
         self.sessions_tree.bind("<Double-1>", self.on_sessions_tree_double_click)
 
     def on_sessions_tree_double_click(self, event):
-        """Inline-edit saved session PED cycled or notes."""
+        """Edit metadata without changing the recorded combat/loot history."""
         tree = self.sessions_tree
         if tree.identify_region(event.x, event.y) != "cell":
             return
@@ -3621,7 +3625,13 @@ class SkillTrackerApp:
             session_index = int(str(iid).replace("session_", ""))
         except (ValueError, IndexError, tk.TclError):
             return
-        if column_name not in ("ped", "notes") or not (0 <= session_index < len(self.sessions)):
+        if not (0 <= session_index < len(self.sessions)):
+            return
+        if column_name in ("weapon", "mob"):
+            self.sessions_tree.selection_set(iid)
+            self.open_session_assignment("setup" if column_name == "weapon" else "mob")
+            return
+        if column_name not in ("ped", "notes"):
             return
 
         bbox = tree.bbox(iid, column_name)
@@ -3707,6 +3717,156 @@ class SkillTrackerApp:
                 editor.destroy()
             except tk.TclError:
                 pass
+
+    def open_session_assignment(self, kind):
+        """Choose equipment or a favorite target for selected saved sessions."""
+        if kind not in ("setup", "mob"):
+            return
+        indices = self.selected_session_indices_from_table()
+        if not indices:
+            messagebox.showwarning("No sessions selected", "Select one or more saved sessions first.")
+            return
+        # Capture objects, not row positions: a refresh cannot redirect edits.
+        sessions = [self.sessions[index] for index in indices]
+        if kind == "setup":
+            choices = [(name, (name, row.get("weapon", "")))
+                       for name, row in sorted(self.hunting_setups.items(), key=lambda pair: str(pair[0]).casefold())
+                       if isinstance(row, dict)]
+            columns = (("name", "Saved setup", 250), ("weapon", "Weapon", 280))
+            hint = "Changes weapon, amplifier and attachments. Recorded PED, loot and skills stay unchanged."
+        else:
+            choices = [((row["mob"], row.get("maturity", "")), (row["mob"], row.get("maturity", "")))
+                       for row in self.favorite_mobs if isinstance(row, dict) and row.get("mob")]
+            choices.sort(key=lambda pair: tuple(str(value).casefold() for value in pair[0]))
+            columns = (("mob", "Favorite mob", 330), ("maturity", "Maturity", 200))
+            hint = "Changes mob and maturity. Equipment, recorded PED, loot and skills stay unchanged."
+        if not choices:
+            messagebox.showwarning("No saved choices", "Add saved setups or favorite mobs in Hunting Setup first.")
+            return
+        self.cancel_session_cell_edit()
+        window = tk.Toplevel(self.root)
+        window.title(f"Change {'setup' if kind == 'setup' else 'mob'} — {len(sessions)} selected session(s)")
+        window.geometry("680x440")
+        window.minsize(560, 360)
+        window.transient(self.root)
+        content = ttk.Frame(window, padding=12)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text=hint, wraplength=620).pack(fill="x", pady=(0, 10))
+        search_var = tk.StringVar(window)
+        search_row = ttk.Frame(content)
+        search_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(search_row, text="Search:").pack(side="left", padx=(0, 8))
+        search = ttk.Entry(search_row, textvariable=search_var)
+        search.pack(side="left", fill="x", expand=True)
+        footer = ttk.Frame(content)
+        footer.pack(side="bottom", fill="x")
+        tree = ttk.Treeview(content, columns=[column for column, _, _ in columns], show="headings", selectmode="browse", height=9)
+        for column, title, width in columns:
+            tree.heading(column, text=title)
+            tree.column(column, width=width, anchor="w")
+        self.pack_table(tree, content)
+        preview_var = tk.StringVar(window, value="Choose a saved setup." if kind == "setup" else "Choose a favorite mob and maturity.")
+        ttk.Label(footer, textvariable=preview_var, wraplength=620).pack(fill="x", pady=8)
+        actions = ttk.Frame(footer)
+        actions.pack(fill="x")
+
+        def selected_choice():
+            selected = tree.selection()
+            return choices[int(selected[0])][0] if selected else None
+
+        def preview(event=None):
+            choice = selected_choice()
+            save_button.configure(state="normal" if choice is not None else "disabled")
+            if choice is None:
+                preview_var.set("Choose a saved setup." if kind == "setup" else "Choose a favorite mob and maturity.")
+            elif kind == "setup":
+                row = self.hunting_setups.get(choice, {})
+                attachments = ", ".join(str(name) for name in (row.get("attachments", []) or [])) or "None"
+                preview_var.set(f"Amplifier: {row.get('amplifier') or 'None'} | Attachments: {attachments}")
+            else:
+                preview_var.set(f"Target: {choice[0]} / {choice[1]}")
+
+        def filter_choices(*args):
+            tree.delete(*tree.get_children())
+            query = search_var.get().strip().casefold()
+            for index, (_, values) in enumerate(choices):
+                if query in " ".join(str(value) for value in values).casefold():
+                    tree.insert("", "end", iid=str(index), values=values)
+            preview()
+
+        def save():
+            choice = selected_choice()
+            if choice is not None and self.assign_saved_session_choice(sessions, kind, choice):
+                window.destroy()
+
+        save_button = ttk.Button(actions, text="Save to selected sessions", command=save, state="disabled")
+        save_button.pack(side="right")
+        ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right", padx=8)
+        tree.bind("<<TreeviewSelect>>", preview)
+        search_var.trace_add("write", filter_choices)
+        filter_choices()
+        window.bind("<Escape>", lambda event: window.destroy())
+        self.style_tracker_widgets(window)
+        window.grab_set()
+        search.focus_set()
+
+    def assign_saved_session_choice(self, sessions, kind, choice):
+        """Patch only equipment/target fields; preserve legacy and extension data."""
+        if kind == "setup":
+            setup = self.hunting_setups.get(choice)
+            if not isinstance(setup, dict):
+                messagebox.showwarning("Setup unavailable", "The selected saved setup is no longer available.")
+                return False
+            changes = {"weapon": str(setup.get("weapon", "") or ""),
+                       "amplifier": str(setup.get("amplifier", "") or ""),
+                       "attachments": list(setup.get("attachments", []) or [])}
+        elif kind == "mob":
+            if not any(isinstance(row, dict) and (row.get("mob"), row.get("maturity", "")) == choice for row in self.favorite_mobs):
+                messagebox.showwarning("Mob unavailable", "The selected favorite is no longer available.")
+                return False
+            changes = {"mob": choice[0], "maturity": choice[1]}
+        else:
+            return False
+        indices = [index for index, row in enumerate(self.sessions) if any(row is session for session in sessions)]
+        if not sessions or len(indices) != len(sessions):
+            messagebox.showwarning("Sessions unavailable", "The selected sessions changed. Close this window and select them again.")
+            return False
+        # Stage copies so a failed primary write leaves live objects untouched.
+        # Keep dictionaries: old sessions may contain fields unknown to us.
+        staged = list(self.sessions)
+        for index in indices:
+            staged[index] = dict(self.sessions[index])
+            staged[index].update(json.loads(json.dumps(changes)))
+        session_ids = {str(self.sessions[index].get("id", "") or "") for index in indices} - {""}
+        analysis = [dict(row, **json.loads(json.dumps(changes)))
+                    if isinstance(row, dict) and str(row.get("id", "") or "") in session_ids else row
+                    for row in self.analysis_sessions]
+        analysis_changed = analysis != self.analysis_sessions
+        try:
+            save_json(SESSIONS_FILE, staged)
+        except OSError as error:
+            messagebox.showerror("Sessions not saved", f"Could not save the selected sessions: {error}")
+            return False
+        for index in indices:
+            self.sessions[index].update(staged[index])
+        if analysis_changed:
+            try:
+                save_json(ANALYSIS_SESSIONS_FILE, analysis)
+            except OSError as error:
+                messagebox.showerror("Analysis not saved", f"Sessions were saved, but the analysis file could not be updated: {error}. Apply the same choice again to retry.")
+                return False
+            self.analysis_sessions = analysis
+        self.refresh_sessions_table()
+        selected_iids = [f"session_{index}" for index in indices if self.sessions_tree.exists(f"session_{index}")]
+        self.sessions_tree.selection_set(selected_iids)
+        if selected_iids:
+            self.sessions_tree.focus(selected_iids[0])
+            self.sessions_tree.see(selected_iids[0])
+        self.show_session_details(self.sessions[indices[0]])
+        self.refresh_loot_tab()
+        if analysis_changed:
+            self.refresh_mob_analysis(persist_settings=False)
+        return True
 
     def add_selected_sessions_to_analysis(self):
         indices = self.selected_session_indices_from_table()
@@ -3983,7 +4143,7 @@ class SkillTrackerApp:
             results.append(row)
         return sorted(results, key=lambda row: (-row["expected_after_mu"], -row["ped_cycled"], row["mob"].casefold()))
 
-    def refresh_mob_analysis(self):
+    def refresh_mob_analysis(self, *, persist_settings=True):
         if not hasattr(self, "mob_analysis_tree"):
             return
         try:
@@ -4013,7 +4173,8 @@ class SkillTrackerApp:
             f"Valid sessions: {len(self.analysis_sessions)} | mobs with usable data: {len(self.mob_analysis_results)} | "
             f"manual loot MU overrides weekly market MU; missing MU defaults to 100%."
         )
-        self.save_state()
+        if persist_settings:
+            self.save_state()
 
     def open_mob_analysis_details(self, event=None):
         tree = self.mob_analysis_tree
